@@ -473,27 +473,37 @@ fd_solfuzz_pb_txn_run( fd_solfuzz_runner_t * runner,
     }
 
     /* If the transaction is a fees-only transaction, we have to create rollback accounts to iterate over and save. */
+    fd_pubkey_t *         pubkeys_to_save  = txn_out->accounts.keys;
     fd_account_meta_t * * accounts_to_save = txn_out->accounts.metas;
     ulong                 accounts_cnt     = txn_out->accounts.cnt;
     if( txn_out->err.is_fees_only ) {
-      accounts_to_save = fd_spad_alloc( runner->spad, alignof(fd_txn_account_t), sizeof(fd_txn_account_t) * 2 );
+      pubkeys_to_save  = fd_spad_alloc( runner->spad, alignof(fd_pubkey_t), sizeof(fd_pubkey_t) * 2 );
+      accounts_to_save = fd_spad_alloc( runner->spad, alignof(fd_account_meta_t *), sizeof(fd_account_meta_t *) * 2 );
       accounts_cnt     = 0UL;
 
       if( FD_LIKELY( txn_out->accounts.nonce_idx_in_txn!=FD_FEE_PAYER_TXN_IDX ) ) {
-        accounts_to_save[accounts_cnt++] = txn_out->accounts.rollback_fee_payer;
+        pubkeys_to_save[accounts_cnt]  = txn_out->accounts.keys[FD_FEE_PAYER_TXN_IDX];
+        accounts_to_save[accounts_cnt] = txn_out->accounts.rollback_fee_payer;
+        accounts_cnt++;
       }
 
       if( txn_out->accounts.nonce_idx_in_txn!=ULONG_MAX ) {
-        accounts_to_save[accounts_cnt++] = txn_out->accounts.rollback_nonce;
+        pubkeys_to_save[accounts_cnt]  = txn_out->accounts.keys[txn_out->accounts.nonce_idx_in_txn];
+        accounts_to_save[accounts_cnt] = txn_out->accounts.rollback_nonce;
+        accounts_cnt++;
       }
     }
 
     /* Capture borrowed accounts */
     for( ulong j=0UL; j<accounts_cnt; j++ ) {
-      fd_account_meta_t * meta = accounts_to_save[j];
-      fd_pubkey_t * pubkey     = &txn_out->accounts.keys[j];
+      fd_pubkey_t *       pubkey = &pubkeys_to_save[j];
+      fd_account_meta_t * meta   = accounts_to_save[j];
 
-      if( !( fd_runtime_account_is_writable_idx( txn_in, txn_out, runner->bank, (ushort)j ) || j==FD_FEE_PAYER_TXN_IDX ) ) continue;
+      if( !( txn_out->err.is_fees_only ||                                                                /* Capture all accounts in fees-only transactions */
+             fd_runtime_account_is_writable_idx( txn_in, txn_out, runner->bank, (ushort)j ) || /* Capture writable accounts */
+             j==FD_FEE_PAYER_TXN_IDX ) ) {                                                               /* Capture the fee payer account */
+        continue;
+      }
 
       ulong modified_idx = txn_result->resulting_state.acct_states_count;
       assert( modified_idx < modified_acct_cnt );
