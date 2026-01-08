@@ -273,6 +273,9 @@ fd_solfuzz_pb_instr_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_instr_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -301,6 +304,9 @@ fd_solfuzz_pb_txn_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_txn_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -324,6 +330,9 @@ fd_solfuzz_pb_block_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_block_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -347,6 +356,9 @@ fd_solfuzz_pb_elf_loader_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_elf_loader_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -369,6 +381,9 @@ fd_solfuzz_pb_syscall_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_syscall_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -391,6 +406,9 @@ fd_solfuzz_pb_vm_interp_fixture( fd_solfuzz_runner_t * runner,
 
   // Cleanup
   pb_release( &fd_exec_test_syscall_fixture_t_msg, fixture );
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
   return ok;
 }
 
@@ -476,6 +494,7 @@ fd_solfuzz_fb_elf_loader_fixture( fd_solfuzz_runner_t * runner,
   if( FD_UNLIKELY( err==SOL_COMPAT_V2_FAILURE ) ) return err;
 
   /* Compare */
+  int ok = 0;
   FD_SPAD_FRAME_BEGIN( runner->spad ) {
     ulong   buffer_sz  = flatcc_builder_get_buffer_size( runner->fb_builder );
     uchar * actual_buf = fd_spad_alloc( runner->spad, 1UL, buffer_sz );
@@ -485,8 +504,12 @@ fd_solfuzz_fb_elf_loader_fixture( fd_solfuzz_runner_t * runner,
     SOL_COMPAT_NS(ELFLoaderEffects_table_t) actual   = SOL_COMPAT_NS(ELFLoaderFixture_output( fixture ));
     if( FD_UNLIKELY( !expected || !actual ) ) return 0;
 
-    return sol_compat_fb_cmp_elf_loader( expected, actual );
+    ok = sol_compat_fb_cmp_elf_loader( expected, actual );
   } FD_SPAD_FRAME_END;
+
+  // Leak check
+  fd_solfuzz_runner_leak_check( runner );
+  return ok;
 }
 
 #endif /* FD_HAS_FLATCC */
