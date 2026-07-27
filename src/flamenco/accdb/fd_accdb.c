@@ -157,6 +157,49 @@ fd_accdb_partition_write_bump( fd_accdb_t * accdb,
   FD_ATOMIC_FETCH_AND_ADD( &p->write_ops,     1UL   );
 }
 
+/* accdb_wstats defers the telemetry counters that allocate_next_write
+   would otherwise bump once per allocation.  Each of those bumps is a
+   lock-prefixed add, and a lock is a full barrier that drains the store
+   buffer, so on a per-account hot path the barriers cost more than the
+   arithmetic.  Callers that allocate in a batch accumulate here and
+   flush once.
+
+   Only disk_current_bytes and the per-partition write counters are
+   deferred; all three are read solely by metrics reporting.  In
+   particular compaction keys off partition->bytes_freed, which is
+   untouched here, so deferring does not change compaction timing.
+
+   part_idx is only meaningful while part_ops is non-zero.  A batch that
+   straddles a partition boundary flushes at the crossing, so bytes are
+   never misattributed to the wrong partition. */
+
+struct accdb_wstats {
+  ulong current_bytes;
+  ulong part_idx;
+  ulong part_bytes;
+  ulong part_ops;
+};
+
+typedef struct accdb_wstats accdb_wstats_t;
+
+static inline void
+accdb_wstats_flush( fd_accdb_t *     accdb,
+                    accdb_wstats_t * st ) {
+  if( FD_LIKELY( st->current_bytes ) ) {
+    FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, st->current_bytes );
+    st->current_bytes = 0UL;
+  }
+  if( FD_LIKELY( st->part_ops ) ) {
+    fd_accdb_partition_t * p = partition_pool_ele( accdb->partition_pool, st->part_idx );
+    if( FD_LIKELY( p ) ) {
+      FD_ATOMIC_FETCH_AND_ADD( &p->bytes_written, st->part_bytes );
+      FD_ATOMIC_FETCH_AND_ADD( &p->write_ops,     st->part_ops   );
+    }
+    st->part_bytes = 0UL;
+    st->part_ops   = 0UL;
+  }
+}
+
 static inline ulong
 cache_line_idx( fd_accdb_t *                  accdb,
                 ulong                         cls,
@@ -1616,15 +1659,30 @@ change_partition( fd_accdb_t *           accdb,
   }
 }
 
+/* st==NULL bumps the write telemetry inline; otherwise it accumulates
+   into st, which the caller must flush with accdb_wstats_flush. */
+
 static inline ulong
-allocate_next_write( fd_accdb_t * accdb,
-                     ulong        sz ) {
+allocate_next_write_stats( fd_accdb_t *     accdb,
+                           ulong            sz,
+                           accdb_wstats_t * st ) {
   for(;;) {
     accdb_offset_t offset = { .val = FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->whead[ 0 ].val, sz ) };
     if( FD_LIKELY( packed_partition_offset( &offset )+sz<=accdb->shmem->partition_sz ) ) {
-      FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, sz );
       ulong file_offset = packed_partition_file_offset( &offset, accdb->shmem->partition_sz );
-      fd_accdb_partition_write_bump( accdb, file_offset, sz );
+      if( FD_LIKELY( st ) ) {
+        if( FD_LIKELY( sz ) ) {
+          ulong part_idx = file_offset / accdb->shmem->partition_sz;
+          if( FD_UNLIKELY( st->part_ops && st->part_idx!=part_idx ) ) accdb_wstats_flush( accdb, st );
+          st->part_idx       = part_idx;
+          st->part_bytes    += sz;
+          st->part_ops      += 1UL;
+          st->current_bytes += sz;
+        }
+      } else {
+        FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, sz );
+        fd_accdb_partition_write_bump( accdb, file_offset, sz );
+      }
       return file_offset;
     }
 
@@ -1654,6 +1712,12 @@ allocate_next_write( fd_accdb_t * accdb,
     change_partition( accdb, &offset, &accdb->shmem->whead[ 0 ], &accdb->shmem->has_partition[ 0 ], 0 );
     spin_lock_release( &accdb->shmem->partition_lock );
   }
+}
+
+static inline ulong
+allocate_next_write( fd_accdb_t * accdb,
+                     ulong        sz ) {
+  return allocate_next_write_stats( accdb, sz, NULL );
 }
 
 /* Compaction write allocation.  Single-threaded: only the compaction
@@ -3983,7 +4047,14 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
   /* Phase 3: commit.  For each account either update the existing
      entry in-place (replace), allocate and insert at the chain head
      (new), or skip entirely (ignore).  This matches the
-     insert/replace/ignore semantics of write_one. */
+     insert/replace/ignore semantics of write_one.
+
+     Write telemetry is accumulated across the batch and flushed once
+     below rather than bumped per account, see accdb_wstats. */
+
+  accdb_wstats_t wstats = {0};
+  ulong used_bytes_added   = 0UL;
+  ulong used_bytes_removed = 0UL;
 
   for( ulong i=0UL; i<cnt; i++ ) {
     if( FD_UNLIKELY( skip[ i ] ) ) {
@@ -3992,7 +4063,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
          Mark the space as immediately freed since it is dead on
          arrival. */
       ulong dead_sz  = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
-      ulong dead_off = allocate_next_write( accdb, dead_sz );
+      ulong dead_off = allocate_next_write_stats( accdb, dead_sz, &wstats );
       fd_accdb_shmem_bytes_freed( accdb->shmem, dead_off, dead_sz );
       ignored_lamports += lamports[ i ];
       ignored++;
@@ -4006,7 +4077,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
       /* The old version's disk space is now dead. */
       ulong old_sz = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( accmeta->executable_size );
       fd_accdb_shmem_bytes_freed( accdb->shmem, fd_accdb_acc_offset( accmeta ), old_sz );
-      accdb->shmem->shmetrics->disk_used_bytes -= old_sz;
+      used_bytes_removed += old_sz;
       replaced_lamports += accmeta->lamports;
       replaced++;
     } else {
@@ -4043,10 +4114,14 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
     accmeta->lamports        = lamports[ i ];
     accmeta->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
     ulong entry_sz       = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
-    ulong file_off       = allocate_next_write( accdb, entry_sz );
+    ulong file_off       = allocate_next_write_stats( accdb, entry_sz, &wstats );
     accmeta->offset_fork = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
-    accdb->shmem->shmetrics->disk_used_bytes += entry_sz;
+    used_bytes_added    += entry_sz;
   }
+
+  accdb_wstats_flush( accdb, &wstats );
+  accdb->shmem->shmetrics->disk_used_bytes += used_bytes_added;
+  accdb->shmem->shmetrics->disk_used_bytes -= used_bytes_removed;
 
   /* accounts_total tracks acc_pool entries: increment for every new
      allocation (both genuinely new accounts and cross-fork overrides
