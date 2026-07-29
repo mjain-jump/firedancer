@@ -3934,19 +3934,36 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
      In incremental mode, cross-fork entries are saved separately so
      they can be left in place while a new entry is inserted. */
 
-  for( ulong i=0UL; i<cnt; i++ ) {
-    ulong next_acc = accdb->acc_map[ hashes[ i ] ];
+  /* Walk all cnt chains round-robin rather than one at a time, so the
+     independent pool-node loads for different lanes are in flight
+     together (memory level parallelism).  Every decision below is
+     identical to the serial walk; only the request order differs. */
 
-    if( FD_LIKELY( next_acc!=UINT_MAX ) ) {
-      __builtin_prefetch( &accdb->acc_pool[ next_acc ], 0, 1 );
+  ulong cursor[ 8 ];
+  int   active[ 8 ];
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    cursor[ i ] = accdb->acc_map[ hashes[ i ] ];
+    active[ i ] = cursor[ i ]!=UINT_MAX;
+  }
+
+  for(;;) {
+    ulong active_cnt = 0UL;
+
+    /* Issue every active lane's pool-node request before consuming any. */
+    for( ulong i=0UL; i<cnt; i++ ) {
+      if( !active[ i ] ) continue;
+      __builtin_prefetch( &accdb->acc_pool[ cursor[ i ] ], 0, 1 );
+      active_cnt++;
     }
 
-    while( next_acc!=UINT_MAX ) {
-      fd_accdb_accmeta_t * candidate = &accdb->acc_pool[ next_acc ];
+    if( !active_cnt ) break;
 
-      if( FD_LIKELY( candidate->map.next!=UINT_MAX ) ) {
-        __builtin_prefetch( &accdb->acc_pool[ candidate->map.next ], 0, 1 );
-      }
+    /* Consume one node from each still-active lane. */
+    for( ulong i=0UL; i<cnt; i++ ) {
+      if( !active[ i ] ) continue;
+
+      fd_accdb_accmeta_t * candidate = &accdb->acc_pool[ cursor[ i ] ];
 
       if( FD_UNLIKELY( !memcmp( pubkeys[ i ], candidate->key.pubkey, 32UL ) ) ) {
         if( FD_LIKELY( (ulong)candidate->cache_idx>slots[ i ] ) ) {
@@ -3956,9 +3973,11 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
         } else {
           existing[ i ] = candidate;
         }
-        break;
+        active[ i ] = 0;
+      } else {
+        cursor[ i ] = candidate->map.next;
+        active[ i ] = cursor[ i ]!=UINT_MAX;
       }
-      next_acc = candidate->map.next;
     }
   }
 
