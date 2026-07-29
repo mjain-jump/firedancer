@@ -339,6 +339,7 @@ fd_accdb_acc_xchg_offset( fd_accdb_accmeta_t * acc,
 #define POOL_IDX_WIDTH  32
 #define POOL_IMPL_STYLE 0
 #define POOL_LAZY       1
+#define POOL_ENABLE_NOLOCK_ACQUIRE 1
 
 #include "../../util/tmpl/fd_pool_para.c"
 
