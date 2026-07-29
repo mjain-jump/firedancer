@@ -13,6 +13,7 @@ typedef struct myele myele_t;
 #define POOL_NEXT          mynext
 #define POOL_IMPL_STYLE    0
 #define POOL_LAZY          1
+#define POOL_ENABLE_NOLOCK_ACQUIRE 1
 #include "fd_pool_para.c"
 
 FD_STATIC_ASSERT( FD_POOL_SUCCESS    == 0, unit_test );
@@ -31,6 +32,54 @@ shmem_alloc( ulong a,
   shmem_cnt = (ulong)((m + s) - shmem);
   FD_TEST( shmem_cnt <= SHMEM_MAX );
   return (void *)m;
+}
+
+static void
+test_acquire_nolock( mypool_t * pool,
+                     myele_t *  ele,
+                     ulong      ele_max ) {
+  if( FD_UNLIKELY( !ele_max ) ) return;
+
+  mypool_reset( pool );
+
+  ulong top0  = pool->pool->ver_top;
+  ulong lazy0 = pool->pool->ver_lazy;
+  myele_t * ele0 = mypool_acquire_nolock( pool );
+  FD_TEST( ele0==ele );
+  FD_TEST( pool->pool->ver_top==top0 );
+  FD_TEST( mypool_private_vidx_ver( pool->pool->ver_lazy )==mypool_private_vidx_ver( lazy0 )+2UL );
+  FD_TEST( mypool_private_vidx_idx( pool->pool->ver_lazy )==(ele_max>1UL ? 1UL : mypool_idx_null()) );
+
+  mypool_release( pool, ele0 );
+  ulong top1  = pool->pool->ver_top;
+  ulong lazy1 = pool->pool->ver_lazy;
+  FD_TEST( mypool_private_vidx_idx( top1 )==0UL );
+  FD_TEST( mypool_acquire_nolock( pool )==ele0 );
+  FD_TEST( mypool_private_vidx_ver( pool->pool->ver_top )==mypool_private_vidx_ver( top1 )+2UL );
+  FD_TEST( mypool_private_vidx_idx( pool->pool->ver_top )==mypool_idx_null() );
+  FD_TEST( pool->pool->ver_lazy==lazy1 );
+
+  mypool_reset( pool );
+  for( ulong i=0UL; i<ele_max; i++ ) FD_TEST( mypool_acquire_nolock( pool )==ele+i );
+  ulong top_empty = pool->pool->ver_top;
+  ulong lazy_empty = pool->pool->ver_lazy;
+  FD_TEST( !mypool_acquire_nolock( pool ) );
+  FD_TEST( pool->pool->ver_top ==top_empty  );
+  FD_TEST( pool->pool->ver_lazy==lazy_empty );
+  for( ulong i=0UL; i<ele_max; i++ ) mypool_release( pool, ele+i );
+  FD_TEST( !mypool_verify( pool ) );
+
+  mypool_reset( pool );
+  FD_TEST( !mypool_lock( pool, 1 ) );
+  ulong top_locked  = pool->pool->ver_top;
+  ulong lazy_locked = pool->pool->ver_lazy;
+  ele0 = mypool_acquire_nolock( pool );
+  FD_TEST( ele0==ele );
+  FD_TEST( pool->pool->ver_top==top_locked );
+  FD_TEST( mypool_private_vidx_ver( pool->pool->ver_lazy )==mypool_private_vidx_ver( lazy_locked )+2UL );
+  mypool_unlock( pool );
+  mypool_release( pool, ele0 );
+  FD_TEST( !mypool_verify( pool ) );
 }
 
 static mypool_t * tile_pool;
@@ -191,6 +240,9 @@ main( int     argc,
   FD_TEST( !mypool_verify  ( pool ) );
 
   mypool_unlock( pool );
+
+  FD_LOG_NOTICE(( "Testing nolock acquire" ));
+  test_acquire_nolock( pool, shele, ele_max );
 
   /* FIXME: use tpool here */
 
