@@ -162,11 +162,26 @@ process_account_header( fd_snapwr_tile_t *            ctx,
     buffer_skip( ctx, next - ctx->accounts_off );
   }
 
-  uchar data[ 68UL ];
-  fd_memcpy( data, result->account_header.pubkey, 32UL );
-  fd_memcpy( data+32UL, &result->account_header.data_len, 4UL );
-  fd_memcpy( data+36UL, result->account_header.owner, 32UL );
-  buffer_write( ctx, data, 68UL );
+  /* Assemble the 68-byte header directly in the write buffer.  Staging it on
+     the stack first and then copying costs an extra 68 bytes per account --
+     ~78 GB over a mainnet snapshot -- for no reason other than convenience.
+     A 2 MiB buffer holds ~30k headers, so the straddling case is rare; it falls
+     back to the original path so that path stays byte-for-byte unchanged. */
+  if( FD_LIKELY( FD_SNAPWR_WRITE_BUF_SZ - ctx->write_buf_used >= 68UL ) ) {
+    uchar * d = ctx->write_buf + ctx->write_buf_used;
+    fd_memcpy( d,        result->account_header.pubkey,    32UL );
+    fd_memcpy( d+32UL,  &result->account_header.data_len,   4UL );
+    fd_memcpy( d+36UL,   result->account_header.owner,     32UL );
+    ctx->write_buf_used += 68UL;
+    ctx->accounts_off   += 68UL;
+    if( FD_UNLIKELY( ctx->write_buf_used==FD_SNAPWR_WRITE_BUF_SZ ) ) buffer_flush( ctx );
+  } else {
+    uchar data[ 68UL ];
+    fd_memcpy( data, result->account_header.pubkey, 32UL );
+    fd_memcpy( data+32UL, &result->account_header.data_len, 4UL );
+    fd_memcpy( data+36UL, result->account_header.owner, 32UL );
+    buffer_write( ctx, data, 68UL );
+  }
   ctx->metrics.accounts_written++;
 }
 
