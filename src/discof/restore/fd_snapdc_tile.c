@@ -17,6 +17,10 @@
    snapld tile.  In the event that the snapshot is already uncompressed,
    this tile simply copies the stream to the next tile in the pipeline. */
 
+/* output slots offered to zstd per call; 8 x 65408 is ~512 KiB, above
+   ZSTD_BLOCKSIZE_MAX so a whole block can be emitted in one call */
+#define FD_SNAPDC_OUT_BATCH (8UL)
+
 struct fd_snapdc_tile {
   uint full    : 1;
   uint is_zstd : 1;
@@ -248,11 +252,20 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
     return 0;
   }
 
+  /* Offer zstd as many contiguous output slots as remain before the wmark.
+     The slots are adjacent, so this needs no staging buffer and adds no copy;
+     it only lets a whole zstd block be produced in one call instead of two. */
+  ulong out_slots = FD_SNAPDC_OUT_BATCH;
+  ulong avail_slots = 1UL + ( (ctx->out.wmark - ctx->out.chunk) /
+                              (ctx->out.mtu >> FD_CHUNK_LG_SZ) );
+  if( FD_UNLIKELY( avail_slots<out_slots ) ) out_slots = avail_slots;
+  if( FD_UNLIKELY( !out_slots ) ) out_slots = 1UL;
+
   ulong in_consumed = 0UL, out_produced = 0UL;
   ulong frame_res = ZSTD_decompressStream_simpleArgs(
       ctx->zstd,
       out,
-      ctx->out.mtu,
+      out_slots*ctx->out.mtu,
       &out_produced,
       in,
       sz-ctx->in.frag_pos,
@@ -266,9 +279,14 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
     return 0;
   }
 
-  if( FD_LIKELY( out_produced ) ) {
-    fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out.chunk, out_produced, 0UL, 0UL, 0UL );
-    ctx->out.chunk = fd_dcache_compact_next( ctx->out.chunk, out_produced, ctx->out.chunk0, ctx->out.wmark );
+  {
+    ulong left = out_produced;
+    while( left ) {
+      ulong psz = fd_ulong_min( left, ctx->out.mtu );
+      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out.chunk, psz, 0UL, 0UL, 0UL );
+      ctx->out.chunk = fd_dcache_compact_next( ctx->out.chunk, psz, ctx->out.chunk0, ctx->out.wmark );
+      left -= psz;
+    }
   }
 
   ctx->in.frag_pos += in_consumed;
@@ -287,7 +305,7 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
   /* frame_res==0 means the frame ended exactly at the output boundary;
      re-polling then reports "new frame expected" and would mark the
      stream dirty at a clean EOF. */
-  int maybe_more_output = (out_produced==ctx->out.mtu && frame_res!=0UL) || ctx->in.frag_pos<sz;
+  int maybe_more_output = (out_produced==out_slots*ctx->out.mtu && frame_res!=0UL) || ctx->in.frag_pos<sz;
   if( FD_LIKELY( !maybe_more_output ) ) ctx->in.frag_pos = 0UL;
   return maybe_more_output;
 }
@@ -382,7 +400,7 @@ unprivileged_init( fd_topo_t const *      topo,
 }
 
 /* handle_data_frag can publish one data frag plus an error frag */
-#define STEM_BURST 2UL
+#define STEM_BURST (FD_SNAPDC_OUT_BATCH+2UL)
 
 #define STEM_LAZY  (128L*3000L)
 
