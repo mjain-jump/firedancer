@@ -28,6 +28,9 @@
    or from an HTTP/TCP connection and sending it to the snapdc tile
    for later decompression. */
 
+/* Number of consecutive dcache slots filled by a single read(). */
+#define FD_SNAPLD_READ_BATCH (1024UL)
+
 typedef struct fd_snapld_tile {
 
   struct {
@@ -311,7 +314,17 @@ after_credit( fd_snapld_tile_t *  ctx,
       ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), ctx->out_dc.chunk0, ctx->out_dc.wmark );
       return;
     }
-    long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, out, ctx->out_dc.mtu );
+    /* Fill as many consecutive dcache slots as remain before the wmark, in a
+       single read().  The slots are contiguous, so this needs no staging
+       buffer and adds no copy -- it only replaces N syscalls with one. */
+    ulong slots = FD_SNAPLD_READ_BATCH;
+    ulong avail_slots = 1UL + ( (ctx->out_dc.wmark - ctx->out_dc.chunk) /
+                                (ctx->out_dc.mtu >> FD_CHUNK_LG_SZ) );
+    if( FD_UNLIKELY( avail_slots<slots ) ) slots = avail_slots;
+    if( FD_UNLIKELY( !slots ) ) slots = 1UL;
+
+    long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd,
+                        out, slots*ctx->out_dc.mtu );
     if( FD_UNLIKELY( result<=0L ) ) {
       if( result==0L ) {
         FD_LOG_INFO(( "finished reading %s snapshot from local file", ctx->load_full ? "full" : "incremental" ));
@@ -323,8 +336,15 @@ after_credit( fd_snapld_tile_t *  ctx,
         return; /* verbose return */
       }
     } else {
-      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, (ulong)result, 0UL, 0UL, 0UL );
-      ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, (ulong)result, ctx->out_dc.chunk0, ctx->out_dc.wmark );
+      /* Split what we got across one frag per slot.  Frag sizes must stay
+         <= mtu; the tail frag is whatever is left over. */
+      ulong left = (ulong)result;
+      while( left ) {
+        ulong sz = fd_ulong_min( left, ctx->out_dc.mtu );
+        fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, sz, 0UL, 0UL, 0UL );
+        ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sz, ctx->out_dc.chunk0, ctx->out_dc.wmark );
+        left -= sz;
+      }
       *charge_busy = 1;
       return; /* verbose return */
     }
@@ -570,7 +590,7 @@ returnable_frag( fd_snapld_tile_t *  ctx,
 }
 
 /* Up to two frags from after_credit plus one from returnable_frag */
-#define STEM_BURST 3UL
+#define STEM_BURST (FD_SNAPLD_READ_BATCH+3UL)
 
 #define STEM_LAZY (128L*3000L)
 
