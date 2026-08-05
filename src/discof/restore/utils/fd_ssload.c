@@ -10,7 +10,7 @@ FD_STATIC_ASSERT( FD_BLOCKHASHES_MAX==sizeof(((fd_snapshot_manifest_t *)0)->bloc
 FD_STATIC_ASSERT( FD_RUNTIME_MAX_SNAPSHOT_VOTE_ACCOUNTS==sizeof(((fd_snapshot_manifest_t *)0)->vote_accounts)/sizeof(fd_snapshot_manifest_vote_account_t), vote_accounts_max );
 FD_STATIC_ASSERT( FD_RUNTIME_MAX_STAKE_ACCOUNTS==sizeof(((fd_snapshot_manifest_t *)0)->stake_delegations)/sizeof(fd_snapshot_manifest_stake_delegation_t), stake_delegations_max );
 FD_STATIC_ASSERT( FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN==sizeof(((fd_snapshot_manifest_t *)0)->epoch_stakes)/sizeof(fd_snapshot_manifest_epoch_stakes_t), epoch_stakes_len );
-FD_STATIC_ASSERT( FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS==sizeof(((fd_snapshot_manifest_epoch_stakes_t *)0)->vote_stakes)/sizeof(fd_snapshot_manifest_vote_stakes_t), epoch_vote_stakes_max );
+FD_STATIC_ASSERT( FD_RUNTIME_MAX_SNAPSHOT_VOTE_ACCOUNTS==sizeof(((fd_snapshot_manifest_epoch_stakes_t *)0)->vote_stakes)/sizeof(fd_snapshot_manifest_vote_stakes_t), epoch_vote_stakes_max );
 FD_STATIC_ASSERT( FD_EPOCH_CREDITS_MAX==sizeof(((fd_snapshot_manifest_vote_stakes_t *)0)->epoch_credits)/sizeof(epoch_credits_t), vote_stakes_epoch_credits_max );
 
 int
@@ -135,7 +135,7 @@ fd_ssload_manifest_validate( fd_snapshot_manifest_t const * manifest,
   /* Epoch credits downcasting validation */
 
   for( ulong i=0UL; i<FD_RUNTIME_MANIFEST_EPOCH_STAKES_LEN; i++ ) {
-    if( FD_UNLIKELY( manifest->epoch_stakes[i].vote_stakes_len>FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS ) ) {
+    if( FD_UNLIKELY( manifest->epoch_stakes[i].vote_stakes_len>FD_RUNTIME_MAX_SNAPSHOT_VOTE_ACCOUNTS ) ) {
       FD_LOG_WARNING(( "corrupt snapshot: epoch_stakes[%lu].vote_stakes_len %lu exceeds max %lu",
                        i, manifest->epoch_stakes[i].vote_stakes_len, FD_RUNTIME_MAX_VAT_VOTE_ACCOUNTS ));
       return -1;
