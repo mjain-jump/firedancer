@@ -1076,7 +1076,7 @@ deferred_acc_append( fd_accdb_t * accdb,
 
 static inline void
 acc_unlink( fd_accdb_t * accdb,
-            uint         map_idx,
+            ulong        map_idx,
             uint         prev,
             uint         acc_idx ) {
   fd_accdb_accmeta_t * accmeta = &accdb->acc_pool[ acc_idx ];
@@ -3356,7 +3356,7 @@ release_inner( fd_accdb_t * accdb,
 
       fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
       FD_TEST( txn ); /* Sized so it always succeeds */
-      txn->acc_map_idx  = (uint)accs[ i ]._acc_map_idx;
+      txn->acc_map_idx  = accs[ i ]._acc_map_idx;
       txn->acc_pool_idx = (uint)acc_idx;
       uint txn_idx = (uint)txn_pool_idx( accdb->txn_pool, txn );
       for(;;) {
@@ -3968,7 +3968,7 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
     if( FD_UNLIKELY( incremental ) ) {
       fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
       if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
-      txn->acc_map_idx  = (uint)hash;
+      txn->acc_map_idx  = hash;
       txn->acc_pool_idx = acc_idx;
       uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
       txn->fork.next          = fork->shmem->txn_head;
@@ -4155,7 +4155,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
       if( FD_UNLIKELY( incremental ) ) {
         fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
         if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
-        txn->acc_map_idx  = (uint)hashes[ i ];
+        txn->acc_map_idx  = hashes[ i ];
         txn->acc_pool_idx = acc_idx;
         uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
         txn->fork.next          = fork->shmem->txn_head;
