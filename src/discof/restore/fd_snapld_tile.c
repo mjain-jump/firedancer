@@ -28,6 +28,11 @@
    or from an HTTP/TCP connection and sending it to the snapdc tile
    for later decompression. */
 
+/* Upper bound on dcache slots filled by one read().  The actual count is
+   clamped to the flow-control credits available at the time, so this is a
+   ceiling and not a threshold the tile waits to reach. */
+#define FD_SNAPLD_READ_MAX (1024UL)
+
 typedef struct fd_snapld_tile {
 
   struct {
@@ -311,7 +316,21 @@ after_credit( fd_snapld_tile_t *  ctx,
       ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), ctx->out_dc.chunk0, ctx->out_dc.wmark );
       return;
     }
-    long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, out, ctx->out_dc.mtu );
+    /* Fill as many consecutive dcache slots as we have credits for and as
+       remain before the wmark, in a single read().  The slots are contiguous,
+       so this needs no staging buffer and adds no copy.  Clamping to cr_avail
+       is what keeps STEM_BURST small: the tile never waits for a large credit
+       balance, it just reads less when downstream is behind. */
+    ulong slots = FD_SNAPLD_READ_MAX;
+    ulong cr = stem->cr_avail[ 0 ];
+    if( FD_UNLIKELY( cr<slots ) ) slots = cr;
+    ulong avail_slots = 1UL + ( (ctx->out_dc.wmark - ctx->out_dc.chunk) /
+                                (ctx->out_dc.mtu >> FD_CHUNK_LG_SZ) );
+    if( FD_UNLIKELY( avail_slots<slots ) ) slots = avail_slots;
+    if( FD_UNLIKELY( !slots ) ) slots = 1UL;
+
+    long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd,
+                        out, slots*ctx->out_dc.mtu );
     if( FD_UNLIKELY( result<=0L ) ) {
       if( result==0L ) {
         FD_LOG_INFO(( "finished reading %s snapshot from local file", ctx->load_full ? "full" : "incremental" ));
@@ -323,8 +342,15 @@ after_credit( fd_snapld_tile_t *  ctx,
         return; /* verbose return */
       }
     } else {
-      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, (ulong)result, 0UL, 0UL, 0UL );
-      ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, (ulong)result, ctx->out_dc.chunk0, ctx->out_dc.wmark );
+      /* One frag per slot; sizes must stay <= mtu and the tail is the
+         remainder.  cr_avail bounded the read, so a credit exists for each. */
+      ulong left = (ulong)result;
+      while( left ) {
+        ulong psz = fd_ulong_min( left, ctx->out_dc.mtu );
+        fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, psz, 0UL, 0UL, 0UL );
+        ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, psz, ctx->out_dc.chunk0, ctx->out_dc.wmark );
+        left -= psz;
+      }
       *charge_busy = 1;
       return; /* verbose return */
     }
@@ -570,7 +596,9 @@ returnable_frag( fd_snapld_tile_t *  ctx,
 }
 
 /* Up to two frags from after_credit plus one from returnable_frag */
-#define STEM_BURST 3UL
+/* Entry gate only.  Reads are clamped to cr_avail, so the tile does not need
+   a large credit balance before it may run -- which is the whole point. */
+#define STEM_BURST 4UL
 
 #define STEM_LAZY (128L*3000L)
 
