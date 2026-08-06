@@ -104,3 +104,10 @@ getrandom
 
 # shutdown: exit is called on shutdown
 exit: (eq (arg 0) 0)
+
+# ldauto3: the page-cache probe maps one page at a time, asks mincore whether it
+# is resident, and unmaps it.  It reads nothing and caches nothing, which is the
+# point -- a probe that faults pages in would report its own residue.
+mmap
+mincore
+munmap
