@@ -805,7 +805,14 @@ POOL_(acquire_nolock)( POOL_(t) * join ) {
   ulong ver     = POOL_(private_vidx_ver)( ver_top );
   ulong ele_idx = POOL_(private_vidx_idx)( ver_top );
 
-  if( FD_UNLIKELY( POOL_(idx_is_null)( ele_idx ) ) ) {
+  /* No branch hint: this predicate's direction is phase-dependent.  During a
+     bulk snapshot load the pool is reset empty and the load only adds, so the
+     free list is empty on essentially every acquire and the lazy path is taken
+     every time; in steady-state replay the opposite holds.  A static hint is
+     wrong for one of the two, so let the predictor learn the caller's pattern.
+     (Measured: acquire_nolock + acquire_lazy_nolock are 13.6% of snapin's
+     cycles during a load, with no corresponding cache misses.) */
+  if( POOL_(idx_is_null)( ele_idx ) ) {
 #   if POOL_LAZY
     return POOL_(acquire_lazy_nolock)( join );
 #   endif
