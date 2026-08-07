@@ -9,6 +9,12 @@ struct fd_topo_cpu {
   int   online;
   ulong numa_node;
   ulong sibling;
+
+  /* Index of the last-level (L3) cache this CPU shares, as reported by
+     /sys/devices/system/cpu/cpuN/cache/index3/id.  ULONG_MAX if the
+     system does not report one.  Used by the automatic layout to spread
+     tiles across cache domains rather than packing them into one. */
+  ulong l3_id;
 };
 
 typedef struct fd_topo_cpu fd_topo_cpu_t;
