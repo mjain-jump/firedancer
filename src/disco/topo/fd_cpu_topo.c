@@ -48,6 +48,24 @@ fd_topo_cpu_cnt( void ) {
   return end+1UL;
 }
 
+/* Returns the L3 cache id for cpu_idx, or ULONG_MAX if the system does
+   not report one.  Unlike the other readers here this must NOT be fatal
+   on ENOENT: index3 is absent on machines with no L3 and on kernels
+   built without the cache sysfs, and the caller degrades gracefully. */
+
+static ulong
+fd_topo_cpus_l3_id( ulong cpu_idx ) {
+  char path[ PATH_MAX ];
+  FD_TEST( fd_cstr_printf_check( path, sizeof( path ), NULL,
+                                 "/sys/devices/system/cpu/cpu%lu/cache/index3/id", cpu_idx ) );
+  FILE * fp = fopen( path, "r" );
+  if( FD_UNLIKELY( !fp ) ) return ULONG_MAX;
+  uint value = 0U;
+  int  ok    = ( 1==fscanf( fp, "%u\n", &value ) );
+  fclose( fp );
+  return ok ? (ulong)value : ULONG_MAX;
+}
+
 static int
 fd_topo_cpus_online( ulong cpu_idx ) {
   if( FD_UNLIKELY( cpu_idx==0UL ) ) return 1; /* Cannot set cpu0 to offline */
@@ -71,12 +89,14 @@ fd_topo_cpus_init( fd_topo_cpus_t * cpus ) {
     cpus->cpu[ i ].numa_node = fd_numa_node_idx( i );
     if( FD_LIKELY( cpus->cpu[ i ].online ) ) cpus->cpu[ i ].sibling = fd_tile_private_sibling_idx( i );
     else                                     cpus->cpu[ i ].sibling = ULONG_MAX;
+    if( FD_LIKELY( cpus->cpu[ i ].online ) ) cpus->cpu[ i ].l3_id   = fd_topo_cpus_l3_id( i );
+    else                                     cpus->cpu[ i ].l3_id   = ULONG_MAX;
   }
 }
 
 void
 fd_topo_cpus_printf( fd_topo_cpus_t * cpus ) {
   for( ulong i=0UL; i<cpus->cpu_cnt; i++ ) {
-    FD_LOG_NOTICE(( "cpu%lu: online=%i sibling=%lu numa_node=%lu", i, cpus->cpu[ i ].online, cpus->cpu[ i ].sibling, cpus->cpu[ i ].numa_node ));
+    FD_LOG_NOTICE(( "cpu%lu: online=%i sibling=%lu numa_node=%lu l3_id=%lu", i, cpus->cpu[ i ].online, cpus->cpu[ i ].sibling, cpus->cpu[ i ].numa_node, cpus->cpu[ i ].l3_id ));
   }
 }
