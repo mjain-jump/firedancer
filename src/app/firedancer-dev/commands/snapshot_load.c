@@ -1,3 +1,4 @@
+#include "../../../disco/topo/fd_topo_isolate.h"
 #include "../../firedancer/topology.h"
 #include "../../platform/fd_sys_util.h"
 #include "../../shared/commands/configure/configure.h"
@@ -189,6 +190,7 @@ snapshot_load_topo( config_t * config ) {
   }
 
   fd_topob_auto_layout( topo, 0 );
+  fd_topo_isolate_snapin( topo );
   fd_topob_finish( topo, CALLBACKS );
 }
 
@@ -428,6 +430,7 @@ fixup_config( config_t *     config,
   snapshot_load_topo( config );
 
   fd_topob_auto_layout( topo, 0 );
+  fd_topo_isolate_snapin( topo );
   fd_topob_finish( topo, CALLBACKS );
 }
 

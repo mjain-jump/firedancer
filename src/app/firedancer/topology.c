@@ -18,6 +18,7 @@
 #include "../../disco/pack/fd_pack_cost.h"
 #include "../../disco/tiles.h"
 #include "../../disco/topo/fd_topob.h"
+#include "../../disco/topo/fd_topo_isolate.h"
 #include "../../disco/topo/fd_cpu_topo.h"
 #include "../../disco/bundle/fd_bundle_tile.h"
 #include "../../util/pod/fd_pod_format.h"
@@ -1016,6 +1017,7 @@ fd_topo_initialize( config_t * config ) {
 
   /* Auto layout must run after all fd_topob_tile() calls so every tile gets a blocklist-aware CPU assignment. */
   if( FD_UNLIKELY( is_auto_affinity ) ) fd_topob_auto_layout( topo, 0 );
+  if( FD_UNLIKELY( is_auto_affinity ) ) fd_topo_isolate_snapin( topo );
 
   ulong fec_set_cnt = 2UL*shred_depth + config->tiles.shred.max_pending_shred_sets + 6UL;
   ulong fec_sets_sz = fec_set_cnt*sizeof(fd_fec_set_t); /* mirrors # of dcache entries in frankendancer */
