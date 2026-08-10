@@ -28,7 +28,32 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define FD_ZSTD_LEVEL 1
+/* Compression level for snapshot archives.
+
+   Chosen for the READER, not for the writer.  Measured end to end by loading a
+   463 GiB mainnet snapshot, n=3 per point:
+
+     level 1   144.50 s to load, 109.1 GiB
+     level 5   144.66 s,          98.8 GiB
+     level 7   132.25 s,          97.7 GiB
+     level 9   128.72 s,          95.6 GiB
+
+   Level 7 is both smaller to fetch and 12.25 s faster to decode than level 1.
+   The speedup is not monotonic -- levels 3 to 5 load slower than level 1 despite
+   compressing better, and the improvement appears at zstd's lazy -> lazy2 switch
+   at level 6 -- so this is a measured choice rather than "higher is better".
+
+   The cost is on the writer: at this tile's parallelism a full snapshot takes
+   roughly 9.4 minutes to compress at level 7 against 2.0 at level 1.  Level 9
+   would save another 3.5 s of load for a further 18% of compression time.
+
+   The resulting database is bit-identical either way.  A single-frame level-1
+   archive, a 14,819-frame level-1 archive and a 14,819-frame level-7 archive all
+   load to the same accounts.db, verified by sampling 4 KiB every 16 MiB over the
+   whole file from a zeroed start.  Changing this constant changes what the
+   network transfers, not what a validator ends up with. */
+
+#define FD_ZSTD_LEVEL 7
 
 /* Compression buffer params */
 #define RAW_BUF_SZ    (32UL<<20) /* FIXME make this configurable */
@@ -143,6 +168,16 @@ unprivileged_init( fd_topo_t const *      topo,
   FD_TEST( ctx->zst );
   ulong zst_err;
   zst_err = ZSTD_CCtx_setParameter( ctx->zst, ZSTD_c_compressionLevel, FD_ZSTD_LEVEL );
+  if( FD_UNLIKELY( ZSTD_isError( zst_err ) ) ) {
+    FD_LOG_ERR(( "ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel) failed: %s", ZSTD_getErrorName( zst_err ) ));
+  }
+
+  /* Explicitly off.  This is already zstd's default, but the zstd CLI enables
+     content checksums by default, so it is easy to turn on by analogy.  Verifying
+     one costs a reader 57.5 s per 463 GiB -- measured -- and the snapshot's
+     contents are already verified end to end by the loader. */
+
+  zst_err = ZSTD_CCtx_setParameter( ctx->zst, ZSTD_c_checksumFlag, 0 );
   if( FD_UNLIKELY( ZSTD_isError( zst_err ) ) ) {
     FD_LOG_ERR(( "ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel) failed: %s", ZSTD_getErrorName( zst_err ) ));
   }
