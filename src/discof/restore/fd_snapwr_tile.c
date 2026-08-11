@@ -176,6 +176,45 @@ process_account_data( fd_snapwr_tile_t *            ctx,
   buffer_write( ctx, result->account_data.data, result->account_data.data_sz );
 }
 
+static void
+process_account_batch( fd_snapwr_tile_t *            ctx,
+                       fd_ssparse_advance_result_t *  result ) {
+  /* One callback per batch instead of two per account.  Offsets are ssparse's
+     own: 136-byte entry header, data_len at +8, pubkey at +16, owner at +64,
+     account data at +136.  Each entry is guaranteed unfragmented. */
+  for( ulong i=0UL; i<result->account_batch.batch_cnt; i++ ) {
+    uchar const * e        = result->account_batch.batch[ i ];
+    ulong         data_len = fd_ulong_load_8_fast( e+8UL );
+
+    /* Identical partition-boundary rule to process_account_header. */
+    ulong account_sz   = 68UL + data_len;
+    ulong cur_boundary = ctx->accounts_off / ctx->partition_sz;
+    ulong end_boundary = (ctx->accounts_off + account_sz - 1UL) / ctx->partition_sz;
+    if( FD_UNLIKELY( cur_boundary!=end_boundary ) ) {
+      ulong next = (cur_boundary + 1UL) * ctx->partition_sz;
+      buffer_skip( ctx, next - ctx->accounts_off );
+    }
+
+    if( FD_LIKELY( FD_SNAPWR_WRITE_BUF_SZ - ctx->write_buf_used >= 68UL ) ) {
+      uchar * d = ctx->write_buf + ctx->write_buf_used;
+      fd_memcpy( d,       e+16UL,    32UL );
+      fd_memcpy( d+32UL, &data_len,   4UL );
+      fd_memcpy( d+36UL,  e+64UL,    32UL );
+      ctx->write_buf_used += 68UL;
+      ctx->accounts_off   += 68UL;
+      if( FD_UNLIKELY( ctx->write_buf_used==FD_SNAPWR_WRITE_BUF_SZ ) ) buffer_flush( ctx );
+    } else {
+      uchar hdr[ 68UL ];
+      fd_memcpy( hdr,       e+16UL,    32UL );
+      fd_memcpy( hdr+32UL, &data_len,   4UL );
+      fd_memcpy( hdr+36UL,  e+64UL,    32UL );
+      buffer_write( ctx, hdr, 68UL );
+    }
+    ctx->metrics.accounts_written++;
+    buffer_write( ctx, e+136UL, data_len );
+  }
+}
+
 static int
 handle_data_frag( fd_snapwr_tile_t *  ctx,
                   ulong               chunk,
@@ -234,7 +273,7 @@ handle_data_frag( fd_snapwr_tile_t *  ctx,
         process_account_data( ctx, result );
         break;
       case FD_SSPARSE_ADVANCE_ACCOUNT_BATCH:
-        FD_TEST( 0 );
+        process_account_batch( ctx, result );
         break;
       case FD_SSPARSE_ADVANCE_DONE:
         buffer_flush( ctx );
@@ -279,6 +318,7 @@ handle_control_frag( fd_snapwr_tile_t *  ctx,
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->in.pos = 0UL;
       fd_ssparse_init( ctx->ssparse );
+      fd_ssparse_batch_enable( ctx->ssparse, 1 );
       fd_ssmanifest_parser_init( ctx->manifest_parser, ctx->manifest );
 
       /* Rewind metric counters (no-op unless recovering from a fail) */
@@ -460,7 +500,7 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( ctx->ct_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapwr_ct`" ));
 
   fd_ssparse_init( ctx->ssparse );
-  fd_ssparse_batch_enable( ctx->ssparse, 0 );
+  fd_ssparse_batch_enable( ctx->ssparse, 1 );
   fd_ssmanifest_parser_init( ctx->manifest_parser, ctx->manifest );
 
   fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ 0UL ] ];
