@@ -1964,6 +1964,170 @@ test_worker_write_behind( void ) {
   FD_TEST( !ctx->wb_kick_cnt && !ctx->wb_pending );
 }
 
+/* Worker incremental protocol: the INIT_INCR lane barrier starts the
+   attempt (counters reset, generation already bumped at the first
+   frag); the attempt's accdb fork arrives bound to the generation on
+   the ASSIGN jobs and must be consistent (single fork per attempt,
+   USHORT_MAX only in full attempts). */
+static void
+test_worker_incr_protocol( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 1UL );
+  test_pub_cnt = 0UL;
+  test_accdb_writer_begin_cnt = 0UL;
+
+  /* INIT_INCR: same lifecycle as INIT_FULL */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
+  FD_TEST( ctx->generation==1UL );
+  FD_TEST( !ctx->full );
+  FD_TEST( ctx->incr_fork==ULONG_MAX );
+  FD_TEST( test_accdb_writer_begin_cnt==1UL );
+  FD_TEST( test_pub_cnt==1UL );
+  FD_TEST( test_pub_sig[ 0 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) );
+
+  /* First ASSIGN adopts the fork */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 0UL, 42UL, 512UL, 100UL, 1024UL, 7UL ) );
+  FD_TEST( ctx->incr_fork==7UL );
+  FD_TEST( ctx->fifo_tail==1UL );
+
+  /* A conflicting fork on a later ASSIGN is a protocol violation */
+  test_pub_cnt = 0UL;
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 1UL, 43UL, 1536UL, 100UL, 2048UL, 9UL ) );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( test_pub_cnt==1UL );
+  FD_TEST( test_pub_sig[ 0 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_ERROR ) );
+  FD_TEST( last_worker_ack()->err==EPROTO );
+
+  /* FAIL resets the adopted fork */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( ctx->incr_fork==ULONG_MAX );
+
+  /* A full attempt rejects forked ASSIGNs */
+  worker_send_init( ctx ); /* generation 2 */
+  test_pub_cnt = 0UL;
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 2UL, 0UL, 42UL, 512UL, 100UL, 1024UL, 7UL ) );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( last_worker_ack()->err==EPROTO );
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+
+  /* An incremental attempt rejects the full-mode sentinel fork */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR ); /* generation 3 */
+  FD_TEST( ctx->generation==3UL );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 3UL, 0UL, 42UL, 512UL, 100UL, 1024UL, (ulong)USHORT_MAX ) );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( last_worker_ack()->err==EPROTO );
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+
+  /* Full staging pass under an incremental fork: counters reset at
+     INIT_INCR (no stale full-phase counts re-folded) and the adopted
+     fork reaches the accdb writer. */
+  ctx->metrics.accounts_loaded = 999UL; /* stale garbage that must not survive the reset */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR ); /* generation 4 */
+  FD_TEST( !ctx->metrics.accounts_loaded );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 4UL, 0UL, 440123518UL, 0UL, 100UL, 512UL, 5UL ) );
+  FD_TEST( ctx->incr_fork==5UL );
+
+  test_parser_script   = 5;
+  test_parser_call_cnt = 0UL;
+  test_accdb_worker_call_cnt  = 0UL;
+  test_accdb_worker_fork      = ULONG_MAX;
+  test_accdb_worker_next_off  = 65536UL;
+  test_accdb_worker_skip_mask = 1UL; /* entry 0 ignored */
+  test_accdb_worker_repl_mask = 2UL; /* entry 1 replaced */
+  FD_TEST( send_worker_data( ctx, 0UL, 100UL )==0 );
+  FD_TEST( test_accdb_worker_call_cnt==2UL ); /* batch + header account */
+  FD_TEST( test_accdb_worker_fork==5UL );     /* fork stamped through */
+  FD_TEST( ctx->metrics.accounts_loaded==2UL );
+  FD_TEST( ctx->metrics.accounts_ignored==1UL );
+  FD_TEST( ctx->metrics.accounts_replaced==1UL );
+
+  /* Deferred FINI works in the incremental phase too */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 4UL, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX ) );
+  test_pub_cnt = 0UL;
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
+  FD_TEST( test_pub_sig[ 0 ]==fd_snapin_io_ack_sig( 4UL, FD_SNAPSHOT_MSG_CTRL_FINI ) );
+  FD_TEST( last_worker_ack()->accounts_loaded==2UL ); /* this attempt only */
+}
+
+/* Coordinator incremental phase: INIT_INCR forwards (no more
+   hard-error), the incremental fork (attached at INIT_INCR) is stamped
+   on every ASSIGN, and a FAIL during the incremental phase purges the
+   fork WITHOUT revert_whead (which would release every partition) or
+   reset. */
+static void
+test_coordinator_incr_forward( void ) {
+  static uchar init_mem[ 2 ][ FD_CHUNK_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  fd_memset( init_mem, 0, sizeof(init_mem) );
+
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init_n( ctx, 2UL, FD_SNAPSHOT_STATE_IDLE, 2UL );
+  ctx->generation = 0UL;
+  for( ulong i=0UL; i<2UL; i++ ) {
+    ctx->in[ i ].wksp   = (fd_wksp_t *)init_mem[ i ];
+    ctx->in[ i ].chunk0 = 0UL;
+    ctx->in[ i ].wmark  = 0UL;
+    ctx->in[ i ].mtu    = 4096UL;
+  }
+  test_pub_cnt          = 0UL;
+  test_accdb_attach_cnt = 0UL;
+  test_accdb_purge_cnt  = 0UL;
+  test_accdb_revert_cnt = 0UL;
+  test_accdb_reset_cnt  = 0UL;
+
+  /* INIT_INCR barrier completes: fork attached, control forwarded to
+     the workers (pending), nothing published downstream yet. */
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  FD_TEST( ctx->generation==1UL );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
+  FD_TEST( !ctx->full );
+  FD_TEST( ctx->init_completed );
+  FD_TEST( test_accdb_attach_cnt==1UL );
+  FD_TEST( ctx->accdb_incr_fork_id.val==7U );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  FD_TEST( !test_pub_cnt );
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR, 0UL, 0UL, 0 );
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_INCR, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+
+  /* The incremental ASSIGN carries the attached fork */
+  test_parser_script   = 6;
+  test_parser_call_cnt = 0UL;
+  test_pub_cnt         = 0UL;
+  ulong ctl = fd_frag_meta_ctl( 0UL, 0, 0, 0 );
+  FD_TEST( !returnable_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA, 0UL, 512UL, ctl, 0UL, 0UL,
+                             (fd_stem_context_t *)1UL ) );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPIN_IO_KIND_ASSIGN );
+  fd_snapin_io_job_t const * assign = (fd_snapin_io_job_t const *)test_ring_mem[ 0 ];
+  FD_TEST( assign->kind==FD_SNAPIN_IO_KIND_ASSIGN );
+  FD_TEST( assign->generation==1UL );
+  FD_TEST( assign->fork_id==7UL );
+
+  /* FAIL during the incremental phase: after all FAIL acks, the fork is
+     purged but revert_whead (whead[0]-based, boot-zero recovery in io
+     mode) and reset must NOT run. */
+  test_pub_cnt = 0UL;
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( test_pub_cnt==3UL ); /* ABORT x2 + ERROR */
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FAIL );
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  FD_TEST( !test_accdb_purge_cnt ); /* deferred until all acks */
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  FD_TEST( test_accdb_purge_cnt==1UL );
+  FD_TEST( !test_accdb_revert_cnt );
+  FD_TEST( !test_accdb_reset_cnt );
+  FD_TEST( !ctx->init_completed );
+  FD_TEST( ctx->accdb_incr_fork_id.val==USHORT_MAX );
+  FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==FD_SNAPSHOT_MSG_CTRL_FAIL );
+}
+
 /* Coordinator passthrough: an appendvec tar header becomes an ASSIGN on
    the least-loaded worker's ring carrying the inline coverage; a region
    header broadcasts the watermark immediately; tar EOF broadcasts EOS. */
@@ -2228,6 +2392,8 @@ main( int     argc,
   test_coordinator_full_lifecycle_8_workers();
   test_coordinator_assign_flow();
   test_coordinator_watermark_protocol();
+  test_worker_incr_protocol();
+  test_coordinator_incr_forward();
   test_worker_write_behind();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

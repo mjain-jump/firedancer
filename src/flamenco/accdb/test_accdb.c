@@ -2060,6 +2060,342 @@ test_snapshot_striped_writers( void ) {
   test_teardown( accdb, fd );
 }
 
+/* Incremental extension of the striped-writer contract. */
+
+#define PAR_INCR_KEYS     (PAR_KEYS+16UL) /* 16 brand-new keys in the incr phase */
+#define PAR_INCR_LAMPORTS( t, k ) ( 2000000UL + (t)*1000UL + (k) )
+#define PAR_INCR_DLEN( t, k )     ( ((t)*3UL+(k))%64UL )
+
+/* Replay the shmem layout to reach the fork/acc/txn element arrays (the
+   private joiner struct is local to fd_accdb.c).  Keep in sync with
+   fd_accdb_shmem_new. */
+typedef struct {
+  fd_accdb_fork_shmem_t * fork_ele;
+  fd_accdb_accmeta_t *    acc_ele;
+  fd_accdb_txn_t *        txn_ele;
+} par_layout_t;
+
+static par_layout_t
+par_layout( ulong max_accounts ) {
+  ulong max_live_slots = test_shmem_mem->max_live_slots;
+  ulong chain_cnt      = test_shmem_mem->chain_cnt;
+  ulong txn_max        = max_live_slots*test_shmem_mem->max_account_writes_per_slot;
+  par_layout_t out;
+  FD_SCRATCH_ALLOC_INIT( l, test_shmem_mem );
+                 FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
+  out.fork_ele = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
+                 FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
+                 FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
+  out.acc_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
+  out.txn_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),        txn_max*sizeof(fd_accdb_txn_t)                          );
+  return out;
+}
+
+/* Incremental writer schedule against ctx->fork, all four threads
+   racing on the SAME keys through the stripe locks:
+     - keys k%4==0 and k%4==3: cross-fork overrides of the full winners,
+       each thread at its own slot 200+t (winner: slot 203);
+     - keys k%4==1: stale rewrite at slot 50 (below the full winner's
+       103): always ignored;
+     - keys k%4==2: untouched;
+     - keys [PAR_KEYS, PAR_INCR_KEYS): brand-new, each thread at its own
+       slot 200+t (first arrival loads, later ones replace in place). */
+static void *
+par_incr_writer_main( void * _ctx ) {
+  par_writer_ctx_t * ctx = _ctx;
+  ulong t = ctx->thread_idx;
+
+  for( ulong k=0UL; k<PAR_INCR_KEYS; k++ ) {
+    if( k<PAR_KEYS && k%4UL==2UL ) continue; /* group 2 untouched */
+
+    uchar const * pubkeys  [ 1 ] = { ctx->pks[ k ] };
+    ulong         lamports [ 1 ] = { k%4UL==1UL && k<PAR_KEYS ? 9000000UL+k : PAR_INCR_LAMPORTS( t, k ) };
+    ulong         data_lens[ 1 ] = { PAR_INCR_DLEN( t, k ) };
+    int           execs    [ 1 ] = { 0 };
+    ulong         offs     [ 1 ];
+    ulong slot = ( k<PAR_KEYS && k%4UL==1UL ) ? 50UL : 200UL+t;
+
+    ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
+    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, ctx->fork, 1UL, pubkeys, slot, lamports,
+                                                        data_lens, execs, &ctx->whead,
+                                                        ctx->stripe_locks, ctx->stripe_msk, ctx->m,
+                                                        offs, &ignored, &replaced, &loaded,
+                                                        &replaced_lamports, &ignored_lamports ) );
+    if( offs[ 0 ]!=ULONG_MAX ) {
+      ctx->alloc_offs[ ctx->alloc_cnt ] = offs[ 0 ];
+      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ 0 ];
+      ctx->alloc_cnt++;
+      fd_accdb_disk_meta_t meta;
+      fd_memcpy( meta.pubkey, pubkeys[ 0 ], 32UL );
+      meta.size       = (uint)data_lens[ 0 ];
+      meta.generation = 0U;
+      fd_memset( meta.owner, 0, 32UL );
+      FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)offs[ 0 ] )==(long)sizeof(meta) );
+    }
+    ctx->ignored           += ignored;
+    ctx->replaced          += replaced;
+    ctx->loaded            += loaded;
+    ctx->input_lamports    += lamports[ 0 ];
+    ctx->replaced_lamports += replaced_lamports;
+    ctx->ignored_lamports  += ignored_lamports;
+  }
+  return NULL;
+}
+
+/* Run one incremental attempt against fork_id and assert the
+   schedule-independent facts: loaded, write totals, the capitalization
+   identity, the fork txn undo-record list (length == loaded +
+   cross_replaced, fork bits, generation, slots), per-key winners, and
+   allocation disjointness. */
+static void
+test_run_striped_incr_attempt( fd_accdb_t *       coordinator,
+                               fd_accdb_t *       joins[],
+                               int                fd,
+                               fd_accdb_fork_id_t fork_id,
+                               uint *             stripe_locks,
+                               ulong              stripe_msk,
+                               uchar            (*pks)[ 32UL ],
+                               ulong              max_accounts ) {
+  par_writer_ctx_t ctxs[ PAR_THREADS ];
+  memset( ctxs, 0, sizeof(ctxs) );
+  pthread_t threads[ PAR_THREADS ];
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+    ctxs[ t ].accdb        = joins[ t ];
+    ctxs[ t ].fd           = fd;
+    ctxs[ t ].thread_idx   = t;
+    ctxs[ t ].fork         = fork_id;
+    ctxs[ t ].stripe_locks = stripe_locks;
+    ctxs[ t ].stripe_msk   = stripe_msk;
+    ctxs[ t ].pks          = pks;
+    FD_TEST( !pthread_create( &threads[ t ], NULL, par_incr_writer_main, &ctxs[ t ] ) );
+  }
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) FD_TEST( !pthread_join( threads[ t ], NULL ) );
+
+  ulong tot_loaded=0UL, tot_replaced=0UL, tot_ignored=0UL;
+  ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL, tot_eq=0UL;
+  ulong all_cnt=0UL;
+  static ulong all_allocs[ 2UL*PAR_THREADS*PAR_INCR_KEYS ][ 2 ];
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+    tot_loaded   += ctxs[ t ].loaded;
+    tot_replaced += ctxs[ t ].replaced;
+    tot_ignored  += ctxs[ t ].ignored;
+    tot_input    += ctxs[ t ].input_lamports;
+    tot_repl_l   += ctxs[ t ].replaced_lamports;
+    tot_ign_l    += ctxs[ t ].ignored_lamports;
+    tot_eq       += ctxs[ t ].m->eq_slot_dups;
+    for( ulong j=0UL; j<ctxs[ t ].alloc_cnt; j++ ) {
+      all_allocs[ all_cnt ][ 0 ] = ctxs[ t ].alloc_offs[ j ];
+      all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].alloc_szs [ j ];
+      all_cnt++;
+    }
+    fd_accdb_snapshot_flush_par_metrics( joins[ t ], ctxs[ t ].m );
+  }
+
+  ulong const new_cnt   = PAR_INCR_KEYS-PAR_KEYS;         /* 16 */
+  ulong const cross_cnt = PAR_KEYS/2UL;                   /* groups 0 and 3 */
+  ulong const write_cnt = PAR_THREADS*( cross_cnt + PAR_KEYS/4UL + new_cnt );
+
+  /* Distinct slots per thread: winners deterministic; every write is
+     exactly one of loaded/replaced/ignored. */
+  FD_TEST( !tot_eq );
+  FD_TEST( tot_loaded==new_cnt );
+  FD_TEST( tot_loaded+tot_replaced+tot_ignored==write_cnt );
+
+  /* Capitalization identity for the incremental phase (telescoping the
+     per-key accept chains; the first accepted write of a crossed key
+     books the shadowed FULL version's lamports as replaced):
+       input - ignored - replaced == final_incr - crossed_full_old. */
+  ulong exp = 0UL;
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    if( k%4UL==0UL || k%4UL==3UL ) exp += PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k ) - PAR_LAMPORTS( PAR_THREADS-1UL, k );
+  }
+  for( ulong k=PAR_KEYS; k<PAR_INCR_KEYS; k++ ) exp += PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k );
+  FD_TEST( tot_input-tot_ign_l-tot_repl_l==exp );
+
+  /* Fork visibility: the incr fork sees the overrides and new keys, the
+     root still sees the full winners. */
+  fd_accdb_fork_id_t root = test_shmem_mem->root_fork_id;
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    ulong full_win = PAR_LAMPORTS( PAR_THREADS-1UL, k );
+    ulong incr_win = ( k%4UL==0UL || k%4UL==3UL ) ? PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k ) : full_win;
+    FD_TEST( fd_accdb_lamports( coordinator, fork_id, pks[ k ] )==incr_win );
+    FD_TEST( fd_accdb_lamports( coordinator, root,    pks[ k ] )==full_win );
+  }
+  for( ulong k=PAR_KEYS; k<PAR_INCR_KEYS; k++ ) {
+    FD_TEST( fd_accdb_lamports( coordinator, fork_id, pks[ k ] )==PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k ) );
+    FD_TEST( fd_accdb_lamports( coordinator, root,    pks[ k ] )==0UL );
+  }
+
+  /* Every new pool entry (new key or cross-fork override) left exactly
+     one undo record on the fork, stamped with the fork's bits and
+     generation. */
+  par_layout_t lo = par_layout( max_accounts );
+  ulong txn_cnt = 0UL;
+  uint  txn_idx = lo.fork_ele[ fork_id.val ].txn_head;
+  while( txn_idx!=UINT_MAX ) {
+    fd_accdb_txn_t const *     txn = &lo.txn_ele[ txn_idx ];
+    fd_accdb_accmeta_t const * acc = &lo.acc_ele[ txn->acc_pool_idx ];
+    FD_TEST( fd_accdb_acc_fork_id( acc )==fork_id.val );
+    FD_TEST( acc->key.generation==lo.fork_ele[ fork_id.val ].generation );
+    FD_TEST( acc->cache_idx>=200U && acc->cache_idx<200U+(uint)PAR_THREADS );
+    txn_cnt++;
+    txn_idx = txn->fork.next;
+  }
+  FD_TEST( txn_cnt==cross_cnt+new_cnt ); /* == loaded + cross_replaced */
+
+  /* Accepted allocations never overlap (private write heads). */
+  qsort( all_allocs, all_cnt, 2UL*sizeof(ulong), par_offset_cmp );
+  for( ulong i=1UL; i<all_cnt; i++ ) {
+    FD_TEST( all_allocs[ i ][ 0 ]>=all_allocs[ i-1UL ][ 0 ]+all_allocs[ i-1UL ][ 1 ] );
+  }
+}
+
+/* Extends the striped-writer contract across the full->incremental
+   boundary: a concurrent full pass, then two incremental attempts of
+   the same-key racing schedule.  Attempt (a) is rolled back with
+   fd_accdb_purge (the io-mode FAIL path: no revert_whead, the attempt's
+   partitions leak but the index must be exactly the post-full state);
+   attempt (b) is promoted via recover_delta + advance_root and must
+   yield the merged winners.  Ends with an equal-slot incremental dup
+   check (untiebreakable: counted, not committed) and the readback
+   gate. */
+static void
+test_snapshot_striped_writers_incremental( void ) {
+  int fd;
+  ulong psz = 11UL<<20UL;
+  ulong max_accounts = 4096UL;
+  fd_accdb_t * coordinator = test_setup_ex( &fd, max_accounts, 64UL, 1024UL, 64UL, psz,
+                                            TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED,
+                                            PAR_THREADS+1UL );
+  fd_accdb_shmem_metrics_t const * shmetrics = fd_accdb_shmetrics( coordinator );
+
+  fd_accdb_fork_id_t root = fd_accdb_attach_child( coordinator, SENTINEL );
+  fd_accdb_snapshot_load_begin_with_writers( coordinator, PAR_THREADS );
+
+  static uint stripe_locks[ 16UL ];
+  memset( stripe_locks, 0, sizeof(stripe_locks) );
+  ulong stripe_msk = 15UL;
+
+  static uchar pks[ PAR_INCR_KEYS ][ 32UL ];
+  for( ulong k=0UL; k<PAR_INCR_KEYS; k++ ) {
+    fd_memset( pks[ k ], 0, 32UL );
+    pks[ k ][ 0 ] = (uchar)( k+1UL );
+    pks[ k ][ 1 ] = 0x78;
+  }
+
+  fd_accdb_t * joins[ PAR_THREADS ];
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) joins[ t ] = test_join_writer( fd );
+
+  /* Full pass: every thread writes every key at its own slot 100+t
+     (winner: slot 103). */
+  par_writer_ctx_t ctxs[ PAR_THREADS ];
+  memset( ctxs, 0, sizeof(ctxs) );
+  pthread_t threads[ PAR_THREADS ];
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+    ctxs[ t ].accdb        = joins[ t ];
+    ctxs[ t ].fd           = fd;
+    ctxs[ t ].thread_idx   = t;
+    ctxs[ t ].fork         = SENTINEL;
+    ctxs[ t ].stripe_locks = stripe_locks;
+    ctxs[ t ].stripe_msk   = stripe_msk;
+    ctxs[ t ].pks          = pks;
+    FD_TEST( !pthread_create( &threads[ t ], NULL, par_writer_main, &ctxs[ t ] ) );
+  }
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) FD_TEST( !pthread_join( threads[ t ], NULL ) );
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) fd_accdb_snapshot_flush_par_metrics( joins[ t ], ctxs[ t ].m );
+  FD_TEST( shmetrics->accounts_total==PAR_KEYS );
+
+  /* Attempt (a): incremental phase, then a purge rollback. */
+  fd_accdb_fork_id_t incr_a = fd_accdb_attach_child( coordinator, root );
+  test_run_striped_incr_attempt( coordinator, joins, fd, incr_a, stripe_locks, stripe_msk, pks, max_accounts );
+  FD_TEST( shmetrics->accounts_total==PAR_KEYS+PAR_KEYS/2UL+16UL );
+
+  fd_accdb_purge( coordinator, incr_a );
+  drain_background( coordinator );
+
+  FD_TEST( shmetrics->accounts_total==PAR_KEYS );
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    FD_TEST( fd_accdb_lamports( coordinator, root, pks[ k ] )==PAR_LAMPORTS( PAR_THREADS-1UL, k ) );
+  }
+  for( ulong k=PAR_KEYS; k<PAR_INCR_KEYS; k++ ) FD_TEST( fd_accdb_lamports( coordinator, root, pks[ k ] )==0UL );
+
+  /* The purge deferred its freed acc pool entries behind an epoch;
+     drain them back into the pool so attempt (b) can reuse them
+     (purging an empty scratch fork runs drain_deferred_frees first). */
+  fd_accdb_fork_id_t scratch = fd_accdb_attach_child( coordinator, root );
+  fd_accdb_purge( coordinator, scratch );
+  drain_background( coordinator );
+
+  /* Attempt (b): rerun the schedule on a fresh fork and promote it. */
+  fd_accdb_fork_id_t incr_b = fd_accdb_attach_child( coordinator, root );
+  test_run_striped_incr_attempt( coordinator, joins, fd, incr_b, stripe_locks, stripe_msk, pks, max_accounts );
+
+  /* The delta table is sized 0 here (as in the snapshot-load topology),
+     so recover_delta is a no-op; the tile ignores the return the same
+     way. */
+  (void)fd_accdb_snapshot_recover_delta( coordinator, incr_b );
+  __atomic_thread_fence( __ATOMIC_SEQ_CST );
+  fd_accdb_advance_root( coordinator, incr_b );
+  drain_background( coordinator );
+
+  /* Equal-slot incremental duplicate: untiebreakable under worker-local
+     offsets, so it must be counted (for the coordinator's malform gate)
+     and treated as ignored. */
+  fd_accdb_fork_id_t eq_fork = fd_accdb_attach_child( coordinator, incr_b );
+  {
+    par_writer_ctx_t eq[ 1 ];
+    memset( eq, 0, sizeof(eq) );
+    uchar const * pubkeys  [ 1 ] = { pks[ 2 ] }; /* group-2 key, untouched by the incr schedule */
+    ulong         lamports [ 1 ] = { 42UL };
+    ulong         data_lens[ 1 ] = { 8UL };
+    int           execs    [ 1 ] = { 0 };
+    ulong         offs     [ 1 ];
+    ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
+    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
+                                                        data_lens, execs, &eq->whead,
+                                                        stripe_locks, stripe_msk, eq->m,
+                                                        offs, &ignored, &replaced, &loaded,
+                                                        &replaced_lamports, &ignored_lamports ) );
+    FD_TEST( replaced==1UL && offs[ 0 ]!=ULONG_MAX && !eq->m->eq_slot_dups ); /* cross override of the promoted winner */
+    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
+                                                        data_lens, execs, &eq->whead,
+                                                        stripe_locks, stripe_msk, eq->m,
+                                                        offs, &ignored, &replaced, &loaded,
+                                                        &replaced_lamports, &ignored_lamports ) );
+    FD_TEST( ignored==1UL && offs[ 0 ]==ULONG_MAX && eq->m->eq_slot_dups==1UL );
+    fd_accdb_snapshot_flush_par_metrics( joins[ 0 ], eq->m );
+  }
+  fd_accdb_purge( coordinator, eq_fork );
+  drain_background( coordinator );
+
+  fd_accdb_snapshot_load_end( coordinator );
+
+  /* Merged winners: groups 0/3 crossed over, group 1 kept the full
+     value (stale incr rejected), group 2 untouched, new keys
+     inserted. */
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    ulong expect = ( k%4UL==0UL || k%4UL==3UL ) ? PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k )
+                                                : PAR_LAMPORTS( PAR_THREADS-1UL, k );
+    FD_TEST( fd_accdb_lamports( coordinator, incr_b, pks[ k ] )==expect );
+  }
+  for( ulong k=PAR_KEYS; k<PAR_INCR_KEYS; k++ ) {
+    FD_TEST( fd_accdb_lamports( coordinator, incr_b, pks[ k ] )==PAR_INCR_LAMPORTS( PAR_THREADS-1UL, k ) );
+  }
+  /* Shadowed full versions were unlinked by the promotion. */
+  FD_TEST( shmetrics->accounts_total==PAR_INCR_KEYS );
+
+  /* The sampled index->file readback covers both phases' explicit
+     offsets. */
+  fd_accdb_snapshot_verify_readback( coordinator, PAR_INCR_KEYS );
+
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) free( joins[ t ] );
+  test_teardown( coordinator, fd );
+}
+
+#undef PAR_INCR_DLEN
+#undef PAR_INCR_LAMPORTS
+#undef PAR_INCR_KEYS
+
 #undef PAR_LAMPORTS
 #undef PAR_DATA_LEN
 #undef PAR_THREADS
@@ -2381,6 +2717,8 @@ main( int     argc,
   FD_LOG_NOTICE(( "test_snapshot_striped_writers ..." ));
   for( ulong rep=0UL; rep<4UL; rep++ ) test_snapshot_striped_writers();
 
+  FD_LOG_NOTICE(( "test_snapshot_striped_writers_incremental ..." ));
+  for( ulong rep=0UL; rep<2UL; rep++ ) test_snapshot_striped_writers_incremental();
 
   FD_LOG_NOTICE(( "test_incremental_cross_fork_override ..." ));
   test_incremental_cross_fork_override();
