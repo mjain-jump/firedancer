@@ -1777,6 +1777,292 @@ test_snapshot_parallel_writers( void ) {
 #undef TEST_SNAPSHOT_ACCOUNT_CNT
 #undef TEST_SNAPSHOT_WRITER_CNT
 
+/* test_snapshot_striped_writers: adversarial multi-threaded coverage of
+   fd_accdb_snapshot_write_batch_par_worker.  T writer threads slam the
+   SAME set of pubkeys (same hash chains) concurrently, each allocating
+   its own explicit offsets from a private write head:
+
+     Phase A (distinct slots): every thread writes every key at its own
+     slot.  Exactly one index entry per key must survive, holding the
+     highest slot's version; loaded / replaced+ignored totals and the
+     lamports balance must be schedule-independent, and all accepted
+     allocations must be disjoint.
+
+     Phase B (equal slot): every thread rewrites every key at ONE slot.
+     Worker-local offsets admit no stream-order tiebreak: the first
+     writer in wins (schedule-dependent), the rest must be counted as
+     eq_slot_dups and ignored without allocating. */
+
+#define PAR_THREADS (4UL)
+#define PAR_KEYS    (64UL)
+
+typedef struct {
+  fd_accdb_t * accdb;
+  int          fd;
+  ulong        thread_idx;
+  int          equal_slot; /* phase B? */
+  uint *       stripe_locks;
+  ulong        stripe_msk;
+  uchar      (*pks)[ 32UL ];
+
+  /* outputs */
+  fd_accdb_snapshot_whead_t       whead;
+  fd_accdb_snapshot_par_metrics_t m[1];
+  ulong ignored;
+  ulong replaced;
+  ulong loaded;
+  ulong input_lamports;
+  ulong replaced_lamports;
+  ulong ignored_lamports;
+  ulong alloc_offs[ PAR_KEYS ];
+  ulong alloc_szs [ PAR_KEYS ];
+  ulong alloc_cnt;
+} par_writer_ctx_t;
+
+#define PAR_LAMPORTS( t, k )  ( 1000000UL + (t)*1000UL + (k) )
+#define PAR_DATA_LEN( t, k )  ( ((t)+(k))%64UL )
+
+static void *
+par_writer_main( void * _ctx ) {
+  par_writer_ctx_t * ctx = _ctx;
+  ulong t = ctx->thread_idx;
+
+  ulong k = 0UL;
+  while( k<PAR_KEYS ) {
+    ulong batch = fd_ulong_min( 1UL+((t+k)%8UL), PAR_KEYS-k );
+    uchar const * pubkeys  [ 8 ];
+    ulong         lamports [ 8 ];
+    ulong         data_lens[ 8 ];
+    int           execs    [ 8 ];
+    ulong         offs     [ 8 ];
+    for( ulong i=0UL; i<batch; i++ ) {
+      pubkeys  [ i ] = ctx->pks[ k+i ];
+      lamports [ i ] = PAR_LAMPORTS( t, k+i );
+      data_lens[ i ] = PAR_DATA_LEN( t, k+i );
+      execs    [ i ] = 0;
+    }
+    ulong slot = ctx->equal_slot ? 200UL : 100UL+t;
+
+    ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
+    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, batch, pubkeys, slot, lamports,
+                                                        data_lens, execs, &ctx->whead,
+                                                        ctx->stripe_locks, ctx->stripe_msk, ctx->m,
+                                                        offs, &ignored, &replaced, &loaded,
+                                                        &replaced_lamports, &ignored_lamports ) );
+    for( ulong i=0UL; i<batch; i++ ) {
+      if( offs[ i ]==ULONG_MAX ) continue; /* ignored dup burns no space */
+      ctx->alloc_offs[ ctx->alloc_cnt ] = offs[ i ];
+      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+      ctx->alloc_cnt++;
+      /* Stage the disk meta so verify_readback can gate the layout. */
+      fd_accdb_disk_meta_t meta;
+      fd_memcpy( meta.pubkey, pubkeys[ i ], 32UL );
+      meta.size       = (uint)data_lens[ i ];
+      meta.generation = 0U;
+      fd_memset( meta.owner, 0, 32UL );
+      FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)offs[ i ] )==(long)sizeof(meta) );
+    }
+    ctx->ignored  += ignored;
+    ctx->replaced += replaced;
+    ctx->loaded   += loaded;
+    for( ulong i=0UL; i<batch; i++ ) ctx->input_lamports += lamports[ i ];
+    ctx->replaced_lamports += replaced_lamports;
+    ctx->ignored_lamports  += ignored_lamports;
+    k += batch;
+  }
+  return NULL;
+}
+
+/* Count live index entries for pubkey and return the accmeta of the
+   (unique) entry.  Uses the same chain walk as the write path. */
+static fd_accdb_accmeta_t *
+par_find_unique( fd_accdb_shmem_t * shmem,
+                 ulong              max_accounts,
+                 uchar const *      pubkey ) {
+  ulong max_live_slots = shmem->max_live_slots;
+  ulong chain_cnt      = shmem->chain_cnt;
+  FD_SCRATCH_ALLOC_INIT( l, shmem );
+                                    FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
+                                    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
+                                    FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
+  uint *               acc_map     = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
+  fd_accdb_accmeta_t * acc_pool    = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
+
+  ulong hash = fd_hash32( pubkey, shmem->seed )&(chain_cnt-1UL);
+  fd_accdb_accmeta_t * found = NULL;
+  ulong cnt = 0UL;
+  uint next = acc_map[ hash ];
+  while( next!=UINT_MAX ) {
+    fd_accdb_accmeta_t * cand = &acc_pool[ next ];
+    if( !memcmp( cand->key.pubkey, pubkey, 32UL ) ) { found = cand; cnt++; }
+    next = cand->map.next;
+  }
+  FD_TEST( cnt==1UL ); /* double insert would show up here */
+  return found;
+}
+
+static int
+par_offset_cmp( void const * a, void const * b ) {
+  ulong ua = ((ulong const *)a)[0]; ulong ub = ((ulong const *)b)[0];
+  return ua<ub ? -1 : (ua>ub ? 1 : 0);
+}
+
+static void
+test_snapshot_striped_writers( void ) {
+  int fd;
+  ulong psz = 11UL<<20UL;
+  ulong max_accounts = 4096UL;
+  fd_accdb_t * accdb = test_setup_ex( &fd, max_accounts, 64UL, 1024UL, 64UL, psz,
+                                      TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED,
+                                      PAR_THREADS+1UL );
+
+  fd_accdb_fork_id_t root = fd_accdb_attach_child( accdb, SENTINEL );
+  (void)root;
+  fd_accdb_snapshot_load_begin_with_writers( accdb, PAR_THREADS );
+
+  /* Tiny stripe count so distinct chains share stripes too. */
+  static uint stripe_locks[ 16UL ];
+  memset( stripe_locks, 0, sizeof(stripe_locks) );
+  ulong stripe_msk = 15UL;
+
+  static uchar pks[ PAR_KEYS ][ 32UL ];
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    fd_memset( pks[ k ], 0, 32UL );
+    pks[ k ][ 0 ] = (uchar)( k+1UL );
+    pks[ k ][ 1 ] = 0x77;
+  }
+
+  fd_accdb_t * joins[ PAR_THREADS ];
+  par_writer_ctx_t ctxs[ PAR_THREADS ];
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+    joins[ t ] = test_join_writer( fd );
+    fd_accdb_snapshot_writer_begin( joins[ t ] );
+  }
+
+  ulong cum_input = 0UL, cum_ign_l = 0UL, cum_repl_l = 0UL;
+  for( int phase=0; phase<2; phase++ ) {
+    memset( ctxs, 0, sizeof(ctxs) );
+    pthread_t threads[ PAR_THREADS ];
+    for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+      ctxs[ t ].accdb        = joins[ t ];
+      ctxs[ t ].fd           = fd;
+      ctxs[ t ].thread_idx   = t;
+      ctxs[ t ].equal_slot   = phase;
+      ctxs[ t ].stripe_locks = stripe_locks;
+      ctxs[ t ].stripe_msk   = stripe_msk;
+      ctxs[ t ].pks          = pks;
+      FD_TEST( !pthread_create( &threads[ t ], NULL, par_writer_main, &ctxs[ t ] ) );
+    }
+    for( ulong t=0UL; t<PAR_THREADS; t++ ) FD_TEST( !pthread_join( threads[ t ], NULL ) );
+
+    ulong tot_loaded=0UL, tot_replaced=0UL, tot_ignored=0UL;
+    ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL;
+    ulong tot_eq=0UL, tot_eq_diff=0UL;
+    ulong all_cnt=0UL;
+    static ulong all_allocs[ 2UL*PAR_THREADS*PAR_KEYS ][ 2 ];
+    for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+      tot_loaded   += ctxs[ t ].loaded;
+      tot_replaced += ctxs[ t ].replaced;
+      tot_ignored  += ctxs[ t ].ignored;
+      tot_input    += ctxs[ t ].input_lamports;
+      tot_repl_l   += ctxs[ t ].replaced_lamports;
+      tot_ign_l    += ctxs[ t ].ignored_lamports;
+      tot_eq       += ctxs[ t ].m->eq_slot_dups;
+      tot_eq_diff  += ctxs[ t ].m->eq_slot_lamports_diff;
+      for( ulong j=0UL; j<ctxs[ t ].alloc_cnt; j++ ) {
+        all_allocs[ all_cnt ][ 0 ] = ctxs[ t ].alloc_offs[ j ];
+        all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].alloc_szs [ j ];
+        all_cnt++;
+      }
+      fd_accdb_snapshot_flush_par_metrics( joins[ t ], ctxs[ t ].m );
+    }
+
+    /* Accepted allocations never overlap (private write heads). */
+    qsort( all_allocs, all_cnt, 2UL*sizeof(ulong), par_offset_cmp );
+    for( ulong i=1UL; i<all_cnt; i++ ) {
+      FD_TEST( all_allocs[ i ][ 0 ]>=all_allocs[ i-1UL ][ 0 ]+all_allocs[ i-1UL ][ 1 ] );
+    }
+
+    ulong live_lamports = 0UL;
+    if( phase==0 ) {
+      /* Distinct slots: winner is the highest slot's version. */
+      FD_TEST( tot_loaded==PAR_KEYS );
+      FD_TEST( tot_replaced+tot_ignored==PAR_KEYS*(PAR_THREADS-1UL) );
+      FD_TEST( !tot_eq && !tot_eq_diff );
+      for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+        fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
+        FD_TEST( (ulong)acc->cache_idx==100UL+PAR_THREADS-1UL );
+        FD_TEST( acc->lamports==PAR_LAMPORTS( PAR_THREADS-1UL, k ) );
+        FD_TEST( FD_ACCDB_SIZE_DATA( acc->executable_size )==PAR_DATA_LEN( PAR_THREADS-1UL, k ) );
+        live_lamports += acc->lamports;
+      }
+    } else {
+      /* Equal slot: exactly one writer's version replaced the phase-A
+         entry; the other T-1 writes per key were untiebreakable dups,
+         counted and ignored without allocating. */
+      FD_TEST( !tot_loaded );
+      FD_TEST( tot_replaced==PAR_KEYS );
+      FD_TEST( tot_ignored ==PAR_KEYS*(PAR_THREADS-1UL) );
+      FD_TEST( tot_eq      ==PAR_KEYS*(PAR_THREADS-1UL) );
+      FD_TEST( tot_eq_diff ==PAR_KEYS*(PAR_THREADS-1UL) ); /* per-thread lamports always differ */
+      FD_TEST( all_cnt     ==PAR_KEYS );
+      for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+        fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
+        FD_TEST( (ulong)acc->cache_idx==200UL );
+        /* Winner is schedule dependent but must be one of the writers'
+           versions, internally consistent. */
+        ulong t_win = ULONG_MAX;
+        for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+          if( acc->lamports==PAR_LAMPORTS( t, k ) ) { t_win = t; break; }
+        }
+        FD_TEST( t_win!=ULONG_MAX );
+        FD_TEST( FD_ACCDB_SIZE_DATA( acc->executable_size )==PAR_DATA_LEN( t_win, k ) );
+        live_lamports += acc->lamports;
+      }
+    }
+
+    /* Capitalization identity (cumulative, since replaced_lamports of a
+       later phase subtracts the previous phase's live versions):
+       Sigma input - Sigma ignored - Sigma replaced == live.  Order
+       independent regardless of the interleaving. */
+    cum_input  += tot_input;
+    cum_ign_l  += tot_ign_l;
+    cum_repl_l += tot_repl_l;
+    FD_TEST( cum_input-cum_ign_l-cum_repl_l==live_lamports );
+  }
+
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
+    fd_accdb_snapshot_worker_close( joins[ t ], &ctxs[ t ].whead );
+    fd_accdb_snapshot_writer_end( joins[ t ] );
+  }
+
+  /* disk_used_bytes invariant: sum of (72+len) over the live set. */
+  fd_accdb_flush_metrics( accdb );
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) fd_accdb_flush_metrics( joins[ t ] );
+  ulong expect_used = 0UL;
+  for( ulong k=0UL; k<PAR_KEYS; k++ ) {
+    fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
+    expect_used += sizeof(fd_accdb_disk_meta_t)+FD_ACCDB_SIZE_DATA( acc->executable_size );
+  }
+  fd_accdb_shmem_metrics_t const * shmetrics = fd_accdb_shmetrics( accdb );
+  FD_TEST( shmetrics->accounts_total ==PAR_KEYS );
+  FD_TEST( shmetrics->disk_used_bytes==expect_used );
+
+  fd_accdb_snapshot_load_end( accdb );
+
+  /* The sampled index->file readback gate passes against the metas the
+     winners staged at their explicit offsets. */
+  fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS );
+
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) free( joins[ t ] );
+  test_teardown( accdb, fd );
+}
+
+#undef PAR_LAMPORTS
+#undef PAR_DATA_LEN
+#undef PAR_THREADS
+#undef PAR_KEYS
+
 /* test_incremental_cross_fork_override verifies that incremental
    cross-fork overrides create new acc_pool entries with txn records,
    and that purging the incremental fork + revert_whead fully restores
@@ -2089,6 +2375,9 @@ main( int     argc,
 
   FD_LOG_NOTICE(( "test_snapshot_parallel_writers ..." ));
   test_snapshot_parallel_writers();
+
+  FD_LOG_NOTICE(( "test_snapshot_striped_writers ..." ));
+  for( ulong rep=0UL; rep<4UL; rep++ ) test_snapshot_striped_writers();
 
   FD_LOG_NOTICE(( "test_incremental_cross_fork_override ..." ));
   test_incremental_cross_fork_override();
