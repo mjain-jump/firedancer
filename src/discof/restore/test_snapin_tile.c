@@ -67,6 +67,7 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_accdb_snapshot_flush_par_metrics mock_accdb_snapshot_flush_par_metrics
 #define fd_accdb_snapshot_worker_close mock_accdb_snapshot_worker_close
 #define fd_accdb_snapshot_verify_readback mock_accdb_snapshot_verify_readback
+#define fd_accdb_snapshot_load_begin_with_writers mock_accdb_snapshot_load_begin_with_writers
 #define fd_accdb_snapshot_write_batch mock_accdb_snapshot_write_batch
 #define fd_accdb_snapshot_write_one   mock_accdb_snapshot_write_one
 #define fd_accdb_reset                mock_accdb_reset
@@ -190,6 +191,13 @@ mock_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
   whead->val           = 0UL;
   whead->has_partition = 0;
   test_accdb_worker_close_cnt++;
+}
+
+void
+mock_accdb_snapshot_load_begin_with_writers( fd_accdb_t * accdb,
+                                             ulong        writer_cnt ) {
+  (void)accdb;
+  (void)writer_cnt;
 }
 
 void
@@ -1193,8 +1201,8 @@ static uchar test_worker_write_buf[ FD_SNAPIN_WRITE_BUF_SZ ]    __attribute__((a
 static uchar test_job_mem [ FD_SNAPIN_IO_JOB_SLOT_SZ ]          __attribute__((aligned(FD_CHUNK_ALIGN)));
 static uchar test_ack_mem [ FD_SNAPIN_IO_ACK_SLOT_SZ ]          __attribute__((aligned(FD_CHUNK_ALIGN)));
 static uchar test_wlane_mem[ 4 ][ 4096UL ]                      __attribute__((aligned(FD_CHUNK_ALIGN)));
-static uchar test_ring_mem[ 2 ][ FD_SNAPIN_IO_JOB_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
-static uchar test_wack_mem[ 2 ][ FD_SNAPIN_IO_ACK_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_ring_mem[ 8 ][ FD_SNAPIN_IO_JOB_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_wack_mem[ 8 ][ FD_SNAPIN_IO_ACK_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
 
 /* Worker in link layout mirrors the real topology: the snapin_io ring
    at in_idx 0, the snapdc lanes at in_idx 1..lane_cnt. */
@@ -1612,18 +1620,18 @@ test_worker_error_mid_init_barrier( void ) {
 /* Coordinator (io) side *********************************************/
 
 static void
-coordinator_io_ctx_init( fd_snapin_tile_t * ctx,
-                         ulong              lane_cnt,
-                         int                state ) {
+coordinator_io_ctx_init_n( fd_snapin_tile_t * ctx,
+                           ulong              lane_cnt,
+                           int                state,
+                           ulong              worker_cnt ) {
   sync_ctx_init( ctx, lane_cnt, state );
   ctx->io_enabled = 1;
-  ctx->worker_cnt = 2UL;
+  ctx->worker_cnt = worker_cnt;
   ctx->generation = 1UL;
   ctx->pending_worker_control = ULONG_MAX;
   for( ulong w=0UL; w<FD_SNAPIN_WORKER_MAX; w++ ) ctx->ack_in_idx[ w ] = ULONG_MAX;
-  ctx->ack_in_idx[ 0 ] = lane_cnt;
-  ctx->ack_in_idx[ 1 ] = lane_cnt+1UL;
-  for( ulong w=0UL; w<2UL; w++ ) {
+  for( ulong w=0UL; w<worker_cnt; w++ ) ctx->ack_in_idx[ w ] = lane_cnt+w;
+  for( ulong w=0UL; w<worker_cnt; w++ ) {
     ctx->io_in[ w ].wksp   = (fd_wksp_t *)test_wack_mem[ w ];
     ctx->io_in[ w ].chunk0 = 0UL;
     ctx->io_in[ w ].wmark  = 0UL;
@@ -1638,13 +1646,20 @@ coordinator_io_ctx_init( fd_snapin_tile_t * ctx,
 }
 
 static void
-coordinator_send_ack( fd_snapin_tile_t * ctx,
-                      ulong              worker,
-                      ulong              gen,
-                      ulong              control,
-                      ulong              loaded,
-                      ulong              eq_slot_dups,
-                      int                err ) {
+coordinator_io_ctx_init( fd_snapin_tile_t * ctx,
+                         ulong              lane_cnt,
+                         int                state ) {
+  coordinator_io_ctx_init_n( ctx, lane_cnt, state, 2UL );
+}
+
+static int
+coordinator_send_ack_ex( fd_snapin_tile_t * ctx,
+                         ulong              worker,
+                         ulong              gen,
+                         ulong              control,
+                         ulong              loaded,
+                         ulong              eq_slot_dups,
+                         int                err ) {
   fd_snapin_io_ack_t * ack = (fd_snapin_io_ack_t *)test_wack_mem[ worker ];
   fd_memset( ack, 0, sizeof(*ack) );
   ack->worker_idx      = worker;
@@ -1656,8 +1671,19 @@ coordinator_send_ack( fd_snapin_tile_t * ctx,
   ack->err             = err;
   ulong in_idx = ctx->ack_in_idx[ worker ];
   FD_TEST( !before_frag( ctx, in_idx, 0UL, fd_snapin_io_ack_sig( gen, control ) ) );
-  FD_TEST( !returnable_frag( ctx, in_idx, 0UL, fd_snapin_io_ack_sig( gen, control ), 0UL,
-                             sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL, (fd_stem_context_t *)1UL ) );
+  return returnable_frag( ctx, in_idx, 0UL, fd_snapin_io_ack_sig( gen, control ), 0UL,
+                          sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL, (fd_stem_context_t *)1UL );
+}
+
+static void
+coordinator_send_ack( fd_snapin_tile_t * ctx,
+                      ulong              worker,
+                      ulong              gen,
+                      ulong              control,
+                      ulong              loaded,
+                      ulong              eq_slot_dups,
+                      int                err ) {
+  FD_TEST( !coordinator_send_ack_ex( ctx, worker, gen, control, loaded, eq_slot_dups, err ) );
 }
 
 static void
@@ -1756,6 +1782,134 @@ test_coordinator_eq_slot_malform( void ) {
   FD_TEST( test_pub_sig[ 0 ]==FD_SNAPIN_IO_KIND_ABORT );
   FD_TEST( test_pub_sig[ 1 ]==FD_SNAPIN_IO_KIND_ABORT );
   FD_TEST( test_pub_sig[ 2 ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
+}
+
+/* Early worker acks: a worker's lane barrier (or a whole new attempt's
+   INIT bump) can complete before the coordinator has consumed its own
+   copies of the control frags — the coordinator must HOLD such acks,
+   not drop them (dropping wedges the ack mask forever; the race hit
+   the 8-worker bench at DONE). */
+static void
+test_coordinator_early_ack_hold( void ) {
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 2UL, FD_SNAPSHOT_STATE_FINISHING );
+  test_pub_cnt = 0UL;
+
+  /* Ack arrives before the coordinator's own FINI barrier: held. */
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 )==1 );
+  FD_TEST( ctx->pending_worker_ack_mask==0UL );
+
+  /* Partial barrier: still held. */
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 )==1 );
+
+  /* Barrier completes: the redelivered ack folds. */
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_ack_mask==1UL );
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 5UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_FINI );
+
+  /* Future-generation ack (worker's INIT barrier for the next attempt
+     raced ahead of ours): held; same-generation-after-bump folds. */
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 2UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL, 0UL, 0UL, 0 )==1 );
+  /* Stale ack from a previous attempt: dropped. */
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL, 0UL, 0UL, 0 )==0 );
+
+  /* While failing (state ERROR, pending abandoned): acks for abandoned
+     controls are dropped so the FAIL ack queued behind them can flow,
+     but an EARLY FAIL ack (worker's FAIL barrier completed first) is
+     held. */
+  ctx->state                  = FD_SNAPSHOT_STATE_ERROR;
+  ctx->abort_published        = 1;
+  ctx->pending_worker_control = ULONG_MAX;
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 )==0 );
+  FD_TEST( coordinator_send_ack_ex( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 )==1 );
+
+  /* FAIL barrier completes: the held FAIL ack folds and FAIL flows. */
+  test_pub_cnt = 0UL;
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  /* A straggling stale FINI ack ahead of worker 1's FAIL ack: dropped
+     on the mismatch path. */
+  FD_TEST( coordinator_send_ack_ex( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 )==0 );
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_FAIL );
+}
+
+/* Full control lifecycle at 8 workers (regression for the n9 post-DONE
+   wedge): INIT through SHUTDOWN with worker acks racing ahead of the
+   coordinator's own lane barriers at every step. */
+static void
+test_coordinator_full_lifecycle_8_workers( void ) {
+  static uchar init_mem[ 2 ][ FD_CHUNK_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  fd_memset( init_mem, 0, sizeof(init_mem) );
+
+  void * banks_mem;
+  fd_banks_t * banks = new_banks( &banks_mem );
+
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init_n( ctx, 2UL, FD_SNAPSHOT_STATE_IDLE, 8UL );
+  ctx->generation = 0UL; /* INIT bumps it */
+  ctx->banks      = banks;
+  ctx->in[ 0 ].wksp = (fd_wksp_t *)init_mem[ 0 ];
+  ctx->in[ 1 ].wksp = (fd_wksp_t *)init_mem[ 1 ];
+  test_pub_cnt = 0UL;
+  test_accdb_writer_begin_cnt = 0UL;
+
+  /* INIT: one ack before any INIT frag (future generation), one after
+     the first frag (same generation, barrier incomplete): both held. */
+  FD_TEST( coordinator_send_ack_ex( ctx, 3UL, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL, 0UL, 0UL, 0 )==1 );
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+  FD_TEST( ctx->generation==1UL );
+  FD_TEST( coordinator_send_ack_ex( ctx, 5UL, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL, 0UL, 0UL, 0 )==1 );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+  for( ulong w=0UL; w<8UL; w++ ) coordinator_send_ack( ctx, w, 1UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+
+  /* FINI: ALL EIGHT workers ack before the coordinator's own barrier
+     (the n9 wedge shape at DONE): all held, then folded. */
+  ctx->state   = FD_SNAPSHOT_STATE_FINISHING;
+  test_pub_cnt = 0UL;
+  for( ulong w=0UL; w<8UL; w++ ) {
+    FD_TEST( coordinator_send_ack_ex( ctx, w, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 100UL+w, 0UL, 0 )==1 );
+  }
+  FD_TEST( ctx->pending_worker_ack_mask==0UL );
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
+  for( ulong w=0UL; w<8UL; w++ ) coordinator_send_ack( ctx, w, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 100UL+w, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->metrics.accounts_loaded==8UL*100UL+28UL );
+
+  /* SHUTDOWN: half the acks early, half late. */
+  ctx->state   = FD_SNAPSHOT_STATE_IDLE; /* as if DONE completed */
+  test_pub_cnt = 0UL;
+  for( ulong w=0UL; w<4UL; w++ ) {
+    FD_TEST( coordinator_send_ack_ex( ctx, w, 1UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0 )==1 );
+  }
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  FD_TEST( !should_shutdown( ctx ) ); /* acks outstanding */
+  for( ulong w=0UL; w<8UL; w++ ) coordinator_send_ack( ctx, w, 1UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  FD_TEST( should_shutdown( ctx ) );
+
+  free( banks_mem );
 }
 
 /* Coordinator passthrough: an appendvec tar header becomes an ASSIGN on
@@ -2018,6 +2172,8 @@ main( int     argc,
   test_coordinator_ack_gating();
   test_coordinator_worker_error_ack();
   test_coordinator_eq_slot_malform();
+  test_coordinator_early_ack_hold();
+  test_coordinator_full_lifecycle_8_workers();
   test_coordinator_assign_flow();
   test_coordinator_watermark_protocol();
   FD_LOG_NOTICE(( "pass" ));

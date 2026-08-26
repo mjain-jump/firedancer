@@ -2535,7 +2535,17 @@ coordinator_finish_failed_attempt( fd_snapin_tile_t * ctx ) {
   ctx->init_completed = 0;
 }
 
-static void
+/* Process one worker ack.  Returns 1 to hold the ack frag (reprocess
+   later): workers take controls from their OWN lane barriers, so a
+   worker can legitimately complete a barrier and ack it (or even bump
+   into the next attempt's generation) BEFORE the coordinator has
+   consumed its own copies of the control frags.  Such "early" acks
+   must be held until the coordinator's barrier catches up — dropping
+   them wedges the ack mask (and thus the whole pipeline) forever.
+   The race window is the skew between snapdc tiles' control forwards
+   plus one stem poll rotation, and every worker is a lottery ticket. */
+
+static int
 coordinator_handle_ack( fd_snapin_tile_t *  ctx,
                         fd_stem_context_t * stem,
                         ulong               worker_idx,
@@ -2554,24 +2564,40 @@ coordinator_handle_ack( fd_snapin_tile_t *  ctx,
     FD_LOG_ERR(( "inconsistent worker ack (worker=%lu sig=%lx)", worker_idx, sig ));
   }
 
+  /* Future-attempt acks: the worker's INIT barrier (which bumps its
+     generation) completed before ours.  Hold until our own INIT frags
+     bump us into the same attempt.  Past-attempt acks are stale. */
+  if( FD_UNLIKELY( generation>ctx->generation ) ) return 1;
+  if( FD_UNLIKELY( generation<ctx->generation ) ) return 0;
+
   if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
-    if( generation==ctx->generation ) {
-      FD_LOG_WARNING(( "snapshot accdb worker %lu reported error (%d-%s)", worker_idx, ack->err, fd_io_strerror( ack->err ) ));
-      /* Abandon any in-flight ack wait (except FAIL, which every worker
-         still acks) even if we already transitioned to ERROR. */
-      if( ctx->pending_worker_control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) {
-        ctx->pending_worker_control  = ULONG_MAX;
-        ctx->pending_worker_ack_mask = 0UL;
-      }
-      transition_malformed( ctx, stem );
+    FD_LOG_WARNING(( "snapshot accdb worker %lu reported error (%d-%s)", worker_idx, ack->err, fd_io_strerror( ack->err ) ));
+    /* Abandon any in-flight ack wait (except FAIL, which every worker
+       still acks) even if we already transitioned to ERROR. */
+    if( ctx->pending_worker_control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) {
+      ctx->pending_worker_control  = ULONG_MAX;
+      ctx->pending_worker_ack_mask = 0UL;
     }
-    return;
+    transition_malformed( ctx, stem );
+    return 0;
   }
 
-  /* Drop stale acks: wrong generation, or acks for a control the
-     coordinator abandoned after an error. */
-  if( FD_UNLIKELY( generation!=ctx->generation ) ) return;
-  if( FD_UNLIKELY( ctx->pending_worker_control==ULONG_MAX || control!=ctx->pending_worker_control ) ) return;
+  if( FD_UNLIKELY( ctx->pending_worker_control==ULONG_MAX ) ) {
+    /* Acks for a control the coordinator abandoned after an error are
+       dropped while the FAIL flows (they are queued ahead of the FAIL
+       ack on the same link and must not block it).  Anything else with
+       no pending control is an early ack: hold it. */
+    if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR && control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) ) return 0;
+    return 1;
+  }
+  if( FD_UNLIKELY( control!=ctx->pending_worker_control ) ) {
+    /* Stale ack for a control abandoned after an error (e.g. a FINI
+       ack queued ahead of the FAIL ack): drop.  A clean flow cannot
+       produce this (the coordinator holds its lanes until the pending
+       control's ack mask completes, so workers cannot run a barrier
+       ahead). */
+    return 0;
+  }
 
   ulong worker_bit = 1UL<<worker_idx;
   if( FD_UNLIKELY( ctx->pending_worker_ack_mask & worker_bit ) ) {
@@ -2593,7 +2619,7 @@ coordinator_handle_ack( fd_snapin_tile_t *  ctx,
 
   ctx->pending_worker_ack_mask |= worker_bit;
   ulong all_worker_mask = (1UL<<ctx->worker_cnt)-1UL;
-  if( FD_LIKELY( ctx->pending_worker_ack_mask!=all_worker_mask ) ) return;
+  if( FD_LIKELY( ctx->pending_worker_ack_mask!=all_worker_mask ) ) return 0;
 
   ulong completed = ctx->pending_worker_control;
   ctx->pending_worker_control  = ULONG_MAX;
@@ -2606,11 +2632,12 @@ coordinator_handle_ack( fd_snapin_tile_t *  ctx,
     FD_LOG_WARNING(( "parallel loader: %lu equal-slot cross-appendvec duplicates (lamports-diff=%lu) cannot be tiebroken; flagging snapshot malformed",
                      ctx->worker_fold.eq_slot_dups, ctx->worker_fold.eq_slot_lamports_diff ));
     transition_malformed( ctx, stem );
-    return;
+    return 0;
   }
 
   if( FD_UNLIKELY( completed==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) coordinator_finish_failed_attempt( ctx );
   fd_stem_publish( stem, ctx->ct_out.idx, completed, 0UL, 0UL, 0UL, 0UL, 0UL );
+  return 0;
 }
 
 static void
@@ -3095,8 +3122,7 @@ returnable_frag( fd_snapin_tile_t *  ctx,
 
   ulong worker_idx = ctx->io_enabled ? ack_worker_idx( ctx, in_idx ) : ULONG_MAX;
   if( FD_UNLIKELY( worker_idx!=ULONG_MAX ) ) {
-    coordinator_handle_ack( ctx, stem, worker_idx, sig, chunk, sz );
-    return 0;
+    return coordinator_handle_ack( ctx, stem, worker_idx, sig, chunk, sz );
   }
 
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
