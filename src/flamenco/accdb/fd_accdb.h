@@ -122,10 +122,59 @@ fd_accdb_join_readonly( void *             ljoin,
    accounts never get a second write and therefore never get promoted
    by normal compaction-driven tiering.
 
-   The snapshot loader has exclusive write access to acc_pool. */
+   A single-writer snapshot loader has exclusive write access to acc_pool.
+   Multi-writer loaders must shard ownership so that one worker exclusively
+   owns every acc_map hash chain for the duration of the load.
+
+   fd_accdb_snapshot_load_begin is the normal single-writer entry point.
+   fd_accdb_snapshot_load_begin_with_writers declares the number of joiners
+   that may concurrently mutate the snapshot index.  The coordinator calls
+   it before any writer starts and calls load_end after every writer stops.
+   Counts greater than one use the parallel acc_pool allocator and atomic
+   shared counters.  Disk reservations remain serialized through one
+   coordinator so account bytes retain snapshot stream order. */
 
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
+
+void
+fd_accdb_snapshot_load_begin_with_writers( fd_accdb_t * accdb,
+                                           ulong        writer_cnt );
+
+/* Each parallel snapshot index writer brackets its job stream with
+   writer_begin/writer_end.  This lets it amortize shared acc_pool allocation
+   over local blocks while returning any unused tail before the coordinator
+   ends or resets the load.  Full-snapshot single-writer callers may also use
+   this pair to opt into the same block allocator. */
+
+void
+fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb );
+
+void
+fd_accdb_snapshot_writer_end( fd_accdb_t * accdb );
+
+/* fd_accdb_snapshot_worker_idx selects the writer that owns pubkey's hash
+   chain.  worker_cnt must be a power of two.  During a multi-writer snapshot
+   load, callers must send every account in one hash chain to the same worker
+   and preserve stream order on each worker. */
+
+ulong
+fd_accdb_snapshot_worker_idx( fd_accdb_t const * accdb,
+                              uchar const        pubkey[ static 32 ],
+                              ulong              worker_cnt );
+
+/* fd_accdb_snapshot_route_batch computes each pubkey's full acc_map chain
+   index and owning snapshot writer.  worker_cnt must be a power of two and
+   cnt must be in [1,8].  Full chain indices are useful for cheaply filtering
+   intra-batch duplicate checks before comparing pubkey bytes. */
+
+void
+fd_accdb_snapshot_route_batch( fd_accdb_t const * accdb,
+                               ulong              cnt,
+                               uchar const * const pubkeys[],
+                               ulong              worker_cnt,
+                               ulong              worker_idxs[],
+                               ulong              chain_idxs[] );
 
 void
 fd_accdb_snapshot_load_end( fd_accdb_t * accdb );
@@ -549,19 +598,102 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
    (a corrupt-snapshot signal — the caller should flag the snapshot
    malformed).  Output counters are not meaningful when -1 is returned.
 
-   Each slots[i] must be <= UINT_MAX (see fd_accdb_snapshot_write_one
+   slot must be <= UINT_MAX (see fd_accdb_snapshot_write_one
    for the rationale).  Passing a larger slot crashes the process.
 
    fork_id has the same semantics as in fd_accdb_snapshot_write_one:
    USHORT_MAX for full-snapshot mode, otherwise incremental mode with
    txn tracking on the specified fork. */
 
+/* fd_accdb_snapshot_prefetch_batch computes the hash chain bucket for each
+   pubkey and issues a prefetch for it, then returns.  It performs no lookup
+   and mutates nothing.
+
+   Call it as early as possible before fd_accdb_snapshot_write_batch on the
+   same pubkeys -- ideally with a few hundred cycles of unrelated work in
+   between.  The acc_map is indexed by a hash, so every bucket load is a
+   random access over gigabytes and misses to DRAM; write_batch's own
+   prefetch sits only a handful of cycles ahead of its use and cannot cover
+   that latency on its own. */
+
+void
+fd_accdb_snapshot_prefetch_batch( fd_accdb_t *        accdb,
+                                  ulong               cnt,
+                                  uchar const * const pubkeys[] );
+
+/* fd_accdb_snapshot_prefetch_chain_batch is the prehashed counterpart to
+   fd_accdb_snapshot_prefetch_batch.  chain_idxs must have been returned by
+   fd_accdb_snapshot_route_batch for this accdb and the same ordered pubkeys. */
+
+void
+fd_accdb_snapshot_prefetch_chain_batch( fd_accdb_t * accdb,
+                                        ulong        cnt,
+                                        ulong const  chain_idxs[] );
+
+/* fd_accdb_snapshot_reserve_batch reserves the on-disk locations for a
+   batch in stream order without mutating the account index.  This is the
+   ordered half of snapshot insertion: a coordinator may reserve offsets
+   and then hand the batch to an asynchronous index worker via
+   fd_accdb_snapshot_write_batch_preallocated.  Exactly one coordinator may
+   call this during a load.  cnt must be in [1,8]. */
+
+void
+fd_accdb_snapshot_reserve_batch( fd_accdb_t * accdb,
+                                 ulong        cnt,
+                                 ulong const  data_lens[],
+                                 ulong        file_offsets[] );
+
+/* fd_accdb_snapshot_write_batch_preallocated has the same index mutation,
+   duplicate handling, and output semantics as
+   fd_accdb_snapshot_write_batch, but uses offsets previously returned by
+   fd_accdb_snapshot_reserve_batch instead of advancing the write head. */
+
+int
+fd_accdb_snapshot_write_batch_preallocated( fd_accdb_t *        accdb,
+                                            fd_accdb_fork_id_t  fork_id,
+                                            ulong               cnt,
+                                            uchar const * const pubkeys[],
+                                            ulong               slot,
+                                            ulong  const        lamports[],
+                                            ulong  const        data_lens[],
+                                            int    const        executables[],
+                                            ulong  const        file_offsets[],
+                                            ulong *             accounts_ignored,
+                                            ulong *             accounts_replaced,
+                                            ulong *             accounts_loaded,
+                                            ulong *             out_replaced_lamports,
+                                            ulong *             out_ignored_lamports );
+
+/* fd_accdb_snapshot_write_batch_preallocated_prehashed is identical to
+   fd_accdb_snapshot_write_batch_preallocated, except it reuses chain_idxs
+   previously returned by fd_accdb_snapshot_route_batch instead of hashing
+   the pubkeys again.  The chain indices must correspond to this accdb and
+   the same ordered pubkeys.  Call fd_accdb_snapshot_prefetch_chain_batch
+   first when the chain heads are not already warm. */
+
+int
+fd_accdb_snapshot_write_batch_preallocated_prehashed( fd_accdb_t *        accdb,
+                                                      fd_accdb_fork_id_t  fork_id,
+                                                      ulong               cnt,
+                                                      uchar const * const pubkeys[],
+                                                      ulong const         chain_idxs[],
+                                                      ulong               slot,
+                                                      ulong const         lamports[],
+                                                      ulong const         data_lens[],
+                                                      int const           executables[],
+                                                      ulong const         file_offsets[],
+                                                      ulong *             accounts_ignored,
+                                                      ulong *             accounts_replaced,
+                                                      ulong *             accounts_loaded,
+                                                      ulong *             out_replaced_lamports,
+                                                      ulong *             out_ignored_lamports );
+
 int
 fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
                                fd_accdb_fork_id_t  fork_id,
                                ulong               cnt,
                                uchar const * const pubkeys[],
-                               ulong  const        slots[],
+                               ulong               slot,
                                ulong  const        lamports[],
                                ulong  const        data_lens[],
                                int    const        executables[],

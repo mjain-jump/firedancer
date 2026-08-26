@@ -4,6 +4,7 @@
 #include "utils/fd_ssparse.h"
 #include "utils/fd_ssmanifest_parser.h"
 #include "utils/fd_slot_delta_parser.h"
+#include "utils/fd_snapin_io.h"
 #include "../../util/fd_hash32.h"
 
 #include "../../disco/topo/fd_topo.h"
@@ -25,7 +26,13 @@
 
 #include "generated/fd_snapin_tile_seccomp.h"
 
+#include <errno.h>
+
 #define NAME "snapin"
+
+#define FD_SNAPIN_ROLE_COORDINATOR  (0)
+#define FD_SNAPIN_ROLE_ACCDB_WORKER (1)
+#define FD_SNAPIN_WORKER_MAX        (FD_SNAPIN_TILE_MAX-1UL)
 
 /* The snapin tile is a state machine that parses and loads a full
    and optionally an incremental snapshot.  It is currently responsible
@@ -94,11 +101,19 @@ struct fd_snapin_out_link {
 typedef struct fd_snapin_out_link fd_snapin_out_link_t;
 
 struct fd_snapin_tile {
+  int  role;
+  int  io_enabled;
   int  state;
   uint full           : 1;  /* loading a full snapshot? */
   uint init_completed : 1;  /* did INIT complete for this attempt? */
 
   ulong lane_cnt;
+  ulong worker_idx;
+  ulong worker_cnt;
+  ulong ack_in_idx[ FD_SNAPIN_WORKER_MAX ];
+  ulong generation;
+  ulong pending_worker_control;
+  ulong pending_worker_ack_mask;
   ulong expected_frame;
   ulong pending_control;    /* control message expected from snapdc tiles */
   uchar control_seen[ FD_TOPO_MAX_TILE_IN_LINKS ];
@@ -205,6 +220,23 @@ struct fd_snapin_tile {
   fd_snapin_out_link_t ct_out;
   fd_snapin_out_link_t manifest_out;
   fd_snapin_out_link_t gui_out;
+  fd_snapin_out_link_t io_out[ FD_SNAPIN_WORKER_MAX ];
+  fd_snapin_out_link_t ack_out;
+
+  struct {
+    fd_wksp_t * wksp;
+    ulong       chunk0;
+    ulong       wmark;
+    ulong       mtu;
+  } io_in[ FD_SNAPIN_WORKER_MAX ];
+
+  ulong pending_job_cnt[ FD_SNAPIN_WORKER_MAX ];
+
+  struct {
+    ulong input_lamports;
+    ulong replaced_lamports;
+    ulong ignored_lamports;
+  } worker;
 
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
   ulong gui_config_acct_off;  /* bytes accumulated so far into the current gui_out link chunk */
@@ -234,6 +266,11 @@ struct fd_snapin_tile {
 
 typedef struct fd_snapin_tile fd_snapin_tile_t;
 
+static inline int
+is_accdb_worker( fd_snapin_tile_t const * ctx ) {
+  return ctx->role!=FD_SNAPIN_ROLE_COORDINATOR;
+}
+
 static void
 format_count( char * out, ulong out_sz, ulong n ) {
   if(      n>=1000000UL ) FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%.1fM", (double)n/1e6 ) );
@@ -243,7 +280,10 @@ format_count( char * out, ulong out_sz, ulong n ) {
 
 static inline int
 should_shutdown( fd_snapin_tile_t * ctx ) {
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN ) ) {
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) return ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN;
+  int ready = ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN &&
+              ( !ctx->io_enabled || ctx->pending_worker_control==ULONG_MAX );
+  if( FD_UNLIKELY( ready ) ) {
     ulong accounts_dup = ctx->metrics.accounts_ignored + ctx->metrics.accounts_replaced;
     long  elapsed_ns   = fd_log_wallclock() - ctx->boot_timestamp;
     char  loaded_buf[ 32 ];
@@ -253,7 +293,7 @@ should_shutdown( fd_snapin_tile_t * ctx ) {
     FD_LOG_NOTICE(( "loaded %s accounts %s(%s dups)%s from snapshot in %.3f seconds",
                     loaded_buf, fd_log_style_dim(), dup_buf, fd_log_style_normal(), (double)elapsed_ns/1e9 ));
   }
-  return ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN;
+  return ready;
 }
 
 static ulong
@@ -265,6 +305,10 @@ static ulong
 scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                                    );
+  if( FD_UNLIKELY( tile->kind_id!=FD_SNAPIN_ROLE_COORDINATOR ) ) {
+    l = FD_LAYOUT_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    return FD_LAYOUT_FINI( l, scratch_align() );
+  }
   l = FD_LAYOUT_APPEND( l, fd_txncache_align(),           fd_txncache_footprint( tile->snapin.max_live_slots )        );
   l = FD_LAYOUT_APPEND( l, fd_accdb_align(),              fd_accdb_footprint( tile->snapin.max_live_slots )           );
   l = FD_LAYOUT_APPEND( l, fd_ssmanifest_parser_align(),  fd_ssmanifest_parser_footprint()                            );
@@ -483,11 +527,27 @@ clear_control_barrier( fd_snapin_tile_t * ctx ) {
   fd_memset( ctx->control_seen, 0, sizeof(ctx->control_seen) );
 }
 
+static inline void
+io_out_advance( fd_snapin_tile_t * ctx,
+                ulong              worker_idx ) {
+  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+  out->chunk = fd_dcache_compact_next( out->chunk, out->mtu, out->chunk0, out->wmark );
+}
+
+static inline void
+ack_out_advance( fd_snapin_tile_t * ctx ) {
+  ctx->ack_out.chunk = fd_dcache_compact_next( ctx->ack_out.chunk,
+                                                ctx->ack_out.mtu,
+                                                ctx->ack_out.chunk0,
+                                                ctx->ack_out.wmark );
+}
+
 static void
 transition_malformed( fd_snapin_tile_t *  ctx,
                       fd_stem_context_t * stem ) {
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
   ctx->state = FD_SNAPSHOT_STATE_ERROR;
+  fd_memset( ctx->pending_job_cnt, 0, sizeof(ctx->pending_job_cnt) );
   fd_stem_publish( stem, ctx->ct_out.idx, FD_SNAPSHOT_MSG_CTRL_ERROR, 0UL, 0UL, 0UL, 0UL, 0UL );
 }
 
@@ -873,23 +933,158 @@ snoop_stake_delegation( fd_snapin_tile_t *  ctx,
       FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
 }
 
+static void
+publish_pending_job( fd_snapin_tile_t *  ctx,
+                     ulong               worker_idx,
+                     fd_stem_context_t * stem ) {
+  ulong cnt = ctx->pending_job_cnt[ worker_idx ];
+  if( FD_UNLIKELY( !cnt ) ) return;
+
+  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+  FD_TEST( job->kind==FD_SNAPIN_IO_KIND_BATCH && job->worker_idx==worker_idx && job->cnt==cnt );
+  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
+                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+  io_out_advance( ctx, worker_idx );
+  ctx->pending_job_cnt[ worker_idx ] = 0UL;
+}
+
+static void
+publish_all_pending_jobs( fd_snapin_tile_t *  ctx,
+                          fd_stem_context_t * stem ) {
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    publish_pending_job( ctx, worker_idx, stem );
+  }
+}
+
+static inline void
+discard_all_pending_jobs( fd_snapin_tile_t * ctx ) {
+  fd_memset( ctx->pending_job_cnt, 0, sizeof(ctx->pending_job_cnt) );
+}
+
+__attribute__((always_inline)) static inline void
+append_worker_job( fd_snapin_tile_t *  ctx,
+                   ulong               worker_idx,
+                   uchar const *       pubkey,
+                   ulong               chain_idx,
+                   ulong               slot,
+                   ulong               lamports,
+                   ulong               data_len,
+                   int                 executable,
+                   ulong               file_offset,
+                   fd_accdb_fork_id_t  fork_id,
+                   fd_stem_context_t * stem ) {
+  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+  ulong cnt = ctx->pending_job_cnt[ worker_idx ];
+
+  if( FD_UNLIKELY( cnt && (job->slot!=slot || job->fork_id!=fork_id.val) ) ) {
+    publish_pending_job( ctx, worker_idx, stem );
+    job = fd_chunk_to_laddr( out->mem, out->chunk );
+    cnt = 0UL;
+  }
+
+  if( FD_UNLIKELY( !cnt ) ) {
+    job->kind       = FD_SNAPIN_IO_KIND_BATCH;
+    job->worker_idx = worker_idx;
+    job->generation = ctx->generation;
+    job->control    = ULONG_MAX;
+    job->cnt        = 0UL;
+    job->slot       = slot;
+    job->fork_id    = fork_id.val;
+  }
+
+  FD_TEST( cnt<8UL );
+  fd_memcpy( job->pubkeys[ cnt ], pubkey, 32UL );
+  fd_snapin_io_job_set_chain_idx( job, cnt, chain_idx );
+  job->lamports   [ cnt ] = lamports;
+  job->data_lens  [ cnt ] = data_len;
+  job->executables[ cnt ] = executable;
+  job->file_offsets[ cnt ] = file_offset;
+  job->cnt = ++cnt;
+  ctx->pending_job_cnt[ worker_idx ] = cnt;
+
+  if( FD_UNLIKELY( cnt==8UL ) ) publish_pending_job( ctx, worker_idx, stem );
+}
+
+static int
+write_account_batch( fd_snapin_tile_t *  ctx,
+                     ulong               cnt,
+                     uchar const * const pubkeys[],
+                     ulong               slot,
+                     ulong const         lamports[],
+                     ulong const         data_lens[],
+                     int const           executables[],
+                     fd_stem_context_t * stem ) {
+  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
+
+  ctx->metrics.total_accounts_processed += cnt;
+  ctx->metrics.total_account_batches_processed++;
+
+  if( FD_UNLIKELY( ctx->io_enabled ) ) {
+    ulong worker_idxs[ 8 ];
+    ulong chain_idxs [ 8 ];
+    fd_accdb_snapshot_route_batch( ctx->accdb, cnt, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
+
+    for( ulong i=1UL; i<cnt; i++ ) {
+      for( ulong j=0UL; j<i; j++ ) {
+        if( FD_LIKELY( chain_idxs[ i ]!=chain_idxs[ j ] ) ) continue;
+        if( FD_UNLIKELY( !memcmp( pubkeys[ i ], pubkeys[ j ], 32UL ) ) ) {
+          FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single parser batch (entries %lu and %lu, slot %lu)", j, i, slot ));
+          return -1;
+        }
+      }
+    }
+
+    ulong file_offsets[ 8 ];
+    fd_accdb_snapshot_reserve_batch( ctx->accdb, cnt, data_lens, file_offsets );
+    for( ulong i=0UL; i<cnt; i++ ) {
+      append_worker_job( ctx, worker_idxs[ i ], pubkeys[ i ], chain_idxs[ i ], slot, lamports[ i ], data_lens[ i ], executables[ i ],
+                         file_offsets[ i ], fork_id, stem );
+    }
+    return 1;
+  }
+
+  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, cnt, pubkeys, slot, lamports, data_lens,
+                                                     executables, &accounts_ignored, &accounts_replaced, &accounts_loaded,
+                                                     &replaced_lamports, &ignored_lamports ) ) ) {
+    return -1;
+  }
+  ctx->metrics.accounts_ignored  += accounts_ignored;
+  ctx->metrics.accounts_replaced += accounts_replaced;
+  ctx->metrics.accounts_loaded   += accounts_loaded;
+  for( ulong i=0UL; i<cnt; i++ ) ctx->capitalization = fd_ulong_sat_add( ctx->capitalization, lamports[ i ] );
+  ctx->capitalization     = fd_ulong_sat_sub( ctx->capitalization, ignored_lamports );
+  ctx->dup_capitalization = fd_ulong_sat_add( ctx->dup_capitalization, replaced_lamports );
+
+  if( accounts_ignored )  return 0;
+  if( accounts_replaced ) return 2;
+  return 1;
+}
+
 static int
 process_account_batch( fd_snapin_tile_t *            ctx,
-                       fd_ssparse_advance_result_t * result ) {
+                       fd_ssparse_advance_result_t * result,
+                       fd_stem_context_t *           stem ) {
   uchar const * const * entries    = result->account_batch.batch;
   ulong                 cnt        = result->account_batch.batch_cnt;
   ulong                 batch_slot = result->account_batch.slot;
 
   uchar const * pubkeys    [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
-  ulong         slots      [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         lamports   [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         data_lens  [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   int           executables[ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
 
+  /* Resolve pubkey pointers first and start the acc_map prefetch, so the
+     per-account loop below runs while those lines are in flight.  In the
+     multi-worker path the coordinator does not touch the acc_map; each
+     worker issues this prefetch before insertion instead. */
+  for( ulong i=0UL; i<cnt; i++ ) pubkeys[ i ] = entries[ i ] + 16UL;
+  if( FD_LIKELY( !ctx->io_enabled ) ) fd_accdb_snapshot_prefetch_batch( ctx->accdb, cnt, pubkeys );
+
   for( ulong i=0UL; i<cnt; i++ ) {
     uchar const * e = entries[ i ];
-    pubkeys[ i ]     = e + 16UL;
-    slots[ i ]       = batch_slot;
     lamports[ i ]    = fd_ulong_load_8_fast( e+48UL );
     data_lens[ i ]   = fd_ulong_load_8_fast( e+8UL );
     executables[ i ] = e[ 96UL ];
@@ -917,57 +1112,20 @@ process_account_batch( fd_snapin_tile_t *            ctx,
     }
   }
 
-  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, cnt, pubkeys, slots, lamports, data_lens,
-                                                     executables, &accounts_ignored, &accounts_replaced, &accounts_loaded,
-                                                     &replaced_lamports, &ignored_lamports ) ) ) {
-    return -1;
-  }
-  ctx->metrics.accounts_ignored  += accounts_ignored;
-  ctx->metrics.accounts_replaced += accounts_replaced;
-  ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->metrics.total_accounts_processed += cnt;
-  ctx->metrics.total_account_batches_processed++;
-  /* Sum lamports of every accepted entry into capitalization, and
-     accumulate the lamports of overwritten entries into
-     dup_capitalization so the final value can be reconciled with the
-     manifest.  Ignored entries (older slot than what's already in the
-     accdb) contribute neither to the live database nor to capitalization,
-     so subtract their lamports back out. */
-  for( ulong i=0UL; i<cnt; i++ ) ctx->capitalization = fd_ulong_sat_add( ctx->capitalization, lamports[ i ] );
-  ctx->capitalization     = fd_ulong_sat_sub( ctx->capitalization, ignored_lamports );
-  ctx->dup_capitalization = fd_ulong_sat_add( ctx->dup_capitalization, replaced_lamports );
-
-  return 0;
+  return fd_int_if( write_account_batch( ctx, cnt, pubkeys, batch_slot, lamports, data_lens, executables, stem )<0, -1, 0 );
 }
 
 static int
-process_account_header( fd_snapin_tile_t * ctx,
-                        fd_ssparse_advance_result_t * result ) {
-  ctx->metrics.total_account_batches_processed++;
-  ctx->metrics.total_accounts_processed++;
-  ulong replaced_lamports = 0UL;
-  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
-  int account = fd_accdb_snapshot_write_one( ctx->accdb,
-                                             fork_id,
-                                             result->account_header.pubkey,
-                                             result->account_header.slot,
-                                             result->account_header.lamports,
-                                             result->account_header.data_len,
-                                             result->account_header.executable,
-                                             &replaced_lamports );
-  if( FD_UNLIKELY( -1==account ) ) {
-    ctx->metrics.accounts_ignored++;
-  } else {
-    if( FD_UNLIKELY( 2==account ) ) {
-      ctx->metrics.accounts_replaced++;
-      ctx->dup_capitalization = fd_ulong_sat_add( ctx->dup_capitalization, replaced_lamports );
-    } else {
-      ctx->metrics.accounts_loaded++;
-    }
-    ctx->capitalization = fd_ulong_sat_add( ctx->capitalization, result->account_header.lamports );
-  }
+process_account_header( fd_snapin_tile_t *            ctx,
+                        fd_ssparse_advance_result_t * result,
+                        fd_stem_context_t *           stem ) {
+  uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
+  ulong lamports   [ 1 ] = { result->account_header.lamports   };
+  ulong data_lens  [ 1 ] = { result->account_header.data_len  };
+  int   executables[ 1 ] = { result->account_header.executable };
+  int account = write_account_batch( ctx, 1UL, pubkeys, result->account_header.slot,
+                                     lamports, data_lens, executables, stem );
+  if( FD_UNLIKELY( account<0 ) ) return -1;
 
   /* Snoop SlotHistory sysvar.  Streaming path: arm the capture window
      here; process_account_data appends bytes while armed. */
@@ -1001,7 +1159,7 @@ process_account_header( fd_snapin_tile_t * ctx,
   }
 
   ctx->stake_reasm.capturing = 0;
-  if( FD_UNLIKELY( account!=-1 &&
+  if( FD_UNLIKELY( account!=0 &&
                    result->account_header.lamports &&
                    result->account_header.data_len>=sizeof(fd_stake_state_t) &&
                    !memcmp( result->account_header.owner, &fd_solana_stake_program_id, sizeof(fd_pubkey_t) ) ) ) {
@@ -1223,7 +1381,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         break;
       }
       case FD_SSPARSE_ADVANCE_ACCOUNT_HEADER:
-        early_exit = process_account_header( ctx, result );
+        early_exit = process_account_header( ctx, result, stem );
         if( FD_UNLIKELY( early_exit<0 ) ) {
           transition_malformed( ctx, stem );
           return 0;
@@ -1271,7 +1429,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         }
         break;
       case FD_SSPARSE_ADVANCE_ACCOUNT_BATCH:
-        early_exit = process_account_batch( ctx, result );
+        early_exit = process_account_batch( ctx, result, stem );
         if( FD_UNLIKELY( early_exit<0 ) ) {
           transition_malformed( ctx, stem );
           return 0;
@@ -1316,6 +1474,284 @@ validate_capitalization( fd_snapin_tile_t * ctx ) {
 }
 
 static void
+publish_worker_control( fd_snapin_tile_t *  ctx,
+                        fd_stem_context_t * stem,
+                        ulong               control ) {
+  FD_TEST( ctx->io_enabled );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) discard_all_pending_jobs( ctx );
+  else                                                     publish_all_pending_jobs( ctx, stem );
+
+  ctx->pending_worker_ack_mask = 0UL;
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+    fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+    job->kind       = FD_SNAPIN_IO_KIND_CTRL;
+    job->worker_idx = worker_idx;
+    job->generation = ctx->generation;
+    job->control    = control;
+    job->cnt        = 0UL;
+    job->slot       = 0UL;
+    job->fork_id    = ULONG_MAX;
+    fd_stem_publish( stem, out->idx, control,
+                     out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+    io_out_advance( ctx, worker_idx );
+  }
+  ctx->pending_worker_control = control;
+}
+
+static void
+worker_reset_attempt( fd_snapin_tile_t * ctx ) {
+  ctx->metrics.accounts_ignored  = 0UL;
+  ctx->metrics.accounts_replaced = 0UL;
+  ctx->metrics.accounts_loaded   = 0UL;
+  ctx->metrics.total_accounts_processed       = 0UL;
+  ctx->metrics.total_account_batches_processed = 0UL;
+  ctx->worker.input_lamports    = 0UL;
+  ctx->worker.replaced_lamports = 0UL;
+  ctx->worker.ignored_lamports  = 0UL;
+}
+
+static void
+worker_publish_ack( fd_snapin_tile_t *  ctx,
+                    fd_stem_context_t * stem,
+                    ulong               generation,
+                    ulong               control,
+                    int                 err ) {
+  fd_snapin_io_ack_t * ack = fd_chunk_to_laddr( ctx->ack_out.mem, ctx->ack_out.chunk );
+  ack->worker_idx        = ctx->worker_idx;
+  ack->generation        = generation;
+  ack->control           = control;
+  ack->accounts_ignored  = ctx->metrics.accounts_ignored;
+  ack->accounts_replaced = ctx->metrics.accounts_replaced;
+  ack->accounts_loaded   = ctx->metrics.accounts_loaded;
+  ack->input_lamports    = ctx->worker.input_lamports;
+  ack->replaced_lamports = ctx->worker.replaced_lamports;
+  ack->ignored_lamports  = ctx->worker.ignored_lamports;
+  ack->err                = err;
+  fd_stem_publish( stem, ctx->ack_out.idx, fd_snapin_io_ack_sig( generation, control ),
+                   ctx->ack_out.chunk, sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL );
+  ack_out_advance( ctx );
+}
+
+static void
+worker_fail( fd_snapin_tile_t *  ctx,
+             fd_stem_context_t * stem,
+             ulong               generation,
+             int                 err ) {
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
+  FD_LOG_WARNING(( "snapshot accdb worker failed (%d-%s)", err, fd_io_strerror( err ) ));
+  fd_accdb_snapshot_writer_end( ctx->accdb );
+  ctx->state = FD_SNAPSHOT_STATE_ERROR;
+  worker_publish_ack( ctx, stem, generation, FD_SNAPSHOT_MSG_CTRL_ERROR, err );
+}
+
+static void
+worker_handle_batch( fd_snapin_tile_t *       ctx,
+                     fd_snapin_io_job_t const * job,
+                     fd_stem_context_t *      stem ) {
+  if( FD_UNLIKELY( job->generation!=ctx->generation ||
+                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
+                   !job->cnt || job->cnt>8UL || job->fork_id>USHORT_MAX ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  uchar const * pubkeys  [ 8 ];
+  ulong         chain_idxs[ 8 ];
+  for( ulong i=0UL; i<job->cnt; i++ ) {
+    pubkeys  [ i ] = job->pubkeys[ i ];
+    chain_idxs[ i ] = fd_snapin_io_job_chain_idx( job, i );
+  }
+  fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, job->cnt, chain_idxs );
+
+  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
+  fd_accdb_fork_id_t fork_id = { .val = (ushort)job->fork_id };
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_preallocated_prehashed( ctx->accdb, fork_id, job->cnt, pubkeys,
+                                                                            chain_idxs, job->slot, job->lamports,
+                                                                            job->data_lens, job->executables, job->file_offsets,
+                                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
+                                                                            &replaced_lamports, &ignored_lamports ) ) ) {
+    worker_fail( ctx, stem, job->generation, EINVAL );
+    return;
+  }
+
+  ctx->metrics.accounts_ignored  += accounts_ignored;
+  ctx->metrics.accounts_replaced += accounts_replaced;
+  ctx->metrics.accounts_loaded   += accounts_loaded;
+  ctx->metrics.total_accounts_processed += job->cnt;
+  ctx->metrics.total_account_batches_processed++;
+  for( ulong i=0UL; i<job->cnt; i++ ) {
+    ctx->worker.input_lamports = fd_ulong_sat_add( ctx->worker.input_lamports, job->lamports[ i ] );
+  }
+  ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
+  ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
+}
+
+static void
+worker_handle_control( fd_snapin_tile_t *       ctx,
+                       fd_snapin_io_job_t const * job,
+                       fd_stem_context_t *      stem ) {
+  ulong control = job->control;
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_FULL ||
+                   control==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) {
+    if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_IDLE ) ) {
+      worker_fail( ctx, stem, job->generation, EPROTO );
+      return;
+    }
+    ctx->generation = job->generation;
+    ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
+    fd_accdb_snapshot_writer_begin( ctx->accdb );
+    worker_reset_attempt( ctx );
+    worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
+    return;
+  }
+
+  if( FD_UNLIKELY( job->generation!=ctx->generation ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) {
+    fd_accdb_snapshot_writer_end( ctx->accdb );
+    ctx->state = FD_SNAPSHOT_STATE_IDLE;
+    worker_reset_attempt( ctx );
+    worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
+    return;
+  }
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
+
+  switch( control ) {
+    case FD_SNAPSHOT_MSG_CTRL_FINI:
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
+        worker_fail( ctx, stem, job->generation, EPROTO );
+        return;
+      }
+      fd_accdb_snapshot_writer_end( ctx->accdb );
+      ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+      break;
+    case FD_SNAPSHOT_MSG_CTRL_NEXT:
+    case FD_SNAPSHOT_MSG_CTRL_DONE:
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_FINISHING ) ) {
+        worker_fail( ctx, stem, job->generation, EPROTO );
+        return;
+      }
+      ctx->state = FD_SNAPSHOT_STATE_IDLE;
+      break;
+    case FD_SNAPSHOT_MSG_CTRL_SHUTDOWN:
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_IDLE ) ) {
+        worker_fail( ctx, stem, job->generation, EPROTO );
+        return;
+      }
+      ctx->state = FD_SNAPSHOT_STATE_SHUTDOWN;
+      break;
+    default:
+      worker_fail( ctx, stem, job->generation, EPROTO );
+      return;
+  }
+  worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
+}
+
+static void
+worker_handle_frag( fd_snapin_tile_t *  ctx,
+                    ulong               chunk,
+                    ulong               sz,
+                    fd_stem_context_t * stem ) {
+  if( FD_UNLIKELY( chunk<ctx->io_in[ 0 ].chunk0 || chunk>ctx->io_in[ 0 ].wmark || sz!=sizeof(fd_snapin_io_job_t) ) ) {
+    worker_fail( ctx, stem, ctx->generation, EPROTO );
+    return;
+  }
+
+  fd_snapin_io_job_t const * job = fd_chunk_to_laddr_const( ctx->io_in[ 0 ].wksp, chunk );
+  if( FD_UNLIKELY( job->worker_idx!=ctx->worker_idx ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+  if( FD_LIKELY( job->kind==FD_SNAPIN_IO_KIND_BATCH ) ) worker_handle_batch( ctx, job, stem );
+  else if( FD_LIKELY( job->kind==FD_SNAPIN_IO_KIND_CTRL ) ) worker_handle_control( ctx, job, stem );
+  else worker_fail( ctx, stem, job->generation, EPROTO );
+}
+
+/* Finish reverting a failed attempt only after every accdb worker has
+   acknowledged FAIL.  fd_accdb_reset and the incremental purge/revert
+   path require that no other joiner is still mutating shared state. */
+static void
+coordinator_finish_failed_attempt( fd_snapin_tile_t * ctx ) {
+  if( FD_LIKELY( ctx->init_completed ) ) {
+    if( ctx->full ) {
+      fd_accdb_reset( ctx->accdb );
+      ctx->accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+      ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    } else {
+      fd_accdb_purge( ctx->accdb, ctx->accdb_incr_fork_id ); /* this fork and subsequent children */
+      fd_accdb_snapshot_revert_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
+      ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+      *ctx->feature_snoop = ctx->recovery.feature_snoop;
+    }
+  }
+  ctx->init_completed = 0;
+}
+
+static void
+coordinator_handle_ack( fd_snapin_tile_t *  ctx,
+                        fd_stem_context_t * stem,
+                        ulong               worker_idx,
+                        ulong               sig,
+                        ulong               chunk,
+                        ulong               sz ) {
+  if( FD_UNLIKELY( worker_idx>=ctx->worker_cnt ||
+                   chunk<ctx->io_in[ worker_idx ].chunk0 || chunk>ctx->io_in[ worker_idx ].wmark ||
+                   sz!=sizeof(fd_snapin_io_ack_t) ) ) {
+    transition_malformed( ctx, stem );
+    return;
+  }
+  fd_snapin_io_ack_t const * ack = fd_chunk_to_laddr_const( ctx->io_in[ worker_idx ].wksp, chunk );
+  ulong generation = fd_snapin_io_ack_generation( sig );
+  ulong control    = fd_snapin_io_ack_control( sig );
+  if( FD_UNLIKELY( ack->worker_idx!=worker_idx || generation!=ack->generation ||
+                   control!=ack->control || generation!=ctx->generation ) ) {
+    transition_malformed( ctx, stem );
+    return;
+  }
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
+    FD_LOG_WARNING(( "snapshot accdb worker reported error (%d-%s)", ack->err, fd_io_strerror( ack->err ) ));
+    ctx->pending_worker_control = ULONG_MAX;
+    ctx->pending_worker_ack_mask = 0UL;
+    transition_malformed( ctx, stem );
+    return;
+  }
+  if( FD_UNLIKELY( ctx->pending_worker_control==ULONG_MAX || control!=ctx->pending_worker_control ) ) {
+    transition_malformed( ctx, stem );
+    return;
+  }
+
+  ulong worker_bit = 1UL<<worker_idx;
+  if( FD_UNLIKELY( ctx->pending_worker_ack_mask & worker_bit ) ) {
+    transition_malformed( ctx, stem );
+    return;
+  }
+
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FINI ) ) {
+    ctx->metrics.accounts_ignored  += ack->accounts_ignored;
+    ctx->metrics.accounts_replaced += ack->accounts_replaced;
+    ctx->metrics.accounts_loaded   += ack->accounts_loaded;
+    ctx->capitalization     = fd_ulong_sat_add( ctx->capitalization, ack->input_lamports );
+    ctx->capitalization     = fd_ulong_sat_sub( ctx->capitalization, ack->ignored_lamports );
+    ctx->dup_capitalization = fd_ulong_sat_add( ctx->dup_capitalization, ack->replaced_lamports );
+  }
+
+  ctx->pending_worker_ack_mask |= worker_bit;
+  ulong all_worker_mask = (1UL<<ctx->worker_cnt)-1UL;
+  if( FD_LIKELY( ctx->pending_worker_ack_mask!=all_worker_mask ) ) return;
+
+  ctx->pending_worker_control  = ULONG_MAX;
+  ctx->pending_worker_ack_mask = 0UL;
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) coordinator_finish_failed_attempt( ctx );
+  fd_stem_publish( stem, ctx->ct_out.idx, control, 0UL, 0UL, 0UL, 0UL, 0UL );
+}
+
+static void
 handle_control_frag( fd_snapin_tile_t *  ctx,
                      fd_stem_context_t * stem,
                      ulong               in_idx,
@@ -1336,6 +1772,14 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_INIT_FULL:
     case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+      if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR && ctx->worker_cnt>1UL ) ) {
+        FD_LOG_WARNING(( "incremental snapshot loading with %lu accdb workers is not implemented", ctx->worker_cnt ));
+        transition_malformed( ctx, stem );
+        forward_msg = 0;
+        break;
+      }
+      if( FD_UNLIKELY( ctx->io_enabled ) ) ctx->generation++;
+      discard_all_pending_jobs( ctx );
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->expected_frame = 0UL;
@@ -1371,7 +1815,8 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         fd_accdb_fork_id_t null_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
         ctx->accdb_root_fork_id = fd_accdb_attach_child( ctx->accdb, null_fork_id );
 
-        fd_accdb_snapshot_load_begin( ctx->accdb );
+        if( FD_UNLIKELY( ctx->io_enabled ) ) fd_accdb_snapshot_load_begin_with_writers( ctx->accdb, ctx->worker_cnt );
+        else                                 fd_accdb_snapshot_load_begin( ctx->accdb );
 
         ctx->slot_history.captured  = 0;
         ctx->slot_history.capturing = 0;
@@ -1518,20 +1963,8 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
     case FD_SNAPSHOT_MSG_CTRL_FAIL: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
-      if( FD_LIKELY( ctx->init_completed ) ) {
-        if( ctx->full ) {
-          fd_accdb_reset( ctx->accdb );
-          ctx->accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-          ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-        } else {
-          fd_accdb_purge( ctx->accdb, ctx->accdb_incr_fork_id ); /* this fork and subsequent children */
-          fd_accdb_snapshot_revert_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
-          ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-          *ctx->feature_snoop = ctx->recovery.feature_snoop;
-        }
-      }
-      ctx->init_completed = 0;
       ctx->state = FD_SNAPSHOT_STATE_IDLE;
+      if( FD_LIKELY( !ctx->io_enabled ) ) coordinator_finish_failed_attempt( ctx );
       break;
     }
 
@@ -1551,7 +1984,8 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
   /* Forward the control message down the pipeline */
   if( FD_LIKELY( forward_msg ) ) {
-    fd_stem_publish( stem, ctx->ct_out.idx, sig, 0UL, 0UL, 0UL, 0UL, 0UL );
+    if( FD_UNLIKELY( ctx->io_enabled && sig!=FD_SNAPSHOT_MSG_CTRL_ERROR ) ) publish_worker_control( ctx, stem, sig );
+    else fd_stem_publish( stem, ctx->ct_out.idx, sig, 0UL, 0UL, 0UL, 0UL, 0UL );
   }
 }
 
@@ -1564,11 +1998,28 @@ all_controls_seen( fd_snapin_tile_t const * ctx ) {
   return all_seen;
 }
 
+static inline ulong
+ack_worker_idx( fd_snapin_tile_t const * ctx,
+                ulong                    in_idx ) {
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    if( ctx->ack_in_idx[ worker_idx ]==in_idx ) return worker_idx;
+  }
+  return ULONG_MAX;
+}
+
 static inline int
 before_frag( fd_snapin_tile_t * ctx,
              ulong              in_idx,
              ulong              seq    FD_PARAM_UNUSED,
              ulong              sig ) {
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) return 0;
+
+  if( FD_UNLIKELY( ctx->io_enabled && ack_worker_idx( ctx, in_idx )!=ULONG_MAX ) ) return 0;
+
+  /* Do not let the next stream phase start until the worker has drained
+     all jobs preceding the current control and acknowledged it. */
+  if( FD_UNLIKELY( ctx->io_enabled && ctx->pending_worker_control!=ULONG_MAX ) ) return -1;
+
   /* If we're currently in ERROR state we should only process FAIL
      control frags */
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
@@ -1662,6 +2113,19 @@ returnable_frag( fd_snapin_tile_t *  ctx,
                  ulong               tsorig FD_PARAM_UNUSED,
                  ulong               tspub  FD_PARAM_UNUSED,
                  fd_stem_context_t * stem ) {
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
+    FD_TEST( in_idx==0UL );
+    worker_handle_frag( ctx, chunk, sz, stem );
+    return 0;
+  }
+
+  ulong worker_idx = ctx->io_enabled ? ack_worker_idx( ctx, in_idx ) : ULONG_MAX;
+  if( FD_UNLIKELY( worker_idx!=ULONG_MAX ) ) {
+    coordinator_handle_ack( ctx, stem, worker_idx, sig, chunk, sz );
+    return 0;
+  }
+
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
 
   if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_lane_data_frag( ctx, stem, in_idx, chunk, sz, ctl );
@@ -1708,8 +2172,9 @@ privileged_init( fd_topo_t const *      topo,
 static inline fd_snapin_out_link_t
 out1( fd_topo_t const *      topo,
       fd_topo_tile_t const * tile,
-      char const *           name ) {
-  ulong idx = fd_topo_find_tile_out_link( topo, tile, name, 0UL );
+      char const *           name,
+      ulong                  kind_id ) {
+  ulong idx = fd_topo_find_tile_out_link( topo, tile, name, kind_id );
 
   if( FD_UNLIKELY( idx==ULONG_MAX ) ) return (fd_snapin_out_link_t){ .idx = ULONG_MAX, .mem = NULL, .chunk0 = 0, .wmark = 0, .chunk = 0, .mtu = 0 };
 
@@ -1728,20 +2193,61 @@ unprivileged_init( fd_topo_t const *      topo,
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_snapin_tile_t * ctx  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                                    );
+  fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t) );
+
+  ctx->role = (int)tile->kind_id;
+  if( FD_UNLIKELY( ctx->role<FD_SNAPIN_ROLE_COORDINATOR || (ulong)ctx->role>=FD_SNAPIN_TILE_MAX ) ) {
+    FD_LOG_ERR(( "tile `" NAME "` has unsupported kind id %lu", tile->kind_id ));
+  }
+  ctx->io_enabled      = 0;
+  ctx->full            = 1;
+  ctx->init_completed  = 0;
+  ctx->state           = FD_SNAPSHOT_STATE_IDLE;
+  ctx->lane_cnt        = 0UL;
+  ctx->worker_idx      = is_accdb_worker( ctx ) ? tile->kind_id-1UL : ULONG_MAX;
+  ctx->worker_cnt      = 0UL;
+  for( ulong worker_idx=0UL; worker_idx<FD_SNAPIN_WORKER_MAX; worker_idx++ ) ctx->ack_in_idx[ worker_idx ] = ULONG_MAX;
+  ctx->generation      = 0UL;
+  ctx->pending_worker_control = ULONG_MAX;
+  ctx->pending_worker_ack_mask = 0UL;
+  discard_all_pending_jobs( ctx );
+  ctx->expected_frame  = 0UL;
+  clear_control_barrier( ctx );
+  fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
+
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    void * _accdb = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
+    fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
+    FD_TEST( accdb_shmem );
+    ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
+    FD_TEST( ctx->accdb );
+
+    if( FD_UNLIKELY( tile->in_cnt!=1UL ) ) {
+      FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu ins, expected one snapin_io link", tile->kind_id, tile->in_cnt ));
+    }
+    fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ 0 ] ];
+    FD_TEST( !strcmp( in_link->name, "snapin_io" ) && in_link->kind_id==ctx->worker_idx );
+    fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
+    ctx->io_in[ 0 ].wksp   = in_wksp->wksp;
+    ctx->io_in[ 0 ].chunk0 = fd_dcache_compact_chunk0( ctx->io_in[ 0 ].wksp, in_link->dcache );
+    ctx->io_in[ 0 ].wmark  = fd_dcache_compact_wmark( ctx->io_in[ 0 ].wksp, in_link->dcache, in_link->mtu );
+    ctx->io_in[ 0 ].mtu    = in_link->mtu;
+    FD_TEST( ctx->io_in[ 0 ].mtu==FD_SNAPIN_IO_JOB_SLOT_SZ );
+
+    ctx->ack_out = out1( topo, tile, "snapio_ack", ctx->worker_idx );
+    if( FD_UNLIKELY( ctx->ack_out.idx==ULONG_MAX || ctx->ack_out.mtu!=FD_SNAPIN_IO_ACK_SLOT_SZ ) ) {
+      FD_LOG_ERR(( "tile `" NAME ":%lu` missing valid snapio_ack output", tile->kind_id ));
+    }
+    return;
+  }
+
   void * _txncache        = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),           fd_txncache_footprint( tile->snapin.max_live_slots )        );
   void * _accdb           = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),              fd_accdb_footprint( tile->snapin.max_live_slots )           );
   void * _manifest_parser = FD_SCRATCH_ALLOC_APPEND( l, fd_ssmanifest_parser_align(),  fd_ssmanifest_parser_footprint()                            );
   void * _sd_parser       = FD_SCRATCH_ALLOC_APPEND( l, fd_slot_delta_parser_align(),  fd_slot_delta_parser_footprint()                            );
   ctx->blockhash_groups   = FD_SCRATCH_ALLOC_APPEND( l, alignof(blockhash_group_t),    sizeof(blockhash_group_t)*FD_SNAPIN_MAX_SLOT_DELTA_GROUPS   );
   ctx->txncache_entries   = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_sstxncache_hash_t), sizeof(fd_sstxncache_hash_t)*FD_SNAPIN_TXNCACHE_MAX_ENTRIES );
-
-  ctx->full            = 1;
-  ctx->init_completed  = 0;
-  ctx->state           = FD_SNAPSHOT_STATE_IDLE;
-  ctx->lane_cnt        = tile->in_cnt;
-  ctx->expected_frame  = 0UL;
-  clear_control_barrier( ctx );
 
   void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
   fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
@@ -1771,14 +2277,20 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->slot_delta_parser = fd_slot_delta_parser_join( fd_slot_delta_parser_new( _sd_parser ) );
   FD_TEST( ctx->slot_delta_parser );
 
-  fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
-
-  if( FD_UNLIKELY( tile->kind_id ) ) FD_LOG_ERR(( "There can only be one `" NAME "` tile" ));
-  FD_TEST( tile->in_cnt );
-
-  ctx->ct_out =       out1( topo, tile, "snapin_ct" );
-  ctx->manifest_out = out1( topo, tile, "snapin_manif" );
-  ctx->gui_out      = out1( topo, tile, "snapin_gui"   );
+  ctx->ct_out       = out1( topo, tile, "snapin_ct",    0UL );
+  ctx->manifest_out = out1( topo, tile, "snapin_manif", 0UL );
+  ctx->gui_out      = out1( topo, tile, "snapin_gui",   0UL );
+  for( ulong worker_idx=0UL; worker_idx<FD_SNAPIN_WORKER_MAX; worker_idx++ ) {
+    fd_snapin_out_link_t out = out1( topo, tile, "snapin_io", worker_idx );
+    if( out.idx==ULONG_MAX ) break;
+    FD_TEST( out.mtu==FD_SNAPIN_IO_JOB_SLOT_SZ );
+    ctx->io_out[ worker_idx ] = out;
+    ctx->worker_cnt++;
+  }
+  if( FD_UNLIKELY( ctx->worker_cnt ) ) {
+    FD_TEST( fd_ulong_is_pow2( ctx->worker_cnt ) );
+    ctx->io_enabled = 1;
+  }
 
   if( FD_UNLIKELY( ctx->ct_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_ct`" ));
   if( FD_UNLIKELY( ctx->manifest_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_manif`" ));
@@ -1787,16 +2299,40 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_ssmanifest_parser_init( ctx->manifest_parser, fd_chunk_to_laddr( ctx->manifest_out.mem, ctx->manifest_out.chunk ) );
   fd_slot_delta_parser_init( ctx->slot_delta_parser );
 
-  for( ulong i=0UL; i<ctx->lane_cnt; i++ ) {
+  for( ulong i=0UL; i<tile->in_cnt; i++ ) {
     fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
-    FD_TEST( 0==strcmp( in_link->name, "snapdc_in" ) );
-    FD_TEST( in_link->kind_id==i );
+    if( FD_UNLIKELY( !strcmp( in_link->name, "snapio_ack" ) ) ) {
+      ulong worker_idx = in_link->kind_id;
+      FD_TEST( ctx->io_enabled && worker_idx<ctx->worker_cnt && ctx->ack_in_idx[ worker_idx ]==ULONG_MAX );
+      ctx->ack_in_idx[ worker_idx ] = i;
+      fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
+      ctx->io_in[ worker_idx ].wksp   = in_wksp->wksp;
+      ctx->io_in[ worker_idx ].chunk0 = fd_dcache_compact_chunk0( ctx->io_in[ worker_idx ].wksp, in_link->dcache );
+      ctx->io_in[ worker_idx ].wmark  = fd_dcache_compact_wmark( ctx->io_in[ worker_idx ].wksp, in_link->dcache, in_link->mtu );
+      ctx->io_in[ worker_idx ].mtu    = in_link->mtu;
+      FD_TEST( ctx->io_in[ worker_idx ].mtu==FD_SNAPIN_IO_ACK_SLOT_SZ );
+      continue;
+    }
+
+    ulong lane = ctx->lane_cnt++;
+    FD_TEST( !strcmp( in_link->name, "snapdc_in" ) );
+    FD_TEST( in_link->kind_id==lane && lane<FD_TOPO_MAX_TILE_IN_LINKS );
     fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
-    ctx->in[ i ].wksp   = in_wksp->wksp;
-    ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].wksp, in_link->dcache );
-    ctx->in[ i ].wmark  = fd_dcache_compact_wmark( ctx->in[ i ].wksp, in_link->dcache, in_link->mtu );
-    ctx->in[ i ].mtu    = in_link->mtu;
-    ctx->in[ i ].pos    = 0UL;
+    ctx->in[ lane ].wksp   = in_wksp->wksp;
+    ctx->in[ lane ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ lane ].wksp, in_link->dcache );
+    ctx->in[ lane ].wmark  = fd_dcache_compact_wmark( ctx->in[ lane ].wksp, in_link->dcache, in_link->mtu );
+    ctx->in[ lane ].mtu    = in_link->mtu;
+    ctx->in[ lane ].pos    = 0UL;
+  }
+
+  if( FD_UNLIKELY( !ctx->lane_cnt || ctx->lane_cnt>FD_TOPO_MAX_TILE_IN_LINKS ) ) {
+    FD_LOG_ERR(( "tile `" NAME "` has %lu snapshot data lanes, expected 1..%lu", ctx->lane_cnt, FD_TOPO_MAX_TILE_IN_LINKS ));
+  }
+  if( FD_UNLIKELY( ctx->io_enabled ) ) {
+    for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) FD_TEST( ctx->ack_in_idx[ worker_idx ]!=ULONG_MAX );
+    FD_TEST( tile->in_cnt==ctx->lane_cnt+ctx->worker_cnt );
+  } else {
+    FD_TEST( tile->in_cnt==ctx->lane_cnt );
   }
 
   ctx->gui_config_acct_sz  = 0UL;
@@ -1820,16 +2356,13 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->boot_timestamp = fd_log_wallclock();
 }
 
-/* There are 3 output links that affect the calculation of STEM_BURST:
-    1. snapin_ct
-    2. snapin_manif - worst case: 1 message
-    3. snapin_gui   - worst case: 1 message (config program account)
-   The STEM_BURST is the max value across these 3 links (not the sum).
-   Note that snapin_txn is excluded from this calculation, since it is
-   an unreliable link, working as a dcache place holder. */
-#define STEM_BURST 1UL
+/* A full input fragment can contain at most 61 eight-account jobs. */
+#define STEM_BURST FD_SNAPIN_IO_BURST
 
-#define STEM_LAZY  (128L*3000L)
+/* Account-batch jobs arrive at roughly two million messages per second.
+   Refresh flow-control credits before a burst drains so the coordinator
+   and accdb worker do not alternate between backpressure and empty polls. */
+#define STEM_LAZY  (128L*250L)
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_snapin_tile_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_snapin_tile_t)
