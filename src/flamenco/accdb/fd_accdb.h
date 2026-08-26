@@ -745,8 +745,8 @@ struct fd_accdb_snapshot_par_metrics {
 typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
 
 /* fd_accdb_snapshot_write_batch_par_worker is the striped-lock
-   multi-writer counterpart of fd_accdb_snapshot_write_batch_worker
-   (full-snapshot mode only).  Multiple joiners may call it
+   multi-writer counterpart of fd_accdb_snapshot_write_batch_worker.
+   Multiple joiners may call it
    concurrently, including for pubkeys that collide on the same hash
    chain: each per-account chain walk + commit is serialized by a
    striped spin lock (stripe = chain_idx & stripe_msk over the caller
@@ -761,6 +761,13 @@ typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
    counted in par_metrics->eq_slot_dups and treated as ignored; the
    caller must fail the load if the count is nonzero.
 
+   fork_id has the same semantics as in fd_accdb_snapshot_write_batch:
+   USHORT_MAX selects full-snapshot mode, otherwise incremental mode
+   with cross-fork override tracking (undo records CAS-prepended to the
+   fork's shared txn list under the stripe lock, fork bits packed into
+   the entry offsets, key.generation stamped with the fork's
+   generation).
+
    file_offsets[i] receives the allocated offset of entry i, or
    ULONG_MAX if the entry was ignored (the caller must then not write
    the account's bytes).  Shared metrics deltas are accumulated in
@@ -771,6 +778,7 @@ typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
 
 int
 fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                          fd_accdb_fork_id_t                fork_id,
                                           ulong                             cnt,
                                           uchar const * const               pubkeys[],
                                           ulong                             slot,

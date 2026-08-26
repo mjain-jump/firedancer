@@ -14,6 +14,7 @@ static ulong test_accdb_purge_cnt;
 static ulong test_accdb_revert_cnt;
 static ulong test_accdb_worker_call_cnt;
 static ulong test_accdb_worker_slot;
+static ulong test_accdb_worker_fork;
 static ulong test_accdb_worker_cnt_arg;
 static uchar test_accdb_worker_pubkeys[ 8 ][ 32 ];
 static ulong test_accdb_worker_lamports[ 8 ];
@@ -126,6 +127,7 @@ mock_accdb_snapshot_prefetch_batch( fd_accdb_t *        accdb,
    allocation) and repl_mask entries as replaced. */
 int
 mock_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                            fd_accdb_fork_id_t                fork_id,
                                             ulong                             cnt,
                                             uchar const * const               pubkeys[],
                                             ulong                             slot,
@@ -149,6 +151,7 @@ mock_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      ac
   (void)par_metrics;
   FD_TEST( cnt && cnt<=8UL );
   test_accdb_worker_call_cnt++;
+  test_accdb_worker_fork    = (ulong)fork_id.val;
   test_accdb_worker_slot    = slot;
   test_accdb_worker_cnt_arg = cnt;
   *accounts_ignored = *accounts_replaced = *accounts_loaded = 0UL;
@@ -1240,7 +1243,8 @@ worker_ctx_init( fd_snapin_tile_t * ctx,
 static int
 send_job( fd_snapin_tile_t * ctx,
           ulong kind, ulong gen, ulong av_idx,
-          ulong slot, ulong body_off, ulong body_sz, ulong covered_until ) {
+          ulong slot, ulong body_off, ulong body_sz, ulong covered_until,
+          ulong fork_id ) {
   fd_snapin_io_job_t * job = (fd_snapin_io_job_t *)test_job_mem;
   fd_memset( job, 0, sizeof(*job) );
   job->kind          = kind;
@@ -1250,6 +1254,7 @@ send_job( fd_snapin_tile_t * ctx,
   job->body_off      = body_off;
   job->body_sz       = body_sz;
   job->covered_until = covered_until;
+  job->fork_id       = fork_id;
   FD_TEST( !before_frag( ctx, ctx->job_in_idx, 0UL, kind ) );
   return returnable_frag( ctx, ctx->job_in_idx, 0UL, kind, 0UL, sizeof(fd_snapin_io_job_t),
                           0UL, 0UL, 0UL, (fd_stem_context_t *)1UL );
@@ -1303,7 +1308,7 @@ test_worker_coverage_hold( void ) {
   FD_TEST( ctx->cov_stats.hold_reprocess==1UL );
 
   /* WATERMARK covers the first 512-aligned entry */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL, ULONG_MAX ) );
   FD_TEST( ctx->covered_until==512UL );
 
   /* Reprocess: fully consumed (skipped, not ours) */
@@ -1317,7 +1322,7 @@ test_worker_coverage_hold( void ) {
   FD_TEST( ctx->cov_stats.hold_reprocess==2UL );
 
   /* EOS extends coverage to infinity: reprocess drains */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX ) );
   FD_TEST( ctx->eos_seen );
   FD_TEST( send_worker_data( ctx, 0UL, 512UL )==0 );
   FD_TEST( ctx->cursor==612UL );
@@ -1333,13 +1338,13 @@ test_worker_owned_appendvec( void ) {
 
   /* Appendvec for this worker at body [512, 612); ASSIGN carries the
      coverage through its own (padded) end inline. */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL, (ulong)USHORT_MAX ) );
   FD_TEST( ctx->fifo_tail==1UL && ctx->fifo_head==0UL );
   FD_TEST( ctx->covered_until==1024UL );
   FD_TEST( ctx->cov_stats.lag_samples==1UL && ctx->cov_stats.lag_max==1024UL );
 
   /* Another worker's coverage arrives on the periodic watermark */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 2048UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 2048UL, ULONG_MAX ) );
   FD_TEST( ctx->fifo_tail==1UL );
   FD_TEST( ctx->covered_until==2048UL );
 
@@ -1387,7 +1392,7 @@ test_worker_batch_staging( void ) {
   fd_memset( test_script5_hdr_data,  0x53, 8UL  );
 
   /* Owned appendvec spanning the whole 100-byte frag at offset 0 */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 0UL, 440123518UL, 0UL, 100UL, 512UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 0UL, 440123518UL, 0UL, 100UL, 512UL, (ulong)USHORT_MAX ) );
 
   test_parser_script   = 5;
   test_parser_call_cnt = 0UL;
@@ -1412,7 +1417,7 @@ test_worker_batch_staging( void ) {
   /* FINI (after EOS) flushes the staging and acks with the counters. */
   test_accdb_writer_end_cnt   = 0UL;
   test_accdb_worker_close_cnt = 0UL;
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX ) );
   test_pub_cnt = 0UL;
   worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
@@ -1463,28 +1468,28 @@ test_worker_stale_generation( void ) {
   FD_TEST( ctx->generation==1UL );
 
   /* Stale job (previous attempt): drained, no effect */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, 0UL, 512UL, ULONG_MAX ) );
   FD_TEST( ctx->covered_until==0UL );
 
   /* Future job (coordinator's INIT raced ahead): held */
-  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 2UL, 0UL, 0UL, 0UL, 0UL, 512UL )==1 );
+  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 2UL, 0UL, 0UL, 0UL, 0UL, 512UL, ULONG_MAX )==1 );
   FD_TEST( ctx->covered_until==0UL );
 
   /* Current generation: applied */
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL, ULONG_MAX ) );
   FD_TEST( ctx->covered_until==512UL );
 
   /* A full FIFO holds ASSIGNs (reprocess later) */
   ctx->fifo_head = 0UL;
   ctx->fifo_tail = FD_SNAPIN_FIFO_CNT;
-  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL )==1 );
+  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL, (ulong)USHORT_MAX )==1 );
   ctx->fifo_tail = 0UL;
 
   /* Stale ASSIGN after FAIL (state IDLE, same generation): drained */
   for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) worker_send_control( ctx, lane, FD_SNAPSHOT_MSG_CTRL_FAIL );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
   FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL ) );
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 512UL, 512UL, 100UL, 1024UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 512UL, 512UL, 100UL, 1024UL, (ulong)USHORT_MAX ) );
   FD_TEST( ctx->fifo_tail==0UL );
 }
 
@@ -1508,7 +1513,7 @@ test_worker_fini_deferred_ack( void ) {
   after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
   FD_TEST( ctx->pending_fini ); /* still waiting for EOS */
 
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX ) );
   after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
   FD_TEST( !ctx->pending_fini );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
@@ -1566,7 +1571,7 @@ test_worker_abort_ring_bypass( void ) {
 
   /* ABORT: silent (no ERROR ack; the coordinator already knows) */
   ulong pub0 = test_pub_cnt;
-  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ABORT, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ABORT, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX ) );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( test_pub_cnt==pub0 );
 

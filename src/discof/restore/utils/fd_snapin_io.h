@@ -57,7 +57,16 @@
    published on the owning worker's ring before any watermark whose
    covered_until exceeds its body_off, so ring FIFO order guarantees the
    assignment is in the worker's queue by the time its scan cursor
-   reaches the body.  EOS/ABORT carry only generation. */
+   reaches the body.
+
+   fork_id carries the accdb fork every account of the assigned
+   appendvec must be stamped with: USHORT_MAX during a full load, the
+   coordinator's incremental fork during an incremental one.  Riding
+   the ASSIGN (rather than a separate control message) binds the fork
+   to the generation-gated message that carries the work itself, so no
+   ring/lane-barrier ordering hazard is possible: a worker cannot
+   insert anything without first consuming an ASSIGN of the current
+   generation.  EOS/ABORT carry only generation. */
 
 struct __attribute__((aligned(64))) fd_snapin_io_job {
   ulong kind;
@@ -67,6 +76,7 @@ struct __attribute__((aligned(64))) fd_snapin_io_job {
   ulong body_off;      /* ASSIGN */
   ulong body_sz;       /* ASSIGN */
   ulong covered_until; /* ASSIGN / WATERMARK */
+  ulong fork_id;       /* ASSIGN: accdb fork for this appendvec's inserts */
 };
 
 typedef struct fd_snapin_io_job fd_snapin_io_job_t;

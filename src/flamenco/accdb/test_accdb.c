@@ -1797,13 +1797,14 @@ test_snapshot_parallel_writers( void ) {
 #define PAR_KEYS    (64UL)
 
 typedef struct {
-  fd_accdb_t * accdb;
-  int          fd;
-  ulong        thread_idx;
-  int          equal_slot; /* phase B? */
-  uint *       stripe_locks;
-  ulong        stripe_msk;
-  uchar      (*pks)[ 32UL ];
+  fd_accdb_t *       accdb;
+  int                fd;
+  ulong              thread_idx;
+  int                equal_slot; /* phase B? */
+  fd_accdb_fork_id_t fork;       /* SENTINEL = full-snapshot mode */
+  uint *             stripe_locks;
+  ulong              stripe_msk;
+  uchar            (*pks)[ 32UL ];
 
   /* outputs */
   fd_accdb_snapshot_whead_t       whead;
@@ -1844,7 +1845,7 @@ par_writer_main( void * _ctx ) {
     ulong slot = ctx->equal_slot ? 200UL : 100UL+t;
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, batch, pubkeys, slot, lamports,
+    FD_TEST( !fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, ctx->fork, batch, pubkeys, slot, lamports,
                                                         data_lens, execs, &ctx->whead,
                                                         ctx->stripe_locks, ctx->stripe_msk, ctx->m,
                                                         offs, &ignored, &replaced, &loaded,
@@ -1948,6 +1949,7 @@ test_snapshot_striped_writers( void ) {
       ctxs[ t ].fd           = fd;
       ctxs[ t ].thread_idx   = t;
       ctxs[ t ].equal_slot   = phase;
+      ctxs[ t ].fork         = SENTINEL;
       ctxs[ t ].stripe_locks = stripe_locks;
       ctxs[ t ].stripe_msk   = stripe_msk;
       ctxs[ t ].pks          = pks;
@@ -2378,6 +2380,7 @@ main( int     argc,
 
   FD_LOG_NOTICE(( "test_snapshot_striped_writers ..." ));
   for( ulong rep=0UL; rep<4UL; rep++ ) test_snapshot_striped_writers();
+
 
   FD_LOG_NOTICE(( "test_incremental_cross_fork_override ..." ));
   test_incremental_cross_fork_override();

@@ -336,6 +336,7 @@ struct fd_snapin_tile {
   ulong in_lane[ FD_TOPO_MAX_TILE_IN_LINKS ];      /* in_idx -> lane (ULONG_MAX for job link) */
   int   eos_seen;
   int   pending_fini;                              /* FINI barrier complete, ack deferred until work drains */
+  ulong incr_fork;                                 /* accdb fork adopted from this attempt's ASSIGNs (ULONG_MAX = none yet) */
   ulong cursor;                                    /* stream offset consumed by this worker */
   fd_snapin_extent_t * fifo;                       /* owned appendvecs not yet started */
   ulong fifo_head;
@@ -711,7 +712,8 @@ publish_io_job( fd_snapin_tile_t *  ctx,
                 ulong               slot,
                 ulong               body_off,
                 ulong               body_sz,
-                ulong               covered_until ) {
+                ulong               covered_until,
+                ulong               fork_id ) {
   fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
   fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
   job->kind          = kind;
@@ -721,6 +723,7 @@ publish_io_job( fd_snapin_tile_t *  ctx,
   job->body_off      = body_off;
   job->body_sz       = body_sz;
   job->covered_until = covered_until;
+  job->fork_id       = fork_id;
   fd_stem_publish( stem, out->idx, kind, out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
   io_out_advance( ctx, worker_idx );
   ctx->io_pub_cnt++;
@@ -736,7 +739,7 @@ static void
 publish_watermarks( fd_snapin_tile_t *  ctx,
                     fd_stem_context_t * stem ) {
   for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, ctx->covered_until );
+    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, ctx->covered_until, ULONG_MAX );
   }
   ctx->io_watermark_dirty       = 0;
   ctx->io_frags_since_watermark = 0UL;
@@ -753,7 +756,7 @@ publish_abort( fd_snapin_tile_t *  ctx,
   if( FD_UNLIKELY( !ctx->io_enabled || ctx->abort_published ) ) return;
   ctx->abort_published = 1;
   for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_ABORT, 0UL, 0UL, 0UL, 0UL, 0UL );
+    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_ABORT, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX );
   }
 }
 
@@ -1407,8 +1410,13 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         ctx->worker_assigned_bytes[ w ] += body_sz;
         ulong end = body_off + fd_ulong_align_up( body_sz, 512UL );
         ctx->covered_until = fd_ulong_max( ctx->covered_until, end );
+        /* The ASSIGN carries the accdb fork for this appendvec's
+           inserts: USHORT_MAX in the full phase, the incremental fork
+           (attached at INIT_INCR, before any incremental ASSIGN can
+           exist) otherwise. */
+        ulong assign_fork = ctx->full ? (ulong)USHORT_MAX : (ulong)ctx->accdb_incr_fork_id.val;
         publish_io_job( ctx, stem, w, FD_SNAPIN_IO_KIND_ASSIGN, ctx->appendvec_seq++,
-                        result->appendvec.slot, body_off, body_sz, ctx->covered_until );
+                        result->appendvec.slot, body_off, body_sz, ctx->covered_until, assign_fork );
         ctx->io_watermark_dirty = 1;
 
         ctx->av_stats.cnt++;
@@ -1612,7 +1620,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
       case FD_SSPARSE_ADVANCE_DONE:
         if( FD_UNLIKELY( ctx->io_enabled ) ) {
           for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-            publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_EOS, 0UL, 0UL, 0UL, 0UL, 0UL );
+            publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_EOS, 0UL, 0UL, 0UL, 0UL, 0UL, ULONG_MAX );
           }
         }
         ctx->state = FD_SNAPSHOT_STATE_FINISHING;
@@ -1719,6 +1727,7 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) ctx->in[ lane ].pos = 0UL;
   ctx->eos_seen       = 0;
   ctx->pending_fini   = 0;
+  ctx->incr_fork      = ULONG_MAX;
   ctx->covered_until  = 0UL;
   ctx->cursor         = 0UL;
   ctx->fifo_head      = 0UL;
@@ -2034,7 +2043,8 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   ctx->rec_idx += cnt;
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, cnt, pubkeys, batch_slot, lamports,
+  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
                                                                 data_lens, executables, &ctx->whead,
                                                                 ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
                                                                 file_offsets, &accounts_ignored, &accounts_replaced,
@@ -2078,7 +2088,8 @@ worker_process_account_header( fd_snapin_tile_t *            ctx,
   int           executables [ 1 ] = { result->account_header.executable };
   ulong         file_offsets[ 1 ];
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, 1UL, pubkeys, slot, lamports_a,
+  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
                                                                 data_lens, executables, &ctx->whead,
                                                                 ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
                                                                 file_offsets, &accounts_ignored, &accounts_replaced,
@@ -2373,6 +2384,16 @@ worker_handle_job( fd_snapin_tile_t *  ctx,
     case FD_SNAPIN_IO_KIND_ASSIGN: {
       if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) return 0; /* stale (post-FAIL) */
       if( FD_UNLIKELY( ctx->fifo_tail-ctx->fifo_head>=FD_SNAPIN_FIFO_CNT ) ) return 1; /* hold until drained */
+      /* Adopt/validate the phase fork: USHORT_MAX in a full attempt, a
+         single valid fork id across every ASSIGN of an incremental
+         attempt (bound to the generation by the ring protocol). */
+      if( FD_UNLIKELY( ctx->full ? job->fork_id!=(ulong)USHORT_MAX
+                                 : ( job->fork_id>=(ulong)USHORT_MAX ||
+                                     ( ctx->incr_fork!=ULONG_MAX && job->fork_id!=ctx->incr_fork ) ) ) ) {
+        worker_enter_error( ctx, stem, EPROTO, 0 );
+        return 0;
+      }
+      if( FD_UNLIKELY( !ctx->full ) ) ctx->incr_fork = job->fork_id;
       fd_snapin_extent_t * ext = &ctx->fifo[ ctx->fifo_tail & (FD_SNAPIN_FIFO_CNT-1UL) ];
       ext->body_off      = job->body_off;
       ext->body_sz       = job->body_sz;
@@ -2418,10 +2439,17 @@ worker_handle_control_frag( fd_snapin_tile_t *  ctx,
       break;
     }
     case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
-      /* Explicit-offset workers cannot support incremental recovery;
-         the coordinator flags the snapshot malformed on its own copy of
-         this barrier.  Enter error so the FAIL flows cleanly. */
-      worker_enter_error( ctx, stem, EPROTO, 0 );
+      FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+      /* Same lifecycle as INIT_FULL (generation already bumped at the
+         first INIT frag); the attempt's accdb fork arrives with the
+         ASSIGN jobs.  Per-attempt counters reset exactly as at
+         INIT_FULL: the coordinator re-folds every FINI ack, so acking
+         stale full-phase counts would double-count them. */
+      ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
+      ctx->full  = 0;
+      worker_reset_attempt( ctx );
+      fd_accdb_snapshot_writer_begin( ctx->accdb );
+      worker_publish_ack( ctx, stem, sig, 0 );
       break;
     }
     case FD_SNAPSHOT_MSG_META: {
@@ -2644,7 +2672,13 @@ coordinator_finish_failed_attempt( fd_snapin_tile_t * ctx ) {
       ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
     } else {
       fd_accdb_purge( ctx->accdb, ctx->accdb_incr_fork_id ); /* this fork and subsequent children */
-      fd_accdb_snapshot_revert_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
+      /* revert_whead is whead[0]-based; in io mode NEXT never saved it
+         (recovery.accdb_metadata is still the boot-time zero) and
+         reverting to partition_max=0 would release EVERY partition,
+         destroying the loaded full snapshot.  Explicit-offset workers
+         instead leak the failed attempt's partitions (purge unlinks the
+         index entries, so the stale bytes are unreachable). */
+      if( FD_LIKELY( !ctx->io_enabled ) ) fd_accdb_snapshot_revert_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
       ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
       *ctx->feature_snoop = ctx->recovery.feature_snoop;
     }
@@ -2778,15 +2812,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_INIT_FULL:
     case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
-      if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR && ctx->io_enabled ) ) {
-        /* Even one explicit-offset worker changes the on-disk layout,
-           which makes save_whead/revert_whead (whead[0]-based) recovery
-           meaningless.  Hard-error for ALL worker counts. */
-        FD_LOG_WARNING(( "incremental snapshot loading with %lu accdb workers is not implemented", ctx->worker_cnt ));
-        transition_malformed( ctx, stem );
-        forward_msg = 0;
-        break;
-      }
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->expected_frame = 0UL;
@@ -2969,6 +2994,17 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
+      /* Multi-writer layout is not stream-ordered: gate on a sampled
+         index->file readback (workers flushed + closed their partitions
+         before acking FINI, so the bytes are visible here).  Must run
+         BEFORE advance_root below: the promotion is asynchronous and
+         background_advance_root concurrently unlinks + defer-frees
+         shadowed full entries, which can be recycled under our chain
+         walk (this joiner publishes no epoch).  Pre-promotion, both the
+         old and new versions are chain-linked with valid on-disk
+         records, so the readback covers both phases. */
+      if( FD_UNLIKELY( ctx->io_enabled ) ) fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL );
+
       if( !ctx->full ) {
         fd_accdb_snapshot_recover_delta( ctx->accdb, ctx->accdb_incr_fork_id );
         /* ensure that snapin tile sees all delta changes before rooting */
@@ -2979,11 +3015,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
 
       fd_accdb_snapshot_load_end( ctx->accdb );
-
-      /* Multi-writer layout is not stream-ordered: gate on a sampled
-         index->file readback (workers flushed + closed their partitions
-         before acking FINI, so the bytes are visible here). */
-      if( FD_UNLIKELY( ctx->io_enabled ) ) fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL );
 
       fd_feature_snoop_finalize( &ctx->bank->f.features, ctx->bank_slot, &ctx->epoch_schedule, ctx->feature_snoop );
 

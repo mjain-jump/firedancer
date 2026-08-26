@@ -4742,6 +4742,7 @@ snapshot_worker_ensure_capacity( fd_accdb_t *                accdb,
 
 int
 fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                          fd_accdb_fork_id_t                fork_id,
                                           ulong                             cnt,
                                           uchar const * const               pubkeys[],
                                           ulong                             slot,
@@ -4760,19 +4761,26 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
                                           ulong *                           out_ignored_lamports ) {
   FD_TEST( cnt && cnt<=8UL );
 
+  int incremental = fork_id.val!=USHORT_MAX;
+
+  fd_accdb_fork_t * fork = NULL;
+  if( FD_UNLIKELY( incremental ) ) fork = &accdb->fork_pool[ fork_id.val ];
+
   /* Snapshot slots are stored in the 32-bit cache_idx scratch field
      during loading. */
   if( FD_UNLIKELY( slot>UINT_MAX ) ) FD_LOG_ERR(( "snapshot slot %lu exceeds 2^32-1, accdb format must be widened", slot ));
-  if( FD_UNLIKELY( accdb->shmem->root_fork_id.val==USHORT_MAX ) ) {
+  if( FD_UNLIKELY( !incremental && accdb->shmem->root_fork_id.val==USHORT_MAX ) ) {
     FD_LOG_ERR(( "snapshot_write_batch_par_worker called without a root fork attached" ));
   }
-  uint  gen       = accdb->fork_pool[ accdb->shmem->root_fork_id.val ].shmem->generation;
+  uint  gen       = incremental ? fork->shmem->generation
+                                : accdb->fork_pool[ accdb->shmem->root_fork_id.val ].shmem->generation;
   ulong seed      = accdb->shmem->seed;
   ulong chain_msk = accdb->shmem->chain_cnt - 1UL;
 
   ulong ignored           = 0UL;
   ulong replaced          = 0UL;
   ulong loaded            = 0UL;
+  ulong cross_replaced    = 0UL; /* cross-fork overrides (subset of replaced) */
   ulong replaced_lamports = 0UL;
   ulong ignored_lamports  = 0UL;
 
@@ -4801,7 +4809,11 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
   /* Phase 2: per account, decide-then-allocate with the walk + commit
      under the chain's stripe lock.  Only one lock is ever held at a
      time, so no deadlock.  Partition rotation is hoisted before the
-     lock; the allocation under the lock is then a private whead bump. */
+     lock; the allocation under the lock is then a private whead bump.
+     In incremental mode, a matching entry from another fork generation
+     is a cross-fork override: it is left in place (shadowed until
+     advance_root or purged on FAIL) and a new pool entry is prepended
+     ahead of it, with an undo record on the fork's txn list. */
 
   for( ulong i=0UL; i<cnt; i++ ) {
     ulong  entry_sz = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
@@ -4818,7 +4830,8 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
 
     stripe_lock_acquire( stripe );
 
-    fd_accdb_accmeta_t * existing = NULL;
+    fd_accdb_accmeta_t * existing       = NULL;
+    fd_accdb_accmeta_t * cross_existing = NULL; /* cross-fork dup (incremental only) */
     uint next_acc = FD_VOLATILE_CONST( accdb->acc_map[ hashes[ i ] ] );
     while( next_acc!=UINT_MAX ) {
       fd_accdb_accmeta_t * candidate = &accdb->acc_pool[ next_acc ];
@@ -4838,6 +4851,8 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
           par_metrics->eq_slot_dups++;
           if( FD_UNLIKELY( candidate->lamports!=lamports[ i ] ) ) par_metrics->eq_slot_lamports_diff++;
           skip = 1;
+        } else if( FD_UNLIKELY( incremental ) && candidate->key.generation!=gen ) {
+          cross_existing = candidate;
         } else {
           existing = candidate;
         }
@@ -4855,8 +4870,8 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
     }
 
     if( FD_UNLIKELY( existing!=NULL ) ) {
-      /* In-place replace, still under the stripe lock so concurrent
-         same-chain walkers never observe a torn
+      /* In-place replace (same fork), still under the stripe lock so
+         concurrent same-chain walkers never observe a torn
          (slot, lamports, size, offset) tuple. */
       ulong old_sz  = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( existing->executable_size );
       freed_off     = fd_accdb_acc_offset( existing );
@@ -4868,7 +4883,7 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
       existing->cache_idx       = (uint)slot;
       existing->lamports        = lamports[ i ];
       existing->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
-      existing->offset_fork     = file_off;
+      existing->offset_fork     = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
 
       stripe_lock_release( stripe );
 
@@ -4879,8 +4894,11 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
       continue;
     }
 
-    /* New insert.  Pool acquire is lock free and safe under the stripe
-       lock (it never takes a stripe lock itself). */
+    /* New pool entry: a genuinely new key, or a cross-fork override
+       shadowing another fork's version (which stays in place and keeps
+       its disk bytes until promotion or purge).  Pool acquire is lock
+       free and safe under the stripe lock (it never takes a stripe lock
+       itself). */
     fd_accdb_accmeta_t * accmeta;
     if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
     else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
@@ -4893,17 +4911,50 @@ fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accd
     accmeta->cache_idx        = (uint)slot;
     accmeta->lamports         = lamports[ i ];
     accmeta->executable_size  = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
-    accmeta->offset_fork      = file_off;
+    accmeta->offset_fork      = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
     accmeta->map.next         = accdb->acc_map[ hashes[ i ] ];
     FD_COMPILER_MFENCE();
     accdb->acc_map[ hashes[ i ] ] = acc_idx;
 
+    ulong cross_lamports = cross_existing ? cross_existing->lamports : 0UL;
+
+    if( FD_UNLIKELY( incremental ) ) {
+      /* Undo record so a FAIL can purge this fork's inserts.  The
+         per-fork txn list head is shared by every worker (different
+         stripes race on it), so serialize the prepend with the same
+         CAS retry loop the runtime release path uses; readers (purge /
+         advance_root on T2) only run after all workers quiesced. */
+      fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
+      if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
+      txn->acc_map_idx  = hashes[ i ];
+      txn->acc_pool_idx = acc_idx;
+      uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
+      for(;;) {
+        uint old_head  = FD_VOLATILE_CONST( fork->shmem->txn_head );
+        txn->fork.next = old_head;
+        if( FD_LIKELY( FD_ATOMIC_CAS( &fork->shmem->txn_head, old_head, txn_idx )==old_head ) ) break;
+        FD_SPIN_PAUSE();
+      }
+    }
+
     stripe_lock_release( stripe );
 
+    if( FD_UNLIKELY( cross_existing!=NULL ) ) {
+      /* Cross-fork override: the shadowed version's bytes are NOT freed
+         (it survives an incremental FAIL); count it like write_one's
+         replaced (return 2) semantics. */
+      replaced_lamports += cross_lamports;
+      replaced++;
+      cross_replaced++;
+    } else {
+      loaded++;
+    }
     par_metrics->disk_used_added += entry_sz;
+    /* accounts_total tracks acc_pool entries: increment for every new
+       allocation (both genuinely new accounts and cross-fork overrides
+       that insert a second pool entry). */
     par_metrics->accounts_total_added++;
     file_offsets[ i ] = file_off;
-    loaded++;
   }
 
   *accounts_ignored      = ignored;
