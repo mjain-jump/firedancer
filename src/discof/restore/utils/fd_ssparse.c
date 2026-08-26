@@ -199,6 +199,14 @@ advance_tar( fd_ssparse_t *                ssparse,
       }
 
       ssparse->account.header_bytes_consumed = 0UL;
+      if( FD_UNLIKELY( ssparse->appendvec_passthrough ) ) {
+        /* Do not parse individual accounts: report the appendvec once
+           and consume its body via the garbage skipper. */
+        ssparse->state = FD_SSPARSE_STATE_SCROLL_ACCOUNT_GARBAGE;
+        result->appendvec.slot    = ssparse->slot;
+        result->appendvec.data_sz = ssparse->tar.file_bytes;
+        return FD_SSPARSE_ADVANCE_APPENDVEC;
+      }
       ssparse->state = FD_SSPARSE_STATE_ACCOUNT_HEADER;
       break;
     case FD_SSPARSE_STATE_STATUS_CACHE:
@@ -213,6 +221,14 @@ advance_tar( fd_ssparse_t *                ssparse,
     default:
       FD_LOG_ERR(( "unexpected tar header desired state %d", desired_state ));
       break;
+  }
+
+  if( FD_UNLIKELY( ssparse->appendvec_passthrough ) ) {
+    /* Notify the caller of the non-appendvec region so byte coverage
+       can be published before the (potentially very large) body is
+       parsed. */
+    result->region.data_sz = ssparse->tar.file_bytes;
+    return FD_SSPARSE_ADVANCE_REGION;
   }
 
   return FD_SSPARSE_ADVANCE_AGAIN;
@@ -586,4 +602,25 @@ void
 fd_ssparse_batch_enable( fd_ssparse_t * ssparse,
                          int            enabled ) {
   ssparse->batch_enabled = !!enabled;
+}
+
+void
+fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
+                                         int            enabled ) {
+  ssparse->appendvec_passthrough = !!enabled;
+}
+
+void
+fd_ssparse_accv_init( fd_ssparse_t * ssparse,
+                      ulong          slot,
+                      ulong          sz ) {
+  ssparse->state                         = FD_SSPARSE_STATE_ACCOUNT_HEADER;
+  ssparse->slot                          = slot;
+  ssparse->acc_vec_bytes                 = sz;
+  ssparse->tar.file_bytes                = sz;
+  ssparse->tar.file_bytes_consumed       = 0UL;
+  ssparse->tar.header_bytes_consumed     = 0UL;
+  ssparse->account.header_bytes_consumed = 0UL;
+  ssparse->account.data_bytes_consumed   = 0UL;
+  ssparse->account.data_len              = 0UL;
 }
