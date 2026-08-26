@@ -28,6 +28,7 @@
 #include "../../../discof/genesis/genesis_hash.h"
 #include "../../../discof/replay/fd_replay_tile.h"
 #include "../../../discof/restore/fd_snapct_tile.h"
+#include "../../../discof/restore/utils/fd_snapin_io.h"
 #include "../../../discof/restore/utils/fd_ssctrl.h"
 #include "../../../discof/restore/utils/fd_ssmsg.h"
 #include "../../../discof/tower/fd_tower_tile.h"
@@ -222,7 +223,7 @@ backtest_topo( config_t * config ) {
     fd_topob_link( topo, "snapld_dc",    "snapld_dc",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
     fd_topob_link( topo, "snapdc_in",    "snapdc_in",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
 
-    fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL ); /* TODO: Should be depth 1 or 2 but replay backpressures */
+    fd_topob_link( topo, "snapin_manif", "snapin_manif", FD_SNAPIN_IO_BURST, sizeof(fd_snapshot_manifest_t), 1UL ); /* depth bounds the snapin tile's stem credits; must be >= its FD_SNAPIN_IO_BURST stem burst */
     fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
 
     fd_topob_link( topo, "snapin_ct",    "snapin_ct",    128UL,   0UL,                            1UL );

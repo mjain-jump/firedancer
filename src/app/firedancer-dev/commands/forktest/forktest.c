@@ -18,6 +18,7 @@ Constructed using a full topology which is pruned down. */
 #include "../../../../disco/topo/fd_cpu_topo.h"
 #include "../../../../util/pod/fd_pod_format.h"
 #include "../../../../discof/restore/utils/fd_slot_delta_parser.h"
+#include "../../../../discof/restore/utils/fd_snapin_io.h"
 #include "../../../../discof/restore/utils/fd_ssctrl.h"
 #include "../../../../discof/restore/utils/fd_ssmsg.h"
 #include "../../../../flamenco/progcache/fd_progcache_admin.h"
@@ -167,7 +168,7 @@ forktest_topo( config_t * config ) {
     /**/               fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
     /**/               fd_topob_link( topo, "snapdc_in",     "snapdc_in",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
 
-    /**/               fd_topob_link( topo, "snapin_manif",  "snapin_manif",  4UL,                                      sizeof(fd_snapshot_manifest_t),1UL );
+    /**/               fd_topob_link( topo, "snapin_manif",  "snapin_manif",  FD_SNAPIN_IO_BURST,                       sizeof(fd_snapshot_manifest_t),1UL ); /* depth bounds the snapin tile's stem credits; must be >= its FD_SNAPIN_IO_BURST stem burst */
     /**/               fd_topob_link( topo, "snapct_repr",   "snapct_repr",   128UL,                                    0UL,                           1UL )->permit_no_consumers = 1; /* TODO: wire in repair later */
 
     /**/               fd_topob_link( topo, "snapin_ct",    "snapin_ct",    128UL,                                    0UL,                           1UL );
