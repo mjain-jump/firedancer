@@ -15,7 +15,6 @@ static ulong test_accdb_revert_cnt;
 static ulong test_accdb_worker_call_cnt;
 static ulong test_accdb_worker_slot;
 static ulong test_accdb_worker_cnt_arg;
-static ulong test_accdb_worker_chain_idxs[ 8 ];
 static uchar test_accdb_worker_pubkeys[ 8 ][ 32 ];
 static ulong test_accdb_worker_lamports[ 8 ];
 static ulong test_accdb_worker_data_lens[ 8 ];
@@ -34,14 +33,6 @@ test_ssparse_advance( fd_ssparse_t *                 parser,
                       uchar const *                  data,
                       ulong                          data_sz,
                       fd_ssparse_advance_result_t *  result );
-
-static void
-mock_accdb_snapshot_route_batch( fd_accdb_t const * accdb,
-                                 ulong              cnt,
-                                 uchar const * const pubkeys[],
-                                 ulong              worker_cnt,
-                                 ulong              worker_idxs[],
-                                 ulong              chain_idxs[] );
 
 static void mock_accdb_snapshot_writer_begin( fd_accdb_t * accdb );
 static void mock_accdb_snapshot_writer_end  ( fd_accdb_t * accdb );
@@ -70,11 +61,10 @@ test_stem_publish( fd_stem_context_t * stem,
 
 #define FD_TILE_TEST 1
 #define fd_accdb_snapshot_prefetch_batch mock_accdb_snapshot_prefetch_batch
-#define fd_accdb_snapshot_prefetch_chain_batch mock_accdb_snapshot_prefetch_chain_batch
-#define fd_accdb_snapshot_route_batch mock_accdb_snapshot_route_batch
 #define fd_accdb_snapshot_writer_begin mock_accdb_snapshot_writer_begin
 #define fd_accdb_snapshot_writer_end mock_accdb_snapshot_writer_end
-#define fd_accdb_snapshot_write_batch_worker mock_accdb_snapshot_write_batch_worker
+#define fd_accdb_snapshot_write_batch_par_worker mock_accdb_snapshot_write_batch_par_worker
+#define fd_accdb_snapshot_flush_par_metrics mock_accdb_snapshot_flush_par_metrics
 #define fd_accdb_snapshot_worker_close mock_accdb_snapshot_worker_close
 #define fd_accdb_snapshot_verify_readback mock_accdb_snapshot_verify_readback
 #define fd_accdb_snapshot_write_batch mock_accdb_snapshot_write_batch
@@ -98,32 +88,15 @@ test_stem_publish( fd_stem_context_t * stem,
 #undef fd_accdb_purge
 #undef fd_accdb_attach_child
 #undef fd_accdb_reset
-#undef fd_accdb_snapshot_write_batch_worker
+#undef fd_accdb_snapshot_write_batch_par_worker
+#undef fd_accdb_snapshot_flush_par_metrics
 #undef fd_accdb_snapshot_worker_close
 #undef fd_accdb_snapshot_verify_readback
 #undef fd_accdb_snapshot_writer_end
 #undef fd_accdb_snapshot_writer_begin
-#undef fd_accdb_snapshot_route_batch
-#undef fd_accdb_snapshot_prefetch_chain_batch
 #undef fd_accdb_snapshot_prefetch_batch
 
 #include <stdlib.h>
-
-static void
-mock_accdb_snapshot_route_batch( fd_accdb_t const * accdb,
-                                 ulong              cnt,
-                                 uchar const * const pubkeys[],
-                                 ulong              worker_cnt,
-                                 ulong              worker_idxs[],
-                                 ulong              chain_idxs[] ) {
-  (void)accdb;
-  FD_TEST( cnt && cnt<=8UL );
-  FD_TEST( fd_ulong_is_pow2( worker_cnt ) );
-  for( ulong i=0UL; i<cnt; i++ ) {
-    chain_idxs [ i ] = (ulong)pubkeys[ i ][ 0 ];
-    worker_idxs[ i ] = chain_idxs[ i ] & (worker_cnt-1UL);
-  }
-}
 
 static void
 mock_accdb_snapshot_writer_begin( fd_accdb_t * accdb ) {
@@ -146,37 +119,33 @@ mock_accdb_snapshot_prefetch_batch( fd_accdb_t *        accdb,
   (void)pubkeys;
 }
 
-void
-mock_accdb_snapshot_prefetch_chain_batch( fd_accdb_t * accdb,
-                                          ulong        cnt,
-                                          ulong const  chain_idxs[] ) {
-  (void)accdb;
-  (void)cnt;
-  (void)chain_idxs;
-}
-
-/* Mock explicit-offset worker writer: records what the worker read
-   from the held frag bytes, allocates sequentially from a cursor for
+/* Mock striped-lock worker writer: records what the worker parsed
+   from the appendvec bytes, allocates sequentially from a cursor for
    accepted entries, and reports skip_mask entries as ignored (no
    allocation) and repl_mask entries as replaced. */
 int
-mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
-                                        ulong                       cnt,
-                                        uchar const * const         pubkeys[],
-                                        ulong const                 chain_idxs[],
-                                        ulong                       slot,
-                                        ulong const                 lamports[],
-                                        ulong const                 data_lens[],
-                                        int const                   executables[],
-                                        fd_accdb_snapshot_whead_t * whead,
-                                        ulong                       file_offsets[],
-                                        ulong *                     accounts_ignored,
-                                        ulong *                     accounts_replaced,
-                                        ulong *                     accounts_loaded,
-                                        ulong *                     out_replaced_lamports,
-                                        ulong *                     out_ignored_lamports ) {
+mock_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                            ulong                             cnt,
+                                            uchar const * const               pubkeys[],
+                                            ulong                             slot,
+                                            ulong const                       lamports[],
+                                            ulong const                       data_lens[],
+                                            int const                         executables[],
+                                            fd_accdb_snapshot_whead_t *       whead,
+                                            uint *                            stripe_locks,
+                                            ulong                             stripe_msk,
+                                            fd_accdb_snapshot_par_metrics_t * par_metrics,
+                                            ulong                             file_offsets[],
+                                            ulong *                           accounts_ignored,
+                                            ulong *                           accounts_replaced,
+                                            ulong *                           accounts_loaded,
+                                            ulong *                           out_replaced_lamports,
+                                            ulong *                           out_ignored_lamports ) {
   (void)accdb;
   (void)whead;
+  (void)stripe_locks;
+  (void)stripe_msk;
+  (void)par_metrics;
   FD_TEST( cnt && cnt<=8UL );
   test_accdb_worker_call_cnt++;
   test_accdb_worker_slot    = slot;
@@ -184,7 +153,6 @@ mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
   *accounts_ignored = *accounts_replaced = *accounts_loaded = 0UL;
   *out_replaced_lamports = *out_ignored_lamports = 0UL;
   for( ulong i=0UL; i<cnt; i++ ) {
-    test_accdb_worker_chain_idxs[ i ] = chain_idxs[ i ];
     fd_memcpy( test_accdb_worker_pubkeys[ i ], pubkeys[ i ], 32UL );
     test_accdb_worker_lamports [ i ] = lamports[ i ];
     test_accdb_worker_data_lens[ i ] = data_lens[ i ];
@@ -200,7 +168,19 @@ mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
       else                                           (*accounts_loaded)++;
     }
   }
+  /* masks apply to a single call */
+  test_accdb_worker_skip_mask = 0UL;
+  test_accdb_worker_repl_mask = 0UL;
   return 0;
+}
+
+void
+mock_accdb_snapshot_flush_par_metrics( fd_accdb_t *                      accdb,
+                                       fd_accdb_snapshot_par_metrics_t * m ) {
+  (void)accdb;
+  m->disk_used_added      = 0UL;
+  m->disk_used_removed    = 0UL;
+  m->accounts_total_added = 0UL;
 }
 
 void
@@ -316,13 +296,76 @@ mock_slot_delta_parser_init( fd_slot_delta_parser_t * parser ) {
   (void)parser;
 }
 
+/* Static account entries + fragmented account body for the worker batch
+   staging script (5). */
+static uchar test_script5_ent[ 3 ][ 160UL ];
+static uchar test_script5_hdr_pk   [ 32UL ];
+static uchar test_script5_hdr_owner[ 32UL ];
+static uchar test_script5_hdr_data [ 8UL ];
+
 static int
 test_ssparse_advance( fd_ssparse_t *                parser,
                       uchar const *                 data,
                       ulong                         data_sz,
                       fd_ssparse_advance_result_t * result ) {
   (void)parser;
-  FD_TEST( test_parser_script>=1 && test_parser_script<=3 );
+  FD_TEST( test_parser_script>=1 && test_parser_script<=6 );
+  if( test_parser_script==6 ) {
+    /* coordinator passthrough: appendvec header, region header, DONE */
+    fd_memset( result, 0, sizeof(*result) );
+    result->bytes_consumed = data_sz;
+    test_parser_call_cnt++;
+    if( test_parser_call_cnt==1UL ) {
+      result->appendvec.slot    = 42UL;
+      result->appendvec.data_sz = 1000UL;
+      return FD_SSPARSE_ADVANCE_APPENDVEC;
+    }
+    if( test_parser_call_cnt==2UL ) {
+      result->region.data_sz = 600UL;
+      return FD_SSPARSE_ADVANCE_REGION;
+    }
+    return FD_SSPARSE_ADVANCE_DONE;
+  }
+  if( test_parser_script==5 ) {
+    /* worker appendvec body: one 3-account batch, then a fragmented
+       account (header + one data run), then garbage to the end */
+    fd_memset( result, 0, sizeof(*result) );
+    test_parser_call_cnt++;
+    if( test_parser_call_cnt==1UL ) {
+      result->bytes_consumed = 40UL;
+      result->account_batch.batch[ 0 ] = test_script5_ent[ 0 ];
+      result->account_batch.batch[ 1 ] = test_script5_ent[ 1 ];
+      result->account_batch.batch[ 2 ] = test_script5_ent[ 2 ];
+      result->account_batch.batch_cnt  = 3UL;
+      result->account_batch.slot       = 440123518UL;
+      return FD_SSPARSE_ADVANCE_ACCOUNT_BATCH;
+    }
+    if( test_parser_call_cnt==2UL ) {
+      result->bytes_consumed = 20UL;
+      result->account_header.pubkey     = test_script5_hdr_pk;
+      result->account_header.slot       = 440123518UL;
+      result->account_header.lamports   = 40UL;
+      result->account_header.data_len   = 8UL;
+      result->account_header.owner      = test_script5_hdr_owner;
+      result->account_header.executable = 0;
+      return FD_SSPARSE_ADVANCE_ACCOUNT_HEADER;
+    }
+    if( test_parser_call_cnt==3UL ) {
+      result->bytes_consumed        = 8UL;
+      result->account_data.data     = test_script5_hdr_data;
+      result->account_data.data_sz  = 8UL;
+      return FD_SSPARSE_ADVANCE_ACCOUNT_DATA;
+    }
+    result->bytes_consumed = data_sz;
+    return FD_SSPARSE_ADVANCE_AGAIN;
+  }
+  if( test_parser_script==4 ) {
+    /* consume everything, no events (worker appendvec body) */
+    fd_memset( result, 0, sizeof(*result) );
+    result->bytes_consumed = data_sz;
+    test_parser_call_cnt++;
+    return FD_SSPARSE_ADVANCE_AGAIN;
+  }
   if( test_parser_script==3 ) {
     FD_TEST( data_sz==1UL );
     fd_memset( result, 0, sizeof(*result) );
@@ -1142,211 +1185,236 @@ test_txncache_staging_validates_stale_group_offsets( void ) {
   free( shmem );
 }
 
-/* Write one fd_ssparse batch entry (136-byte header + data) at off in
-   lane_mem.  Returns the offset one past the (unpadded) entry. */
-static ulong
-test_lane_entry( uchar * lane_mem,
-                 ulong   off,
-                 uchar   pubkey_b,
-                 ulong   lamports,
-                 ulong   data_len,
-                 int     executable,
-                 uchar   data_b ) {
-  uchar * e = lane_mem+off;
-  FD_STORE( ulong, e+FD_SNAPIN_IO_ENT_DATA_LEN_OFF, data_len );
-  fd_memset( e+FD_SNAPIN_IO_ENT_PUBKEY_OFF, pubkey_b, 32UL );
-  FD_STORE( ulong, e+FD_SNAPIN_IO_ENT_LAMPORTS_OFF, lamports );
-  fd_memset( e+FD_SNAPIN_IO_ENT_OWNER_OFF, (uchar)(pubkey_b+1), 32UL );
-  e[ FD_SNAPIN_IO_ENT_EXEC_OFF ] = (uchar)executable;
-  fd_memset( e+FD_SNAPIN_IO_ENT_DATA_OFF, data_b, data_len );
-  return off+FD_SNAPIN_IO_ENT_DATA_OFF+data_len;
-}
+/* Parallel loader (D9) role tests ***********************************/
+
+static uchar test_worker_snoop_mem[ sizeof(fd_snapio_worker_snoop_t) + 64UL*sizeof(fd_snapio_stake_ent_t) ] __attribute__((aligned(64)));
+static fd_snapin_extent_t test_worker_fifo[ FD_SNAPIN_FIFO_CNT ];
+static uchar test_worker_write_buf[ FD_SNAPIN_WRITE_BUF_SZ ]    __attribute__((aligned(4096)));
+static uchar test_job_mem [ FD_SNAPIN_IO_JOB_SLOT_SZ ]          __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_ack_mem [ FD_SNAPIN_IO_ACK_SLOT_SZ ]          __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_wlane_mem[ 4 ][ 4096UL ]                      __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_ring_mem[ 2 ][ FD_SNAPIN_IO_JOB_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
+static uchar test_wack_mem[ 2 ][ FD_SNAPIN_IO_ACK_SLOT_SZ ]     __attribute__((aligned(FD_CHUNK_ALIGN)));
+
+/* Worker in link layout mirrors the real topology: the snapin_io ring
+   at in_idx 0, the snapdc lanes at in_idx 1..lane_cnt. */
 
 static void
-test_worker_setup( fd_snapin_tile_t * ctx,
-                   uchar *            job_mem,
-                   uchar *            ack_mem,
-                   uchar *            lane_mem,
-                   ulong              lane_mtu,
-                   uchar *            write_buf ) {
+worker_ctx_init( fd_snapin_tile_t * ctx,
+                 ulong              lane_cnt ) {
   fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->role         = FD_SNAPIN_ROLE_ACCDB_WORKER;
-  ctx->worker_idx   = 0UL;
-  ctx->state        = FD_SNAPSHOT_STATE_IDLE;
-  ctx->job_in_idx   = 0UL;
-  ctx->in_lane[ 0 ] = ULONG_MAX;
-  ctx->in_lane[ 1 ] = 0UL;
-  ctx->io_in[ 0 ].wksp   = (fd_wksp_t *)job_mem;
+  ctx->role            = FD_SNAPIN_ROLE_ACCDB_WORKER;
+  ctx->worker_idx      = 0UL;
+  ctx->full            = 1;
+  ctx->state           = FD_SNAPSHOT_STATE_IDLE;
+  ctx->lane_cnt        = lane_cnt;
+  ctx->pending_control = ULONG_MAX;
+  ctx->job_in_idx      = 0UL;
+  ctx->in_lane[ 0 ]    = ULONG_MAX;
+  ctx->io_in[ 0 ].wksp   = (fd_wksp_t *)test_job_mem;
   ctx->io_in[ 0 ].chunk0 = 0UL;
   ctx->io_in[ 0 ].wmark  = 0UL;
   ctx->io_in[ 0 ].mtu    = FD_SNAPIN_IO_JOB_SLOT_SZ;
-  ctx->lane_cnt        = 1UL;
-  ctx->in[ 0 ].wksp   = (fd_wksp_t *)lane_mem;
-  ctx->in[ 0 ].chunk0 = 0UL;
-  ctx->in[ 0 ].wmark  = 0UL;
-  ctx->in[ 0 ].mtu    = lane_mtu;
-  ctx->release[ 0 ]   = ULONG_MAX;
-  ctx->write_buf      = write_buf;
-  ctx->ack_out.idx    = 3UL;
-  ctx->ack_out.mem    = (fd_wksp_t *)ack_mem;
-  ctx->ack_out.chunk0 = 0UL;
-  ctx->ack_out.wmark  = 0UL;
-  ctx->ack_out.chunk  = 0UL;
-  ctx->ack_out.mtu    = FD_SNAPIN_IO_ACK_SLOT_SZ;
+  for( ulong lane=0UL; lane<lane_cnt; lane++ ) {
+    ctx->in_lane[ 1UL+lane ] = lane;
+    ctx->in[ lane ].wksp   = (fd_wksp_t *)test_wlane_mem[ lane ];
+    ctx->in[ lane ].chunk0 = 0UL;
+    ctx->in[ lane ].wmark  = 0UL;
+    ctx->in[ lane ].mtu    = 4096UL;
+  }
+  ctx->fifo          = test_worker_fifo;
+  ctx->write_buf     = test_worker_write_buf;
+  ctx->my_snoop      = (fd_snapio_worker_snoop_t *)test_worker_snoop_mem;
+  ctx->stake_log_max = 64UL;
+  ctx->ack_out = (fd_snapin_out_link_t){ .idx = 7UL, .mem = (fd_wksp_t *)test_ack_mem, .chunk0 = 0UL, .wmark = 0UL, .chunk = 0UL, .mtu = FD_SNAPIN_IO_ACK_SLOT_SZ };
 }
 
-static uchar test_worker_write_buf[ FD_SNAPIN_WRITE_BUF_SZ ] __attribute__((aligned(4096)));
+static int
+send_job( fd_snapin_tile_t * ctx,
+          ulong kind, ulong gen, ulong av_idx,
+          ulong slot, ulong body_off, ulong body_sz, ulong covered_until ) {
+  fd_snapin_io_job_t * job = (fd_snapin_io_job_t *)test_job_mem;
+  fd_memset( job, 0, sizeof(*job) );
+  job->kind          = kind;
+  job->generation    = gen;
+  job->appendvec_idx = av_idx;
+  job->slot          = slot;
+  job->body_off      = body_off;
+  job->body_sz       = body_sz;
+  job->covered_until = covered_until;
+  FD_TEST( !before_frag( ctx, ctx->job_in_idx, 0UL, kind ) );
+  return returnable_frag( ctx, ctx->job_in_idx, 0UL, kind, 0UL, sizeof(fd_snapin_io_job_t),
+                          0UL, 0UL, 0UL, (fd_stem_context_t *)1UL );
+}
 
 static void
-test_snapin_worker_protocol( void ) {
-  static uchar job_mem [ FD_SNAPIN_IO_JOB_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar ack_mem [ FD_SNAPIN_IO_ACK_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar lane_mem[ 4096UL ]                   __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memset( job_mem,  0, sizeof(job_mem)  );
-  fd_memset( ack_mem,  0, sizeof(ack_mem)  );
-  fd_memset( lane_mem, 0, sizeof(lane_mem) );
+worker_send_control( fd_snapin_tile_t * ctx,
+                     ulong              lane,
+                     ulong              sig ) {
+  FD_TEST( !returnable_frag( ctx, 1UL+lane, 0UL, sig, 0UL, 0UL, 0UL, 0UL, 0UL,
+                             (fd_stem_context_t *)1UL ) );
+}
 
-  fd_snapin_tile_t ctx[ 1 ];
-  test_worker_setup( ctx, job_mem, ack_mem, lane_mem, sizeof(lane_mem), test_worker_write_buf );
+static int
+send_worker_data( fd_snapin_tile_t * ctx,
+                  ulong              lane,
+                  ulong              sz ) {
+  ulong sig = FD_SNAPSHOT_MSG_DATA;
+  ulong ctl = fd_frag_meta_ctl( 0UL, 0, 0, 0 );
+  FD_TEST( !before_frag( ctx, 1UL+lane, 0UL, sig ) );
+  return returnable_frag( ctx, 1UL+lane, 0UL, sig, 0UL, sz, ctl, 0UL, 0UL, (fd_stem_context_t *)1UL );
+}
 
-  /* Three batch entries in the held lane frag: 5-byte data, 0-byte
-     data, 12-byte data (offsets 8-byte aligned like the parser). */
-  ulong e0 = 0UL;
-  ulong e1 = fd_ulong_align_up( test_lane_entry( lane_mem, e0, 0xA1, 10UL, 5UL, 0, 0x51 ), 8UL );
-  ulong e2 = fd_ulong_align_up( test_lane_entry( lane_mem, e1, 0xB2, 20UL, 0UL, 1, 0x00 ), 8UL );
-  ulong e3 = fd_ulong_align_up( test_lane_entry( lane_mem, e2, 0xC3, 30UL, 12UL, 0, 0x52 ), 8UL );
-  /* Slow-path data run for the HEADER account. */
-  ulong dr = e3;
-  fd_memset( lane_mem+dr, 0x53, 8UL );
+static fd_snapin_io_ack_t const *
+last_worker_ack( void ) {
+  return (fd_snapin_io_ack_t const *)test_ack_mem;
+}
 
-  fd_snapin_io_job_t * job = (fd_snapin_io_job_t *)job_mem;
-  job->kind       = FD_SNAPIN_IO_KIND_CTRL;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  job->control    = FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
-  for( ulong i=0UL; i<FD_SNAPIN_IO_LANE_MAX; i++ ) job->frontier[ i ] = ULONG_MAX;
+static void
+worker_send_init( fd_snapin_tile_t * ctx ) {
+  ulong pub0 = test_pub_cnt;
+  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) worker_send_control( ctx, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
+  FD_TEST( test_pub_cnt==pub0+1UL );
+  FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==fd_snapin_io_ack_sig( ctx->generation, FD_SNAPSHOT_MSG_CTRL_INIT_FULL ) );
+}
+
+static void
+test_worker_coverage_hold( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 2UL );
   test_pub_cnt = 0UL;
   test_accdb_writer_begin_cnt = 0UL;
-  test_accdb_writer_end_cnt   = 0UL;
-  test_accdb_worker_close_cnt = 0UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
-  FD_TEST( ctx->generation==9UL );
+  worker_send_init( ctx );
+  FD_TEST( ctx->generation==1UL );
   FD_TEST( test_accdb_writer_begin_cnt==1UL );
-  FD_TEST( test_pub_cnt==1UL );
-  FD_TEST( test_pub_sig[0]==fd_snapin_io_ack_sig( 9UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL ) );
 
-  /* BATCH: worker reads pubkey/lamports/exec/data from the held frag,
-     entry 0 ignored (no allocation), entry 1 replaced, entry 2 loaded. */
-  fd_memset( job, 0, sizeof(*job) );
-  job->kind       = FD_SNAPIN_IO_KIND_BATCH;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  job->cnt        = 3UL;
-  job->slot       = 440123518UL;
-  job->fork_id    = USHORT_MAX;
-  job->lane       = 0UL;
-  job->seq        = 5UL;
-  job->chunk      = 0UL;
-  job->ent_off[0] = (uint)e0; job->data_len[0] =  5U;
-  job->ent_off[1] = (uint)e1; job->data_len[1] =  0U;
-  job->ent_off[2] = (uint)e2; job->data_len[2] = 12U;
-  fd_snapin_io_job_set_chain_idx( job, 0UL, 10UL );
-  fd_snapin_io_job_set_chain_idx( job, 1UL, 20UL );
-  fd_snapin_io_job_set_chain_idx( job, 2UL, 30UL );
+  /* No coverage yet: data frag held (and counted) */
+  FD_TEST( send_worker_data( ctx, 0UL, 100UL )==1 );
+  FD_TEST( ctx->cursor==0UL );
+  FD_TEST( ctx->cov_stats.hold_reprocess==1UL );
+
+  /* WATERMARK covers the first 512-aligned entry */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( ctx->covered_until==512UL );
+
+  /* Reprocess: fully consumed (skipped, not ours) */
+  FD_TEST( send_worker_data( ctx, 0UL, 100UL )==0 );
+  FD_TEST( ctx->cursor==100UL );
+
+  /* Partially covered frag: consume up to the watermark, hold the rest */
+  FD_TEST( send_worker_data( ctx, 0UL, 512UL )==1 );
+  FD_TEST( ctx->cursor==512UL );
+  FD_TEST( ctx->in[ 0 ].pos==412UL );
+  FD_TEST( ctx->cov_stats.hold_reprocess==2UL );
+
+  /* EOS extends coverage to infinity: reprocess drains */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  FD_TEST( ctx->eos_seen );
+  FD_TEST( send_worker_data( ctx, 0UL, 512UL )==0 );
+  FD_TEST( ctx->cursor==612UL );
+  FD_TEST( ctx->in[ 0 ].pos==0UL );
+}
+
+static void
+test_worker_owned_appendvec( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 2UL );
+  test_pub_cnt = 0UL;
+  worker_send_init( ctx );
+
+  /* Appendvec for this worker at body [512, 612); ASSIGN carries the
+     coverage through its own (padded) end inline. */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL ) );
+  FD_TEST( ctx->fifo_tail==1UL && ctx->fifo_head==0UL );
+  FD_TEST( ctx->covered_until==1024UL );
+  FD_TEST( ctx->cov_stats.lag_samples==1UL && ctx->cov_stats.lag_max==1024UL );
+
+  /* Another worker's coverage arrives on the periodic watermark */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 2048UL ) );
+  FD_TEST( ctx->fifo_tail==1UL );
+  FD_TEST( ctx->covered_until==2048UL );
+
+  test_parser_script   = 4;
+  test_parser_call_cnt = 0UL;
+
+  /* One frag spans skip(512) + owned body(100) + skip(88) */
+  FD_TEST( send_worker_data( ctx, 0UL, 700UL )==0 );
+  FD_TEST( ctx->cursor==700UL );
+  FD_TEST( ctx->fifo_head==1UL );
+  FD_TEST( !ctx->av_active );
+  FD_TEST( test_parser_call_cnt==1UL );
+}
+
+/* End-to-end worker staging: an owned appendvec body parsed into an
+   account batch (one ignored, one replaced, one loaded) plus a
+   fragmented account, the accepted records staged at the mock
+   allocator's explicit offsets, flushed at FINI, and readable from the
+   memfd backing FD_ACCDB_FD_RW. */
+static void
+test_worker_batch_staging( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 1UL );
+  test_pub_cnt = 0UL;
+  worker_send_init( ctx );
+
+  /* Batch entries: (pubkey byte, lamports, data_len, exec, data byte) */
+  struct { uchar pk; ulong lamports; ulong len; int exec; uchar db; } spec[3] = {
+    { 0xA1, 10UL,  5UL, 0, 0x51 },
+    { 0xB2, 20UL,  0UL, 1, 0x00 },
+    { 0xC3, 30UL, 12UL, 0, 0x52 },
+  };
+  for( ulong i=0UL; i<3UL; i++ ) {
+    uchar * e = test_script5_ent[ i ];
+    fd_memset( e, 0, 160UL );
+    FD_STORE( ulong, e+8UL, spec[ i ].len );
+    fd_memset( e+16UL, spec[ i ].pk, 32UL );
+    FD_STORE( ulong, e+48UL, spec[ i ].lamports );
+    fd_memset( e+64UL, (uchar)(spec[ i ].pk+1), 32UL );
+    e[ 96UL ] = (uchar)spec[ i ].exec;
+    fd_memset( e+136UL, spec[ i ].db, spec[ i ].len );
+  }
+  fd_memset( test_script5_hdr_pk,    0xD4, 32UL );
+  fd_memset( test_script5_hdr_owner, 0xD5, 32UL );
+  fd_memset( test_script5_hdr_data,  0x53, 8UL  );
+
+  /* Owned appendvec spanning the whole 100-byte frag at offset 0 */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 0UL, 440123518UL, 0UL, 100UL, 512UL ) );
+
+  test_parser_script   = 5;
+  test_parser_call_cnt = 0UL;
   test_accdb_worker_call_cnt  = 0UL;
   test_accdb_worker_next_off  = 4096UL;
   test_accdb_worker_skip_mask = 1UL; /* entry 0 ignored */
   test_accdb_worker_repl_mask = 2UL; /* entry 1 replaced */
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( test_accdb_worker_call_cnt==1UL );
-  FD_TEST( test_accdb_worker_cnt_arg==3UL );
+  FD_TEST( send_worker_data( ctx, 0UL, 100UL )==0 );
+
+  FD_TEST( test_accdb_worker_call_cnt==2UL ); /* batch + header account */
   FD_TEST( test_accdb_worker_slot==440123518UL );
-  FD_TEST( test_accdb_worker_chain_idxs[0]==10UL && test_accdb_worker_chain_idxs[1]==20UL && test_accdb_worker_chain_idxs[2]==30UL );
-  FD_TEST( test_accdb_worker_pubkeys[0][0]==0xA1 && test_accdb_worker_pubkeys[1][0]==0xB2 && test_accdb_worker_pubkeys[2][0]==0xC3 );
-  FD_TEST( test_accdb_worker_lamports[0]==10UL && test_accdb_worker_lamports[1]==20UL && test_accdb_worker_lamports[2]==30UL );
-  FD_TEST( test_accdb_worker_data_lens[0]==5UL && test_accdb_worker_data_lens[1]==0UL && test_accdb_worker_data_lens[2]==12UL );
-  FD_TEST( !test_accdb_worker_execs[0] && test_accdb_worker_execs[1] && !test_accdb_worker_execs[2] );
   FD_TEST( ctx->metrics.accounts_ignored==1UL );
   FD_TEST( ctx->metrics.accounts_replaced==1UL );
-  FD_TEST( ctx->metrics.accounts_loaded==1UL );
-  FD_TEST( ctx->metrics.total_accounts_processed==3UL );
-  FD_TEST( ctx->worker.input_lamports==60UL );
+  FD_TEST( ctx->metrics.accounts_loaded==2UL );
+  FD_TEST( ctx->metrics.total_accounts_processed==4UL );
+  FD_TEST( ctx->worker.input_lamports==100UL );
   FD_TEST( ctx->worker.replaced_lamports==20UL );
   FD_TEST( ctx->worker.ignored_lamports==10UL );
+  FD_TEST( ctx->rec_idx==4UL );
+  FD_TEST( !ctx->av_active && ctx->cursor==100UL );
 
-  /* Slow path: HEADER by value, then a DATA frag ref.  Loaded at the
-     mock's cursor (4096+72+0 + 72+12 = 4252). */
-  fd_memset( job, 0, sizeof(*job) );
-  job->kind       = FD_SNAPIN_IO_KIND_HEADER;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  job->cnt        = 1UL;
-  job->slot       = 440123518UL;
-  job->fork_id    = USHORT_MAX;
-  fd_memset( job->hdr.pubkey, 0xD4, 32UL );
-  fd_memset( job->hdr.owner,  0xD5, 32UL );
-  job->hdr.lamports   = 40UL;
-  job->hdr.data_len   = 8UL;
-  job->hdr.chain_idx  = 40UL;
-  job->hdr.executable = 0;
-  test_accdb_worker_skip_mask = 0UL;
-  test_accdb_worker_repl_mask = 0UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( ctx->open_acc.active && ctx->open_acc.accepted );
-  FD_TEST( ctx->open_acc.data_len==8UL && !ctx->open_acc.received );
-  FD_TEST( ctx->metrics.accounts_loaded==2UL );
-  FD_TEST( ctx->worker.input_lamports==100UL );
-
-  fd_memset( job, 0, sizeof(*job) );
-  job->kind       = FD_SNAPIN_IO_KIND_DATA;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  job->lane       = 0UL;
-  job->seq        = 6UL;
-  job->chunk      = 0UL;
-  job->off        = (uint)dr;
-  job->sz         = 8U;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( !ctx->open_acc.active );
-  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
-
-  /* FRONTIER releases the held lanes up to seq 6: before_frag consumes
-     (filters) released frags and defers newer ones. */
-  FD_TEST( before_frag( ctx, 1UL, 6UL, FD_SNAPSHOT_MSG_DATA )==-1 );
-  fd_memset( job, 0, sizeof(*job) );
-  job->kind       = FD_SNAPIN_IO_KIND_FRONTIER;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  for( ulong i=0UL; i<FD_SNAPIN_IO_LANE_MAX; i++ ) job->frontier[ i ] = ULONG_MAX;
-  job->frontier[ 0 ] = 6UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( ctx->release[ 0 ]==6UL );
-  FD_TEST( before_frag( ctx, 1UL, 6UL, FD_SNAPSHOT_MSG_DATA )==1  );
-  FD_TEST( before_frag( ctx, 1UL, 7UL, FD_SNAPSHOT_MSG_DATA )==-1 );
-  FD_TEST( before_frag( ctx, 0UL, 7UL, FD_SNAPSHOT_MSG_DATA )==0  ); /* job ring always processed */
-  /* Stale frontiers never move release backwards. */
-  job->frontier[ 0 ] = 4UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
-  FD_TEST( ctx->release[ 0 ]==6UL );
-
-  /* FINI: flush staging, close the private partition, writer_end, ack
-     with the folded counters.  The staged bytes must be readable at the
-     explicit offsets. */
-  fd_memset( job, 0, sizeof(*job) );
-  job->kind       = FD_SNAPIN_IO_KIND_CTRL;
-  job->worker_idx = 0UL;
-  job->generation = 9UL;
-  job->control    = FD_SNAPSHOT_MSG_CTRL_FINI;
-  for( ulong i=0UL; i<FD_SNAPIN_IO_LANE_MAX; i++ ) job->frontier[ i ] = ULONG_MAX;
-  job->frontier[ 0 ] = 6UL;
+  /* FINI (after EOS) flushes the staging and acks with the counters. */
+  test_accdb_writer_end_cnt   = 0UL;
+  test_accdb_worker_close_cnt = 0UL;
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
   test_pub_cnt = 0UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
+  FD_TEST( !ctx->pending_fini );
   FD_TEST( test_accdb_writer_end_cnt==1UL );
   FD_TEST( test_accdb_worker_close_cnt==1UL );
   FD_TEST( !ctx->write_buf_used );
-  fd_snapin_io_ack_t const * ack = (fd_snapin_io_ack_t const *)ack_mem;
+  FD_TEST( test_pub_cnt==1UL );
+  FD_TEST( test_pub_sig[0]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FINI ) );
+  fd_snapin_io_ack_t const * ack = last_worker_ack();
   FD_TEST( ack->worker_idx==0UL );
   FD_TEST( ack->accounts_ignored==1UL );
   FD_TEST( ack->accounts_replaced==1UL );
@@ -1355,6 +1423,9 @@ test_snapin_worker_protocol( void ) {
   FD_TEST( ack->replaced_lamports==20UL );
   FD_TEST( ack->ignored_lamports==10UL );
 
+  /* Ignored entry 0 burned no space; the accepted records are packed at
+     the allocator's explicit offsets: entry1@4096 (72+0), entry2@4168
+     (72+12), header account@4252 (72+8). */
   uchar disk[ 128 ];
   FD_TEST( pread( FD_ACCDB_FD_RW, disk, sizeof(fd_accdb_disk_meta_t), 4096L )==(long)sizeof(fd_accdb_disk_meta_t) );
   fd_accdb_disk_meta_t const * m1 = (fd_accdb_disk_meta_t const *)disk;
@@ -1368,259 +1439,437 @@ test_snapin_worker_protocol( void ) {
   FD_TEST( m3->pubkey[ 0 ]==0xD4 && m3->size==8U && m3->owner[ 0 ]==0xD5 );
   for( ulong i=0UL; i<8UL; i++ ) FD_TEST( disk[ sizeof(fd_accdb_disk_meta_t)+i ]==0x53 );
 
-  job->control = FD_SNAPSHOT_MSG_CTRL_DONE;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_DONE );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
-  job->control = FD_SNAPSHOT_MSG_CTRL_SHUTDOWN;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN );
+  FD_TEST( should_shutdown( ctx ) );
 }
 
-/* A job referencing a frag at or below the released watermark violates
-   the frag-lifetime guarantee (nothing holds those bytes): the worker
-   must fail the attempt with EPROTO instead of reading them. */
 static void
-test_snapin_worker_ref_guard( void ) {
-  static uchar job_mem [ FD_SNAPIN_IO_JOB_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar ack_mem [ FD_SNAPIN_IO_ACK_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar lane_mem[ 4096UL ]                   __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memset( job_mem,  0, sizeof(job_mem)  );
-  fd_memset( ack_mem,  0, sizeof(ack_mem)  );
-  fd_memset( lane_mem, 0, sizeof(lane_mem) );
-
-  fd_snapin_tile_t ctx[ 1 ];
-  test_worker_setup( ctx, job_mem, ack_mem, lane_mem, sizeof(lane_mem), test_worker_write_buf );
-  ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
-  ctx->generation = 3UL;
-  ctx->release[ 0 ] = 6UL;
-  test_lane_entry( lane_mem, 0UL, 0xA1, 10UL, 5UL, 0, 0x51 );
-
-  fd_snapin_io_job_t * job = (fd_snapin_io_job_t *)job_mem;
-  job->kind       = FD_SNAPIN_IO_KIND_BATCH;
-  job->worker_idx = 0UL;
-  job->generation = 3UL;
-  job->cnt        = 1UL;
-  job->slot       = 1UL;
-  job->fork_id    = USHORT_MAX;
-  job->lane       = 0UL;
-  job->seq        = 6UL; /* <= release: bytes are no longer held */
-  job->chunk      = 0UL;
-  job->ent_off[0] = 0U;
-  job->data_len[0] = 5U;
+test_worker_stale_generation( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 1UL );
   test_pub_cnt = 0UL;
-  test_accdb_worker_call_cnt = 0UL;
-  worker_handle_frag( ctx, 0UL, sizeof(*job), (fd_stem_context_t *)1UL );
+  worker_send_init( ctx );
+  FD_TEST( ctx->generation==1UL );
+
+  /* Stale job (previous attempt): drained, no effect */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( ctx->covered_until==0UL );
+
+  /* Future job (coordinator's INIT raced ahead): held */
+  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 2UL, 0UL, 0UL, 0UL, 0UL, 512UL )==1 );
+  FD_TEST( ctx->covered_until==0UL );
+
+  /* Current generation: applied */
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_WATERMARK, 1UL, 0UL, 0UL, 0UL, 0UL, 512UL ) );
+  FD_TEST( ctx->covered_until==512UL );
+
+  /* A full FIFO holds ASSIGNs (reprocess later) */
+  ctx->fifo_head = 0UL;
+  ctx->fifo_tail = FD_SNAPIN_FIFO_CNT;
+  FD_TEST( send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 42UL, 512UL, 100UL, 1024UL )==1 );
+  ctx->fifo_tail = 0UL;
+
+  /* Stale ASSIGN after FAIL (state IDLE, same generation): drained */
+  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) worker_send_control( ctx, lane, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL ) );
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ASSIGN, 1UL, 5UL, 512UL, 512UL, 100UL, 1024UL ) );
+  FD_TEST( ctx->fifo_tail==0UL );
+}
+
+static void
+test_worker_fini_deferred_ack( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 2UL );
+  test_pub_cnt = 0UL;
+  worker_send_init( ctx );
+
+  /* FINI barrier completes but EOS has not arrived on the job ring:
+     the ack is deferred (and the lanes are NOT held, so a FAIL queued
+     behind could still flow). */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_fini );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
+  FD_TEST( test_pub_cnt==1UL ); /* just the INIT ack */
+
+  int poll_in = 1; int charge_busy = 0;
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( ctx->pending_fini ); /* still waiting for EOS */
+
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_EOS, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( !ctx->pending_fini );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
+  FD_TEST( test_pub_cnt==2UL );
+  FD_TEST( test_pub_sig[ 1 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FINI ) );
+  FD_TEST( last_worker_ack()->control==FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( last_worker_ack()->worker_idx==0UL );
+
+  /* NEXT/DONE acked immediately */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_DONE );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_DONE );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( test_pub_sig[ 2 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_DONE ) );
+
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_SHUTDOWN );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN );
+  FD_TEST( should_shutdown( ctx ) );
+}
+
+static void
+test_worker_fail_cancels_pending_fini( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 2UL );
+  test_pub_cnt = 0UL;
+  worker_send_init( ctx );
+
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_fini );
+
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( !ctx->pending_fini );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL ) );
+
+  /* Retry: INIT bumps the generation */
+  worker_send_init( ctx );
+  FD_TEST( ctx->generation==2UL );
+}
+
+/* A coverage-held worker cannot reach a FAIL queued behind the held
+   DATA frag: the ABORT ring job bypasses the lane and flips the worker
+   to ERROR-drain so FAIL flows. */
+static void
+test_worker_abort_ring_bypass( void ) {
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 1UL );
+  test_pub_cnt = 0UL;
+  worker_send_init( ctx );
+
+  /* Held on coverage */
+  FD_TEST( send_worker_data( ctx, 0UL, 100UL )==1 );
+
+  /* ABORT: silent (no ERROR ack; the coordinator already knows) */
+  ulong pub0 = test_pub_cnt;
+  FD_TEST( !send_job( ctx, FD_SNAPIN_IO_KIND_ABORT, 1UL, 0UL, 0UL, 0UL, 0UL, 0UL ) );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
-  FD_TEST( !test_accdb_worker_call_cnt ); /* never touched the index */
+  FD_TEST( test_pub_cnt==pub0 );
+
+  /* The held frag is now dropped by the ERROR-state filter */
+  FD_TEST( before_frag( ctx, 1UL, 0UL, FD_SNAPSHOT_MSG_DATA )==1 );
+  FD_TEST( before_frag( ctx, 1UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI )==1 );
+  FD_TEST( before_frag( ctx, 1UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL )==0 );
+
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( test_pub_sig[ test_pub_cnt-1UL ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL ) );
+}
+
+static void
+test_worker_error_mid_init_barrier( void ) {
+  /* Regression: an ERROR processed while the INIT barrier is only
+     partially complete aborts the barrier.  The generation must have
+     been bumped at the FIRST INIT frag (not at completion), or the
+     worker's subsequent ERROR/FAIL acks would be dropped by the
+     coordinator as generation-stale, hanging the FAIL ack mask. */
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 2UL );
+  test_pub_cnt = 0UL;
+
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE ); /* barrier incomplete */
+  FD_TEST( ctx->generation==1UL );               /* but generation already bumped */
+  FD_TEST( !test_pub_cnt );
+
+  /* Immediate ERROR (queued behind INIT on lane 0) aborts the barrier */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( test_pub_cnt==1UL );
-  FD_TEST( test_pub_sig[0]==fd_snapin_io_ack_sig( 3UL, FD_SNAPSHOT_MSG_CTRL_ERROR ) );
-  fd_snapin_io_ack_t const * ack = (fd_snapin_io_ack_t const *)ack_mem;
-  FD_TEST( ack->err==EPROTO );
+  FD_TEST( test_pub_sig[ 0 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_ERROR ) );
+
+  /* Lane 1's INIT would be drained by the ERROR-state filter */
+  FD_TEST( before_frag( ctx, 2UL, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL )>0 );
+
+  /* FAIL supersedes the aborted INIT barrier and is acked at the
+     CURRENT generation */
+  worker_send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  worker_send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( test_pub_sig[ 1 ]==fd_snapin_io_ack_sig( 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL ) );
+
+  /* Retry: the next attempt's generation is 2 on both sides */
+  worker_send_init( ctx );
+  FD_TEST( ctx->generation==2UL );
 }
 
-static void
-test_snapin_coordinator_worker_handoff( void ) {
-  static uchar job_mem [ FD_SNAPIN_IO_JOB_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar ack_mem [ FD_SNAPIN_IO_ACK_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar frag_mem[ 1024UL ]                   __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memset( job_mem,  0, sizeof(job_mem)  );
-  fd_memset( ack_mem,  0, sizeof(ack_mem)  );
-  fd_memset( frag_mem, 0, sizeof(frag_mem) );
-
-  fd_snapin_tile_t ctx[ 1 ];
-  fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->role       = FD_SNAPIN_ROLE_COORDINATOR;
-  ctx->io_enabled = 1;
-  ctx->worker_cnt = 1UL;
-  ctx->generation = 12UL;
-  ctx->full       = 1;
-  ctx->io_out[ 0 ].idx    = 2UL;
-  ctx->io_out[ 0 ].mem    = (fd_wksp_t *)job_mem;
-  ctx->io_out[ 0 ].chunk0 = 0UL;
-  ctx->io_out[ 0 ].wmark  = 0UL;
-  ctx->io_out[ 0 ].chunk  = 0UL;
-  ctx->io_out[ 0 ].mtu    = FD_SNAPIN_IO_JOB_SLOT_SZ;
-
-  /* Jobs pin (lane,seq,chunk) refs into the frag being parsed. */
-  ctx->cur_frag.lane  = 0UL;
-  ctx->cur_frag.seq   = 7UL;
-  ctx->cur_frag.chunk = 5UL;
-  ctx->cur_frag.base  = frag_mem;
-
-  uchar pubkey[ 3 ][ 32 ] = { { 1U }, { 2U }, { 3U } };
-  uchar const * entries[ 3 ] = { frag_mem+0UL, frag_mem+200UL, frag_mem+400UL };
-  uchar const * pubkeys[ 3 ] = { pubkey[0], pubkey[1], pubkey[2] };
-  ulong const data_lens[ 3 ] = { 100UL, 200UL, 300UL };
-  test_pub_cnt = 0UL;
-  FD_TEST( dispatch_account_batch( ctx, entries, 3UL, pubkeys, 440123518UL,
-                                   data_lens, (fd_stem_context_t *)1UL )==0 );
-  FD_TEST( test_pub_cnt==0UL );
-  publish_all_pending_jobs( ctx, (fd_stem_context_t *)1UL );
-  FD_TEST( test_pub_cnt==1UL && test_pub_sig[0]==FD_SNAPSHOT_MSG_DATA );
-  fd_snapin_io_job_t const * job = (fd_snapin_io_job_t const *)job_mem;
-  FD_TEST( job->kind==FD_SNAPIN_IO_KIND_BATCH );
-  FD_TEST( job->worker_idx==0UL );
-  FD_TEST( job->generation==12UL );
-  FD_TEST( job->cnt==3UL );
-  FD_TEST( job->slot==440123518UL );
-  FD_TEST( job->fork_id==USHORT_MAX );
-  FD_TEST( job->lane==0UL && job->seq==7UL && job->chunk==5UL );
-  FD_TEST( job->ent_off[0]==0U && job->ent_off[1]==200U && job->ent_off[2]==400U );
-  FD_TEST( job->data_len[0]==100U && job->data_len[1]==200U && job->data_len[2]==300U );
-  FD_TEST( fd_snapin_io_job_chain_idx( job, 0UL )==1UL &&
-           fd_snapin_io_job_chain_idx( job, 1UL )==2UL &&
-           fd_snapin_io_job_chain_idx( job, 2UL )==3UL );
-
-  ctx->io_in[ 0 ].wksp   = (fd_wksp_t *)ack_mem;
-  ctx->io_in[ 0 ].chunk0 = 0UL;
-  ctx->io_in[ 0 ].wmark  = 0UL;
-  ctx->io_in[ 0 ].mtu    = FD_SNAPIN_IO_ACK_SLOT_SZ;
-  ctx->ct_out.idx   = 4UL;
-  ctx->pending_worker_control = FD_SNAPSHOT_MSG_CTRL_FINI;
-  ctx->capitalization         = 100UL;
-  ctx->dup_capitalization     = 5UL;
-  fd_snapin_io_ack_t * ack = (fd_snapin_io_ack_t *)ack_mem;
-  ack->worker_idx         = 0UL;
-  ack->generation        = 12UL;
-  ack->control           = FD_SNAPSHOT_MSG_CTRL_FINI;
-  ack->accounts_ignored  = 1UL;
-  ack->accounts_replaced = 1UL;
-  ack->accounts_loaded   = 1UL;
-  ack->input_lamports    = 60UL;
-  ack->replaced_lamports = 11UL;
-  ack->ignored_lamports  = 7UL;
-  test_pub_cnt = 0UL;
-  coordinator_handle_ack( ctx, (fd_stem_context_t *)1UL,
-                          0UL,
-                          fd_snapin_io_ack_sig( 12UL, FD_SNAPSHOT_MSG_CTRL_FINI ),
-                          0UL, sizeof(*ack) );
-  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
-  FD_TEST( ctx->metrics.accounts_ignored==1UL );
-  FD_TEST( ctx->metrics.accounts_replaced==1UL );
-  FD_TEST( ctx->metrics.accounts_loaded==1UL );
-  FD_TEST( ctx->capitalization==153UL );
-  FD_TEST( ctx->dup_capitalization==16UL );
-  FD_TEST( test_pub_cnt==1UL && test_pub_sig[0]==FD_SNAPSHOT_MSG_CTRL_FINI );
-}
+/* Coordinator (io) side *********************************************/
 
 static void
-test_snapin_multiworker_routing_and_barrier( void ) {
-  static uchar job_mem[ 2 ][ FD_SNAPIN_IO_JOB_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar ack_mem[ 2 ][ FD_SNAPIN_IO_ACK_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  static uchar frag_mem[ 1024UL ]                       __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memset( job_mem,  0, sizeof(job_mem)  );
-  fd_memset( ack_mem,  0, sizeof(ack_mem)  );
-  fd_memset( frag_mem, 0, sizeof(frag_mem) );
-
-  fd_snapin_tile_t ctx[ 1 ];
-  fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->role       = FD_SNAPIN_ROLE_COORDINATOR;
+coordinator_io_ctx_init( fd_snapin_tile_t * ctx,
+                         ulong              lane_cnt,
+                         int                state ) {
+  sync_ctx_init( ctx, lane_cnt, state );
   ctx->io_enabled = 1;
   ctx->worker_cnt = 2UL;
-  ctx->generation = 21UL;
-  ctx->full       = 1;
-  for( ulong i=0UL; i<2UL; i++ ) {
-    ctx->io_out[ i ].idx    = 10UL+i;
-    ctx->io_out[ i ].mem    = (fd_wksp_t *)job_mem[ i ];
-    ctx->io_out[ i ].chunk0 = 0UL;
-    ctx->io_out[ i ].wmark  = 0UL;
-    ctx->io_out[ i ].chunk  = 0UL;
-    ctx->io_out[ i ].mtu    = FD_SNAPIN_IO_JOB_SLOT_SZ;
+  ctx->generation = 1UL;
+  ctx->pending_worker_control = ULONG_MAX;
+  for( ulong w=0UL; w<FD_SNAPIN_WORKER_MAX; w++ ) ctx->ack_in_idx[ w ] = ULONG_MAX;
+  ctx->ack_in_idx[ 0 ] = lane_cnt;
+  ctx->ack_in_idx[ 1 ] = lane_cnt+1UL;
+  for( ulong w=0UL; w<2UL; w++ ) {
+    ctx->io_in[ w ].wksp   = (fd_wksp_t *)test_wack_mem[ w ];
+    ctx->io_in[ w ].chunk0 = 0UL;
+    ctx->io_in[ w ].wmark  = 0UL;
+    ctx->io_in[ w ].mtu    = FD_SNAPIN_IO_ACK_SLOT_SZ;
+    ctx->io_out[ w ].idx    = 10UL+w;
+    ctx->io_out[ w ].mem    = (fd_wksp_t *)test_ring_mem[ w ];
+    ctx->io_out[ w ].chunk0 = 0UL;
+    ctx->io_out[ w ].wmark  = 0UL;
+    ctx->io_out[ w ].chunk  = 0UL;
+    ctx->io_out[ w ].mtu    = FD_SNAPIN_IO_JOB_SLOT_SZ;
   }
+}
 
-  ctx->cur_frag.lane  = 1UL;
-  ctx->cur_frag.seq   = 9UL;
-  ctx->cur_frag.chunk = 2UL;
-  ctx->cur_frag.base  = frag_mem;
+static void
+coordinator_send_ack( fd_snapin_tile_t * ctx,
+                      ulong              worker,
+                      ulong              gen,
+                      ulong              control,
+                      ulong              loaded,
+                      ulong              eq_slot_dups,
+                      int                err ) {
+  fd_snapin_io_ack_t * ack = (fd_snapin_io_ack_t *)test_wack_mem[ worker ];
+  fd_memset( ack, 0, sizeof(*ack) );
+  ack->worker_idx      = worker;
+  ack->generation      = gen;
+  ack->control         = control;
+  ack->accounts_loaded = loaded;
+  ack->input_lamports  = 10UL*loaded;
+  ack->eq_slot_dups    = eq_slot_dups;
+  ack->err             = err;
+  ulong in_idx = ctx->ack_in_idx[ worker ];
+  FD_TEST( !before_frag( ctx, in_idx, 0UL, fd_snapin_io_ack_sig( gen, control ) ) );
+  FD_TEST( !returnable_frag( ctx, in_idx, 0UL, fd_snapin_io_ack_sig( gen, control ), 0UL,
+                             sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL, (fd_stem_context_t *)1UL ) );
+}
 
-  uchar pubkey[ 4 ][ 32 ] = { { 0U }, { 1U }, { 2U }, { 3U } };
-  uchar const * entries[ 4 ] = { frag_mem+0UL, frag_mem+200UL, frag_mem+400UL, frag_mem+600UL };
-  uchar const * pubkeys[ 4 ] = { pubkey[0], pubkey[1], pubkey[2], pubkey[3] };
-  ulong const data_lens[ 4 ] = { 100UL, 200UL, 300UL, 400UL };
+static void
+test_coordinator_ack_gating( void ) {
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 2UL, FD_SNAPSHOT_STATE_FINISHING );
   test_pub_cnt = 0UL;
-  FD_TEST( dispatch_account_batch( ctx, entries, 4UL, pubkeys, 440123518UL,
-                                   data_lens, (fd_stem_context_t *)1UL )==0 );
+
+  /* FINI barrier completes: local processing, forward to snapct is
+     deferred until both workers ack; lanes are held meanwhile. */
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( test_pub_cnt==0UL );
-  publish_all_pending_jobs( ctx, (fd_stem_context_t *)1UL );
+  FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )<0 );
+  FD_TEST( !before_frag( ctx, ctx->ack_in_idx[ 0 ], 0UL, 0UL ) );
+
+  /* Stale ack (wrong control) is dropped */
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_NEXT, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_ack_mask==0UL );
+
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_ack_mask==1UL );
+  FD_TEST( test_pub_cnt==0UL );
+
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 5UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==1UL );
+  FD_TEST( test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_FINI );
+  /* Counters folded from the FINI acks */
+  FD_TEST( ctx->metrics.accounts_loaded==12UL );
+  FD_TEST( ctx->capitalization==120UL );
+  FD_TEST( !before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA ) );
+}
+
+static void
+test_coordinator_worker_error_ack( void ) {
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 2UL, FD_SNAPSHOT_STATE_FINISHING );
+  test_pub_cnt = 0UL;
+
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
+
+  /* Worker 1 reports an error: the coordinator abandons the ack wait,
+     publishes ABORT on every worker ring and ERROR to snapct. */
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_ERROR, 0UL, 0UL, 5 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( test_pub_cnt==3UL );
+  FD_TEST( test_pub_out_idx[ 0 ]==10UL && test_pub_sig[ 0 ]==FD_SNAPIN_IO_KIND_ABORT );
+  FD_TEST( test_pub_out_idx[ 1 ]==11UL && test_pub_sig[ 1 ]==FD_SNAPIN_IO_KIND_ABORT );
+  FD_TEST( test_pub_sig[ 2 ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
+  FD_TEST( ((fd_snapin_io_job_t const *)test_ring_mem[ 0 ])->kind==FD_SNAPIN_IO_KIND_ABORT );
+  FD_TEST( ((fd_snapin_io_job_t const *)test_ring_mem[ 1 ])->kind==FD_SNAPIN_IO_KIND_ABORT );
+
+  /* Straggler FINI ack from worker 0 after the error: dropped */
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_ack_mask==0UL );
+  FD_TEST( test_pub_cnt==3UL );
+
+  /* FAIL: forwarded only after both workers acked it */
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( test_pub_cnt==3UL );
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FAIL, 0UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( test_pub_cnt==4UL );
+  FD_TEST( test_pub_sig[ 3 ]==FD_SNAPSHOT_MSG_CTRL_FAIL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+}
+
+/* Equal-slot cross-appendvec duplicates cannot be tiebroken with
+   worker-local offsets: any nonzero fold at FINI must flag the snapshot
+   malformed instead of forwarding FINI. */
+static void
+test_coordinator_eq_slot_malform( void ) {
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 2UL, FD_SNAPSHOT_STATE_FINISHING );
+  test_pub_cnt = 0UL;
+
+  send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  send_control( ctx, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
+
+  coordinator_send_ack( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 7UL, 1UL, 0 );
+  coordinator_send_ack( ctx, 1UL, 1UL, FD_SNAPSHOT_MSG_CTRL_FINI, 5UL, 0UL, 0 );
+  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+  FD_TEST( ctx->worker_fold.eq_slot_dups==1UL );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_ERROR );
+  /* ABORT to both rings + ERROR to snapct; FINI never forwarded */
+  FD_TEST( test_pub_cnt==3UL );
+  FD_TEST( test_pub_sig[ 0 ]==FD_SNAPIN_IO_KIND_ABORT );
+  FD_TEST( test_pub_sig[ 1 ]==FD_SNAPIN_IO_KIND_ABORT );
+  FD_TEST( test_pub_sig[ 2 ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
+}
+
+/* Coordinator passthrough: an appendvec tar header becomes an ASSIGN on
+   the least-loaded worker's ring carrying the inline coverage; a region
+   header broadcasts the watermark immediately; tar EOF broadcasts EOS. */
+static void
+test_coordinator_assign_flow( void ) {
+  static uchar lane_mem[ 4096UL ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+  fd_memset( lane_mem, 0, sizeof(lane_mem) );
+
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_PROCESSING );
+  fd_ssparse_init( ctx->ssparse );
+  ctx->in[ 0 ].wksp   = (fd_wksp_t *)lane_mem;
+  ctx->in[ 0 ].chunk0 = 0UL;
+  ctx->in[ 0 ].wmark  = 0UL;
+  ctx->in[ 0 ].mtu    = 4096UL;
+  ctx->worker_assigned_bytes[ 1 ] = 5000UL; /* worker 0 is least loaded */
+
+  test_parser_script   = 6;
+  test_parser_call_cnt = 0UL;
+  test_pub_cnt         = 0UL;
+
+  /* Frag 1: appendvec tar header (script consumes the whole frag). */
+  ulong ctl = fd_frag_meta_ctl( 0UL, 0, 0, 0 );
+  FD_TEST( !returnable_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA, 0UL, 512UL, ctl, 0UL, 0UL,
+                             (fd_stem_context_t *)1UL ) );
+  FD_TEST( test_pub_cnt==1UL );
+  FD_TEST( test_pub_out_idx[ 0 ]==10UL && test_pub_sig[ 0 ]==FD_SNAPIN_IO_KIND_ASSIGN );
+  fd_snapin_io_job_t const * assign = (fd_snapin_io_job_t const *)test_ring_mem[ 0 ];
+  FD_TEST( assign->kind==FD_SNAPIN_IO_KIND_ASSIGN );
+  FD_TEST( assign->generation==1UL );
+  FD_TEST( assign->appendvec_idx==0UL );
+  FD_TEST( assign->slot==42UL );
+  FD_TEST( assign->body_off==512UL );
+  FD_TEST( assign->body_sz==1000UL );
+  FD_TEST( assign->covered_until==512UL+1024UL ); /* align512(1000) */
+  FD_TEST( ctx->worker_assigned_bytes[ 0 ]==1000UL );
+  FD_TEST( ctx->appendvec_seq==1UL );
+  FD_TEST( ctx->covered_until==1536UL );
+  FD_TEST( ctx->io_watermark_dirty );
+  FD_TEST( ctx->av_stats.cnt==1UL && ctx->av_stats.max_sz==1000UL );
+
+  /* Frag 2: region tar header -> immediate watermark broadcast through
+     the region end (workers skip the manifest at line rate). */
+  FD_TEST( !returnable_frag( ctx, 0UL, 1UL, FD_SNAPSHOT_MSG_DATA, 0UL, 512UL, ctl, 0UL, 0UL,
+                             (fd_stem_context_t *)1UL ) );
+  FD_TEST( test_pub_cnt==3UL );
+  FD_TEST( test_pub_out_idx[ 1 ]==10UL && test_pub_sig[ 1 ]==FD_SNAPIN_IO_KIND_WATERMARK );
+  FD_TEST( test_pub_out_idx[ 2 ]==11UL && test_pub_sig[ 2 ]==FD_SNAPIN_IO_KIND_WATERMARK );
+  FD_TEST( ctx->covered_until==1024UL+1024UL ); /* region body at 1024, align512(600) */
+  FD_TEST( !ctx->io_watermark_dirty );
+  fd_snapin_io_job_t const * wm = (fd_snapin_io_job_t const *)test_ring_mem[ 1 ];
+  FD_TEST( wm->kind==FD_SNAPIN_IO_KIND_WATERMARK && wm->covered_until==2048UL );
+
+  /* Frag 3: tar EOF -> EOS broadcast, state FINISHING. */
+  FD_TEST( !returnable_frag( ctx, 0UL, 2UL, FD_SNAPSHOT_MSG_DATA, 0UL, 1UL, ctl, 0UL, 0UL,
+                             (fd_stem_context_t *)1UL ) );
+  FD_TEST( test_pub_cnt==5UL );
+  FD_TEST( test_pub_sig[ 3 ]==FD_SNAPIN_IO_KIND_EOS && test_pub_sig[ 4 ]==FD_SNAPIN_IO_KIND_EOS );
+  FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
+  FD_TEST( ctx->stream_cursor==1025UL );
+}
+
+/* Watermark broadcast cadence: the periodic returnable-frag tail path,
+   the idle after_credit path, and their gating on pending controls and
+   the ERROR state. */
+static void
+test_coordinator_watermark_protocol( void ) {
+  fd_snapin_tile_t ctx[1];
+  coordinator_io_ctx_init( ctx, 2UL, FD_SNAPSHOT_STATE_PROCESSING );
+  ctx->generation = 21UL;
+
+  ctx->covered_until      = 4096UL;
+  ctx->io_watermark_dirty = 1;
+  test_pub_cnt = 0UL;
+  publish_watermarks( ctx, (fd_stem_context_t *)1UL );
   FD_TEST( test_pub_cnt==2UL );
   FD_TEST( test_pub_out_idx[0]==10UL && test_pub_out_idx[1]==11UL );
-
-  fd_snapin_io_job_t const * even = (fd_snapin_io_job_t const *)job_mem[ 0 ];
-  fd_snapin_io_job_t const * odd  = (fd_snapin_io_job_t const *)job_mem[ 1 ];
-  FD_TEST( even->worker_idx==0UL && even->cnt==2UL );
-  FD_TEST( odd ->worker_idx==1UL && odd ->cnt==2UL );
-  FD_TEST( even->lane==1UL && even->seq==9UL && even->chunk==2UL );
-  FD_TEST( odd ->lane==1UL && odd ->seq==9UL && odd ->chunk==2UL );
-  FD_TEST( even->ent_off[0]==0U   && even->ent_off[1]==400U );
-  FD_TEST( odd ->ent_off[0]==200U && odd ->ent_off[1]==600U );
-  FD_TEST( even->data_len[0]==100U && even->data_len[1]==300U );
-  FD_TEST( odd ->data_len[0]==200U && odd ->data_len[1]==400U );
-  FD_TEST( fd_snapin_io_job_chain_idx( even, 0UL )==0UL && fd_snapin_io_job_chain_idx( even, 1UL )==2UL );
-  FD_TEST( fd_snapin_io_job_chain_idx( odd,  0UL )==1UL && fd_snapin_io_job_chain_idx( odd,  1UL )==3UL );
-
+  FD_TEST( !ctx->io_watermark_dirty && !ctx->io_frags_since_watermark );
   for( ulong i=0UL; i<2UL; i++ ) {
-    ctx->io_in[ i ].wksp   = (fd_wksp_t *)ack_mem[ i ];
-    ctx->io_in[ i ].chunk0 = 0UL;
-    ctx->io_in[ i ].wmark  = 0UL;
-    ctx->io_in[ i ].mtu    = FD_SNAPIN_IO_ACK_SLOT_SZ;
+    fd_snapin_io_job_t const * job = (fd_snapin_io_job_t const *)test_ring_mem[ i ];
+    FD_TEST( job->kind==FD_SNAPIN_IO_KIND_WATERMARK );
+    FD_TEST( job->generation==21UL );
+    FD_TEST( job->covered_until==4096UL );
   }
-  ctx->ct_out.idx               = 17UL;
-  ctx->pending_worker_control   = FD_SNAPSHOT_MSG_CTRL_FINI;
-  ctx->pending_worker_ack_mask  = 0UL;
-  ctx->capitalization           = 100UL;
-  ctx->dup_capitalization       = 5UL;
 
-  fd_snapin_io_ack_t * ack0 = (fd_snapin_io_ack_t *)ack_mem[ 0 ];
-  ack0->worker_idx         = 0UL;
-  ack0->generation         = 21UL;
-  ack0->control            = FD_SNAPSHOT_MSG_CTRL_FINI;
-  ack0->accounts_ignored   = 1UL;
-  ack0->accounts_loaded    = 1UL;
-  ack0->input_lamports     = 10UL;
-  ack0->ignored_lamports   = 2UL;
-
-  fd_snapin_io_ack_t * ack1 = (fd_snapin_io_ack_t *)ack_mem[ 1 ];
-  ack1->worker_idx          = 1UL;
-  ack1->generation          = 21UL;
-  ack1->control             = FD_SNAPSHOT_MSG_CTRL_FINI;
-  ack1->accounts_replaced   = 1UL;
-  ack1->accounts_loaded     = 1UL;
-  ack1->input_lamports      = 20UL;
-  ack1->replaced_lamports   = 3UL;
-  ack1->ignored_lamports    = 4UL;
-
-  ulong sig = fd_snapin_io_ack_sig( 21UL, FD_SNAPSHOT_MSG_CTRL_FINI );
+  /* after_credit only emits when the watermark advanced AND no ring
+     publish happened since the last check (idle deadlock fix). */
+  int poll_in = 1; int charge_busy = 0;
+  ctx->covered_until        = 8192UL;
+  ctx->io_watermark_dirty   = 1;
+  ctx->io_jobs_since_credit = 1UL; /* publishes flowed: workers see coverage soon enough */
   test_pub_cnt = 0UL;
-  coordinator_handle_ack( ctx, (fd_stem_context_t *)1UL, 0UL, sig, 0UL, sizeof(*ack0) );
-  FD_TEST( test_pub_cnt==0UL );
-  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( ctx->pending_worker_ack_mask==1UL );
-  coordinator_handle_ack( ctx, (fd_stem_context_t *)1UL, 1UL, sig, 0UL, sizeof(*ack1) );
-  FD_TEST( test_pub_cnt==1UL && test_pub_out_idx[0]==17UL && test_pub_sig[0]==FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
-  FD_TEST( ctx->pending_worker_ack_mask==0UL );
-  FD_TEST( ctx->metrics.accounts_ignored==1UL );
-  FD_TEST( ctx->metrics.accounts_replaced==1UL );
-  FD_TEST( ctx->metrics.accounts_loaded==2UL );
-  FD_TEST( ctx->capitalization==124UL );
-  FD_TEST( ctx->dup_capitalization==8UL );
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( !test_pub_cnt && !charge_busy );
+  FD_TEST( !ctx->io_jobs_since_credit );
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( test_pub_cnt==2UL && charge_busy );
+  FD_TEST( ((fd_snapin_io_job_t const *)test_ring_mem[ 0 ])->covered_until==8192UL );
 
-  /* A failed full attempt must not reset shared accdb state until all
-     workers have drained preceding jobs and acknowledged FAIL. */
-  ctx->pending_worker_control  = FD_SNAPSHOT_MSG_CTRL_FAIL;
-  ctx->pending_worker_ack_mask = 0UL;
-  ctx->init_completed          = 1;
-  ctx->full                    = 1;
-  ack0->control                = FD_SNAPSHOT_MSG_CTRL_FAIL;
-  ack1->control                = FD_SNAPSHOT_MSG_CTRL_FAIL;
-  test_accdb_reset_cnt         = 0UL;
-  test_pub_cnt                 = 0UL;
-  sig = fd_snapin_io_ack_sig( 21UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
-  coordinator_handle_ack( ctx, (fd_stem_context_t *)1UL, 0UL, sig, 0UL, sizeof(*ack0) );
-  FD_TEST( test_accdb_reset_cnt==0UL && ctx->init_completed );
-  coordinator_handle_ack( ctx, (fd_stem_context_t *)1UL, 1UL, sig, 0UL, sizeof(*ack1) );
-  FD_TEST( test_accdb_reset_cnt==1UL && !ctx->init_completed );
-  FD_TEST( test_pub_cnt==1UL && test_pub_out_idx[0]==17UL && test_pub_sig[0]==FD_SNAPSHOT_MSG_CTRL_FAIL );
+  /* While a control awaits worker acks, after_credit must not emit. */
+  ctx->io_watermark_dirty     = 1;
+  ctx->io_jobs_since_credit   = 0UL;
+  ctx->pending_worker_control = FD_SNAPSHOT_MSG_CTRL_FINI;
+  test_pub_cnt = 0UL;
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( !test_pub_cnt );
+
+  /* Nor in the ERROR state (workers drain regardless after ABORT). */
+  ctx->pending_worker_control = ULONG_MAX;
+  ctx->state                  = FD_SNAPSHOT_STATE_ERROR;
+  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
+  FD_TEST( !test_pub_cnt );
 }
 
 /* The scratch footprint is computed from a zero base, so it only bounds
@@ -1645,9 +1894,10 @@ test_snapin_scratch_layout_fits( void ) {
   tile.kind_id = 1UL;
   {
     FD_SCRATCH_ALLOC_INIT( l, (void *)base );
-    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t)                          );
-    FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile.snapin.max_live_slots )  );
-    FD_SCRATCH_ALLOC_APPEND( l, 4096UL,                    FD_SNAPIN_WRITE_BUF_SZ                            );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                          );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),              fd_accdb_footprint( tile.snapin.max_live_slots )  );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_extent_t),   FD_SNAPIN_FIFO_CNT*sizeof(fd_snapin_extent_t)     );
+    FD_SCRATCH_ALLOC_APPEND( l, 4096UL,                        FD_SNAPIN_WRITE_BUF_SZ                            );
     ulong end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
     FD_TEST( end-base<=scratch_footprint( &tile ) );
   }
@@ -1669,26 +1919,24 @@ test_snapin_scratch_layout_fits( void ) {
 }
 
 /* Worker before_frag dispatch across every in_idx/sig class, in the
-   2-worker topology shape for the SECOND worker (kind 2 = worker_idx 1,
-   snapin_io ring at in_idx 0, all eight snapdc lanes at in_idx 1..8):
-   the job ring is always processed, lane frags are consumed once
-   released and deferred otherwise, and the sig (data or any control) is
-   irrelevant on lanes — workers never take the coordinator's
-   expected-frame / control-barrier paths. */
+   2-worker topology shape (snapin_io ring at in_idx 0, snapdc lanes at
+   in_idx 1..8): the job ring is always processed; lanes follow the same
+   expected-frame rotation and control-barrier discipline as the
+   coordinator; in the ERROR state everything but FAIL is dropped
+   (drained) so the retry can flow. */
 static void
 test_snapin_worker_before_frag_dispatch( void ) {
   fd_snapin_tile_t ctx[ 1 ];
   fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->role       = FD_SNAPIN_ROLE_ACCDB_WORKER;
-  ctx->worker_idx = 1UL;
-  ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
-  ctx->lane_cnt   = 8UL;
-  ctx->job_in_idx = 0UL;
-  ctx->in_lane[ 0 ] = ULONG_MAX;
-  for( ulong lane=0UL; lane<8UL; lane++ ) {
-    ctx->in_lane[ 1UL+lane ] = lane;
-    ctx->release[ lane ]     = 2UL*lane; /* distinct per-lane watermarks */
-  }
+  ctx->role            = FD_SNAPIN_ROLE_ACCDB_WORKER;
+  ctx->worker_idx      = 1UL;
+  ctx->state           = FD_SNAPSHOT_STATE_PROCESSING;
+  ctx->lane_cnt        = 8UL;
+  ctx->job_in_idx      = 0UL;
+  ctx->pending_control = ULONG_MAX;
+  ctx->in_lane[ 0 ]    = ULONG_MAX;
+  for( ulong lane=0UL; lane<8UL; lane++ ) ctx->in_lane[ 1UL+lane ] = lane;
+  ctx->expected_frame  = 3UL;
 
   static const ulong sigs[ 6 ] = {
     FD_SNAPSHOT_MSG_DATA,           FD_SNAPSHOT_MSG_CTRL_INIT_FULL, FD_SNAPSHOT_MSG_CTRL_FINI,
@@ -1698,94 +1946,30 @@ test_snapin_worker_before_frag_dispatch( void ) {
     /* Job ring: always processed, whatever the sig or seq. */
     FD_TEST( before_frag( ctx, 0UL, 0UL,       sigs[ s ] )==0 );
     FD_TEST( before_frag( ctx, 0UL, ULONG_MAX, sigs[ s ] )==0 );
-    for( ulong lane=0UL; lane<8UL; lane++ ) {
-      ulong in_idx  = 1UL+lane;
-      ulong release = ctx->release[ lane ];
-      FD_TEST( before_frag( ctx, in_idx, release,     sigs[ s ] )== 1 ); /* released: consume/skip */
-      FD_TEST( before_frag( ctx, in_idx, release+1UL, sigs[ s ] )==-1 ); /* held: defer, keep fseq */
-    }
-  }
-  /* Boot state: nothing released yet (release==ULONG_MAX==seq -1). */
-  ctx->release[ 3 ] = ULONG_MAX;
-  FD_TEST( before_frag( ctx, 4UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
-}
-
-/* Coordinator side of the frontier protocol: watermarks only advance at
-   frag boundaries, FRONTIER jobs go to every worker ring on the
-   consumed-frag interval and from the idle after_credit path, and every
-   CTRL job carries the frontier. */
-static void
-test_snapin_frontier_protocol( void ) {
-  static uchar job_mem[ 2 ][ FD_SNAPIN_IO_JOB_SLOT_SZ ] __attribute__((aligned(FD_CHUNK_ALIGN)));
-  fd_memset( job_mem, 0, sizeof(job_mem) );
-
-  fd_snapin_tile_t ctx[ 1 ];
-  fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->role       = FD_SNAPIN_ROLE_COORDINATOR;
-  ctx->io_enabled = 1;
-  ctx->worker_cnt = 2UL;
-  ctx->generation = 21UL;
-  ctx->lane_cnt   = 2UL;
-  ctx->pending_worker_control = ULONG_MAX;
-  for( ulong i=0UL; i<FD_SNAPIN_IO_LANE_MAX; i++ ) ctx->lane_consumed_seq[ i ] = ULONG_MAX;
-  for( ulong i=0UL; i<2UL; i++ ) {
-    ctx->io_out[ i ].idx    = 10UL+i;
-    ctx->io_out[ i ].mem    = (fd_wksp_t *)job_mem[ i ];
-    ctx->io_out[ i ].chunk0 = 0UL;
-    ctx->io_out[ i ].wmark  = 0UL;
-    ctx->io_out[ i ].chunk  = 0UL;
-    ctx->io_out[ i ].mtu    = FD_SNAPIN_IO_JOB_SLOT_SZ;
   }
 
-  coordinator_mark_lane_consumed( ctx, 0UL, 41UL );
-  coordinator_mark_lane_consumed( ctx, 1UL, 7UL );
-  FD_TEST( ctx->io_frontier_dirty && ctx->io_frags_since_frontier==2UL );
+  /* Data frags only from the expected lane */
+  FD_TEST( before_frag( ctx, 1UL+3UL, 0UL, FD_SNAPSHOT_MSG_DATA )== 0 );
+  FD_TEST( before_frag( ctx, 1UL+4UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
 
-  test_pub_cnt = 0UL;
-  publish_frontier_jobs( ctx, (fd_stem_context_t *)1UL );
-  FD_TEST( test_pub_cnt==2UL );
-  FD_TEST( test_pub_out_idx[0]==10UL && test_pub_out_idx[1]==11UL );
-  FD_TEST( !ctx->io_frontier_dirty && !ctx->io_frags_since_frontier );
-  for( ulong i=0UL; i<2UL; i++ ) {
-    fd_snapin_io_job_t const * job = (fd_snapin_io_job_t const *)job_mem[ i ];
-    FD_TEST( job->kind==FD_SNAPIN_IO_KIND_FRONTIER );
-    FD_TEST( job->worker_idx==i );
-    FD_TEST( job->generation==21UL );
-    FD_TEST( job->frontier[ 0 ]==41UL && job->frontier[ 1 ]==7UL );
-    for( ulong l=2UL; l<FD_SNAPIN_IO_LANE_MAX; l++ ) FD_TEST( job->frontier[ l ]==ULONG_MAX );
-  }
+  /* Controls pass when no barrier is pending */
+  FD_TEST( before_frag( ctx, 1UL+5UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI )==0 );
 
-  /* after_credit only emits when the frontier advanced AND no account
-     job was published since the last check (idle deadlock fix). */
-  int poll_in = 1; int charge_busy = 0;
-  coordinator_mark_lane_consumed( ctx, 1UL, 8UL );
-  ctx->io_jobs_since_credit = 1UL; /* jobs flowed: workers will see a ring frontier soon enough */
-  test_pub_cnt = 0UL;
-  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
-  FD_TEST( !test_pub_cnt && !charge_busy );
-  FD_TEST( !ctx->io_jobs_since_credit );
-  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
-  FD_TEST( test_pub_cnt==2UL && charge_busy );
-  fd_snapin_io_job_t const * job0 = (fd_snapin_io_job_t const *)job_mem[ 0 ];
-  FD_TEST( job0->kind==FD_SNAPIN_IO_KIND_FRONTIER && job0->frontier[ 1 ]==8UL );
+  /* Once a lane contributed to a pending barrier, its later frags hold */
+  ctx->pending_control   = FD_SNAPSHOT_MSG_CTRL_FINI;
+  ctx->control_seen[ 2 ] = 1U;
+  FD_TEST( before_frag( ctx, 1UL+2UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
+  FD_TEST( before_frag( ctx, 1UL+3UL, 0UL, FD_SNAPSHOT_MSG_DATA )== 0 );
+  ctx->pending_control   = ULONG_MAX;
+  ctx->control_seen[ 2 ] = 0U;
 
-  /* Every CTRL job carries the frontier too. */
-  coordinator_mark_lane_consumed( ctx, 0UL, 42UL );
-  test_pub_cnt = 0UL;
-  publish_worker_control( ctx, (fd_stem_context_t *)1UL, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( test_pub_cnt==2UL );
-  FD_TEST( ctx->pending_worker_control==FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( !ctx->io_frontier_dirty && !ctx->io_frags_since_frontier );
-  fd_snapin_io_job_t const * ctrl = (fd_snapin_io_job_t const *)job_mem[ 1 ];
-  FD_TEST( ctrl->kind==FD_SNAPIN_IO_KIND_CTRL );
-  FD_TEST( ctrl->control==FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( ctrl->frontier[ 0 ]==42UL && ctrl->frontier[ 1 ]==8UL );
-
-  /* While a control awaits worker acks, after_credit must not emit. */
-  coordinator_mark_lane_consumed( ctx, 0UL, 43UL );
-  test_pub_cnt = 0UL;
-  after_credit( ctx, (fd_stem_context_t *)1UL, &poll_in, &charge_busy );
-  FD_TEST( !test_pub_cnt );
+  /* ERROR state: drop (drain) everything except FAIL; job ring still
+     polled so ABORT/stale jobs keep draining. */
+  ctx->state = FD_SNAPSHOT_STATE_ERROR;
+  FD_TEST( before_frag( ctx, 1UL+3UL, 0UL, FD_SNAPSHOT_MSG_DATA      )==1 );
+  FD_TEST( before_frag( ctx, 1UL+3UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FINI )==1 );
+  FD_TEST( before_frag( ctx, 1UL+3UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL )==0 );
+  FD_TEST( before_frag( ctx, 0UL,     0UL, FD_SNAPIN_IO_KIND_ABORT   )==0 );
 }
 
 int
@@ -1823,11 +2007,19 @@ main( int     argc,
   test_txncache_staging_validates_stale_group_offsets();
   test_snapin_scratch_layout_fits();
   test_snapin_worker_before_frag_dispatch();
-  test_snapin_worker_protocol();
-  test_snapin_worker_ref_guard();
-  test_snapin_coordinator_worker_handoff();
-  test_snapin_multiworker_routing_and_barrier();
-  test_snapin_frontier_protocol();
+  test_worker_coverage_hold();
+  test_worker_owned_appendvec();
+  test_worker_batch_staging();
+  test_worker_stale_generation();
+  test_worker_fini_deferred_ack();
+  test_worker_fail_cancels_pending_fini();
+  test_worker_abort_ring_bypass();
+  test_worker_error_mid_init_barrier();
+  test_coordinator_ack_gating();
+  test_coordinator_worker_error_ack();
+  test_coordinator_eq_slot_malform();
+  test_coordinator_assign_flow();
+  test_coordinator_watermark_protocol();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
   return 0;

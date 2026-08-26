@@ -157,7 +157,7 @@ struct fd_snapin_tile {
   ulong pending_worker_ack_mask;
   ulong expected_frame;
   ulong pending_control;    /* control message expected from snapdc tiles */
-  uchar control_seen[ FD_SNAPIN_IO_LANE_MAX ]; /* lane indexed */
+  uchar control_seen[ FD_TOPO_MAX_TILE_IN_LINKS ]; /* lane indexed */
 
   ulong seed;
   long boot_timestamp;
