@@ -3122,39 +3122,12 @@ ack_worker_idx( fd_snapin_tile_t const * ctx,
   return ULONG_MAX;
 }
 
+/* Lane admission, identical for both roles. */
+
 static inline int
-before_frag( fd_snapin_tile_t * ctx,
-             ulong              in_idx,
-             ulong              seq    FD_PARAM_UNUSED,
-             ulong              sig ) {
-  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
-    /* Ring jobs are always processed (worker_handle_job may hold them).
-       Lane frags share the coordinator's barrier/rotation discipline;
-       coverage holds happen in returnable_frag so the scan position is
-       preserved. */
-    if( FD_LIKELY( in_idx==ctx->job_in_idx ) ) return 0;
-    ulong lane = ctx->in_lane[ in_idx ];
-    if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
-      return sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
-    }
-    if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) return 0;
-    if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ lane ] ) ) {
-      FD_TEST( sig!=ctx->pending_control );
-      return -1;
-    }
-    if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA && lane!=ctx->expected_frame%ctx->lane_cnt ) ) {
-      return -1;
-    }
-    return 0;
-  }
-
-  if( FD_UNLIKELY( ctx->io_enabled && ack_worker_idx( ctx, in_idx )!=ULONG_MAX ) ) return 0;
-
-  /* Do not let the next stream phase start until every worker has
-     acknowledged the in-flight control (acks arrive on the ack links,
-     which stay polled). */
-  if( FD_UNLIKELY( ctx->io_enabled && ctx->pending_worker_control!=ULONG_MAX ) ) return -1;
-
+lane_before_frag( fd_snapin_tile_t const * ctx,
+                  ulong                    lane,
+                  ulong                    sig ) {
   /* If we're currently in ERROR state we should only process FAIL
      control frags.  Workers were flipped to ERROR-drain by the ABORT
      ring job, so dropping lane frags here cannot wedge them. */
@@ -3168,17 +3141,43 @@ before_frag( fd_snapin_tile_t * ctx,
 
   /* Once this lane sends the pending control, hold its later frags
      until all snapdc lanes send the same control. */
-  if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ in_idx ] ) ) {
+  if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ lane ] ) ) {
     FD_TEST( sig!=ctx->pending_control );
     return -1;
   }
 
   /* Only accept DATA frags from the expected lane */
-  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA && in_idx!=ctx->expected_frame%ctx->lane_cnt ) ) {
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA && lane!=ctx->expected_frame%ctx->lane_cnt ) ) {
     return -1;
   }
 
   return 0;
+}
+
+static inline int
+before_frag( fd_snapin_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq    FD_PARAM_UNUSED,
+             ulong              sig ) {
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    /* Ring jobs are always processed (worker_handle_job may hold them).
+       Lane frags share the coordinator's barrier/rotation discipline;
+       coverage holds happen in returnable_frag so the scan position is
+       preserved. */
+    if( FD_LIKELY( in_idx==ctx->job_in_idx ) ) return 0;
+    return lane_before_frag( ctx, ctx->in_lane[ in_idx ], sig );
+  }
+
+  if( FD_UNLIKELY( ctx->io_enabled && ack_worker_idx( ctx, in_idx )!=ULONG_MAX ) ) return 0;
+
+  /* Do not let the next stream phase start until every worker has
+     acknowledged the in-flight control (acks arrive on the ack links,
+     which stay polled). */
+  if( FD_UNLIKELY( ctx->io_enabled && ctx->pending_worker_control!=ULONG_MAX ) ) return -1;
+
+  /* The coordinator's lanes are its first in links, so in_idx is the
+     lane index. */
+  return lane_before_frag( ctx, in_idx, sig );
 }
 
 static inline int

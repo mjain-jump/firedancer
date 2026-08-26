@@ -1654,6 +1654,31 @@ par_offset_cmp( void const * a, void const * b ) {
   return ua<ub ? -1 : (ua>ub ? 1 : 0);
 }
 
+/* Replay the shmem layout to reach the fork/acc/txn element arrays (the
+   private joiner struct is local to fd_accdb.c).  Keep in sync with
+   fd_accdb_shmem_new. */
+typedef struct {
+  fd_accdb_fork_shmem_t * fork_ele;
+  fd_accdb_accmeta_t *    acc_ele;
+  fd_accdb_txn_t *        txn_ele;
+} par_layout_t;
+
+static par_layout_t
+par_layout( ulong max_accounts ) {
+  ulong max_live_slots = test_shmem_mem->max_live_slots;
+  ulong chain_cnt      = test_shmem_mem->chain_cnt;
+  ulong txn_max        = max_live_slots*test_shmem_mem->max_account_writes_per_slot;
+  par_layout_t out;
+  FD_SCRATCH_ALLOC_INIT( l, test_shmem_mem );
+                 FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
+  out.fork_ele = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
+                 FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
+                 FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
+  out.acc_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
+  out.txn_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),        txn_max*sizeof(fd_accdb_txn_t)                          );
+  return out;
+}
+
 static void
 test_snapshot_striped_writers( void ) {
   int fd;
@@ -1820,6 +1845,15 @@ test_snapshot_striped_writers( void ) {
      winners staged at their explicit offsets. */
   fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS );
 
+  /* writer_end returned every unused block tail, so exactly the live
+     entries are still checked out of the shared pool.  Drains the pool,
+     so this must be the last thing the test does with it. */
+  acc_pool_t pool_join[ 1 ];
+  FD_TEST( acc_pool_join( pool_join, test_shmem_mem->acc_pool, par_layout( max_accounts ).acc_ele, max_accounts ) );
+  ulong free_cnt = 0UL;
+  while( acc_pool_acquire( pool_join ) ) free_cnt++;
+  FD_TEST( free_cnt==max_accounts-PAR_KEYS );
+
   for( ulong t=0UL; t<PAR_THREADS; t++ ) free( joins[ t ] );
   test_teardown( accdb, fd );
 }
@@ -1831,31 +1865,6 @@ test_snapshot_striped_writers( void ) {
 #define PAR_INCR_KEYS     (PAR_KEYS+16UL) /* 16 brand-new keys in the incr phase */
 #define PAR_INCR_LAMPORTS( t, k ) ( 2000000UL + (t)*1000UL + (k) )
 #define PAR_INCR_DLEN( t, k )     ( ((t)*3UL+(k))%64UL )
-
-/* Replay the shmem layout to reach the fork/acc/txn element arrays (the
-   private joiner struct is local to fd_accdb.c).  Keep in sync with
-   fd_accdb_shmem_new. */
-typedef struct {
-  fd_accdb_fork_shmem_t * fork_ele;
-  fd_accdb_accmeta_t *    acc_ele;
-  fd_accdb_txn_t *        txn_ele;
-} par_layout_t;
-
-static par_layout_t
-par_layout( ulong max_accounts ) {
-  ulong max_live_slots = test_shmem_mem->max_live_slots;
-  ulong chain_cnt      = test_shmem_mem->chain_cnt;
-  ulong txn_max        = max_live_slots*test_shmem_mem->max_account_writes_per_slot;
-  par_layout_t out;
-  FD_SCRATCH_ALLOC_INIT( l, test_shmem_mem );
-                 FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
-  out.fork_ele = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
-                 FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
-                 FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
-  out.acc_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
-  out.txn_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),        txn_max*sizeof(fd_accdb_txn_t)                          );
-  return out;
-}
 
 /* Incremental writer schedule against ctx->fork, all four threads
    racing on the SAME keys through the stripe locks:
