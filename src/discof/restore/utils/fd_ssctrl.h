@@ -97,7 +97,7 @@
    exceed the control structs. */
 #define FD_SNAPSHOT_DATA_DEPTH                 (256UL)
 #define FD_SNAPSHOT_DATA_MTU                   (65408UL)
-#define FD_SNAPIN_TILE_MAX                     (5UL) /* coordinator + up to four accdb workers */
+#define FD_SNAPIN_TILE_MAX                     (9UL) /* coordinator + up to eight accdb workers */
 
 #define FD_SNAPSHOT_STATE_IDLE                 (0UL) /* Performing no work and should receive no data frags */
 #define FD_SNAPSHOT_STATE_PROCESSING           (1UL) /* Performing usual work, no errors / EoF condition encountered */
