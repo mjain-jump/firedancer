@@ -45,10 +45,11 @@
 
 #define FD_SNAPIN_WRITE_BUF_SZ (2UL<<20)
 
-/* Pending owned appendvecs not yet reached by the worker's scan.  Must
-   cover the coordinator's maximum assignment lookahead, which is bounded
-   by the in-flight lane window (a 512 MiB window of minimum-size tar
-   entries is far below 32K entries). */
+/* Pending owned appendvecs not yet reached by the worker's scan.  A full
+   FIFO cannot overflow or deadlock -- the worker holds the ASSIGN on its
+   ring instead, and keeps scanning lane bytes (which is what drains the
+   FIFO) meanwhile -- so this only has to be large enough that the
+   coordinator's header walk is not throttled by it. */
 
 #define FD_SNAPIN_FIFO_CNT (1UL<<15)
 
