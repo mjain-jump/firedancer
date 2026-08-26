@@ -3392,7 +3392,12 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->stake_log_max = snoop_hdr->stake_log_max;
 
     ctx->wb_kick_sz = FD_SNAPIN_WB_KICK_SZ;
-    ctx->wb_window  = FD_SNAPIN_WB_TOTAL_WINDOW/snoop_hdr->worker_cnt;
+    /* Write-behind only pays for itself when aggregate pwrite intake can
+       outrun the array's multi-stream writeback and trip the kernel's
+       dirty-page throttler (measured: collapses at 8 workers, while 4
+       workers ride the page cache ~12 s faster without it).  Engage it
+       only at high worker counts. */
+    ctx->wb_window  = snoop_hdr->worker_cnt>=8UL ? FD_SNAPIN_WB_TOTAL_WINDOW/snoop_hdr->worker_cnt : 0UL;
 
     /* One snapin_io job ring, plus every snapdc_in lane (full reliable
        consumer, coverage-gated scan). */
