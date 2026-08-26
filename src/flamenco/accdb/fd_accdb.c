@@ -4685,6 +4685,247 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
   return 0;
 }
 
+void
+fd_accdb_snapshot_bytes_freed( fd_accdb_t * accdb,
+                               ulong        offset,
+                               ulong        sz ) {
+  if( FD_UNLIKELY( !sz ) ) return;
+  fd_accdb_shmem_bytes_freed( accdb->shmem, offset, sz );
+}
+
+/* Striped chain locks for parallel snapshot insertion.  A stripe must
+   be held around the entire chain walk + commit for a pubkey so that
+   concurrent writers to the same chain (same-pubkey duplicates split
+   across appendvecs, or unrelated pubkeys colliding on a chain) cannot
+   observe torn in-place replacements or double-insert a pubkey. */
+
+static inline void
+stripe_lock_acquire( uint * lock ) {
+# if FD_HAS_THREADS
+  for(;;) {
+    if( FD_LIKELY( !FD_ATOMIC_CAS( lock, 0U, 1U ) ) ) break;
+    FD_SPIN_PAUSE();
+  }
+# else
+  *lock = 1U;
+# endif
+  FD_COMPILER_MFENCE();
+}
+
+static inline void
+stripe_lock_release( uint * lock ) {
+  FD_COMPILER_MFENCE();
+  FD_VOLATILE( *lock ) = 0U;
+}
+
+/* snapshot_worker_ensure_capacity guarantees the next
+   fd_accdb_snapshot_worker_alloc of sz bytes takes the lock-free fast
+   path (private whead bump): partition rotation (which takes the shared
+   partition lock and may fallocate) is performed here, so the caller
+   can hoist it outside a stripe lock. */
+
+static void
+snapshot_worker_ensure_capacity( fd_accdb_t *                accdb,
+                                 ulong                       sz,
+                                 fd_accdb_snapshot_whead_t * whead ) {
+  FD_TEST( sz<=accdb->shmem->partition_sz );
+  accdb_offset_t offset = { .val = whead->val };
+  if( FD_UNLIKELY( !whead->has_partition ||
+                   packed_partition_offset( &offset )+sz>accdb->shmem->partition_sz ) ) {
+    accdb_offset_t next;
+    spin_lock_acquire( &accdb->shmem->partition_lock );
+    change_partition( accdb, &offset, &next, &whead->has_partition, 0 );
+    spin_lock_release( &accdb->shmem->partition_lock );
+    whead->val = next.val;
+  }
+}
+
+int
+fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                          ulong                             cnt,
+                                          uchar const * const               pubkeys[],
+                                          ulong                             slot,
+                                          ulong const                       lamports[],
+                                          ulong const                       data_lens[],
+                                          int const                         executables[],
+                                          fd_accdb_snapshot_whead_t *       whead,
+                                          uint *                            stripe_locks,
+                                          ulong                             stripe_msk,
+                                          fd_accdb_snapshot_par_metrics_t * par_metrics,
+                                          ulong                             file_offsets[],
+                                          ulong *                           accounts_ignored,
+                                          ulong *                           accounts_replaced,
+                                          ulong *                           accounts_loaded,
+                                          ulong *                           out_replaced_lamports,
+                                          ulong *                           out_ignored_lamports ) {
+  FD_TEST( cnt && cnt<=8UL );
+
+  /* Snapshot slots are stored in the 32-bit cache_idx scratch field
+     during loading. */
+  if( FD_UNLIKELY( slot>UINT_MAX ) ) FD_LOG_ERR(( "snapshot slot %lu exceeds 2^32-1, accdb format must be widened", slot ));
+  if( FD_UNLIKELY( accdb->shmem->root_fork_id.val==USHORT_MAX ) ) {
+    FD_LOG_ERR(( "snapshot_write_batch_par_worker called without a root fork attached" ));
+  }
+  uint  gen       = accdb->fork_pool[ accdb->shmem->root_fork_id.val ].shmem->generation;
+  ulong seed      = accdb->shmem->seed;
+  ulong chain_msk = accdb->shmem->chain_cnt - 1UL;
+
+  ulong ignored           = 0UL;
+  ulong replaced          = 0UL;
+  ulong loaded            = 0UL;
+  ulong replaced_lamports = 0UL;
+  ulong ignored_lamports  = 0UL;
+
+  /* Phase 1: compute hashes and prefetch chain heads (safe unlocked:
+     just cache warming). */
+
+  ulong hashes[ 8 ];
+  for( ulong i=0UL; i<cnt; i++ ) {
+    hashes[ i ] = fd_hash32( pubkeys[ i ], seed ) & chain_msk;
+    __builtin_prefetch( &accdb->acc_map[ hashes[ i ] ], 1, 1 );
+  }
+
+  /* Phase 1b: reject intra-batch duplicate pubkeys (single appendvec,
+     same slot: corrupt snapshot per the Agave spec). */
+
+  for( ulong i=1UL; i<cnt; i++ ) {
+    for( ulong j=0UL; j<i; j++ ) {
+      if( hashes[ j ]!=hashes[ i ] ) continue;
+      if( FD_UNLIKELY( !memcmp( pubkeys[ j ], pubkeys[ i ], 32UL ) ) ) {
+        FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single batch (entries %lu and %lu, slot %lu)", j, i, slot ));
+        return -1;
+      }
+    }
+  }
+
+  /* Phase 2: per account, decide-then-allocate with the walk + commit
+     under the chain's stripe lock.  Only one lock is ever held at a
+     time, so no deadlock.  Partition rotation is hoisted before the
+     lock; the allocation under the lock is then a private whead bump. */
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    ulong  entry_sz = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+    uint * stripe   = &stripe_locks[ hashes[ i ] & stripe_msk ];
+
+    snapshot_worker_ensure_capacity( accdb, entry_sz, whead );
+
+    /* skip==1: existing version wins (or an untiebreakable equal-slot
+       dup), incoming ignored without allocating.  freed_off/sz: dead
+       disk range of a replaced record, released after unlocking. */
+    int   skip      = 0;
+    ulong freed_off = 0UL;
+    ulong freed_sz  = 0UL;
+
+    stripe_lock_acquire( stripe );
+
+    fd_accdb_accmeta_t * existing = NULL;
+    uint next_acc = FD_VOLATILE_CONST( accdb->acc_map[ hashes[ i ] ] );
+    while( next_acc!=UINT_MAX ) {
+      fd_accdb_accmeta_t * candidate = &accdb->acc_pool[ next_acc ];
+      if( FD_LIKELY( candidate->map.next!=UINT_MAX ) ) {
+        __builtin_prefetch( &accdb->acc_pool[ candidate->map.next ], 0, 1 );
+      }
+      if( FD_UNLIKELY( !memcmp( pubkeys[ i ], candidate->key.pubkey, 32UL ) ) ) {
+        ulong existing_slot = (ulong)candidate->cache_idx;
+        if( FD_LIKELY( existing_slot>slot ) ) {
+          skip = 1;
+        } else if( FD_UNLIKELY( existing_slot==slot ) ) {
+          /* Equal-slot cross-appendvec duplicate.  Worker-local disk
+             offsets are not stream ordered, so the sequential loader's
+             last-in-stream-wins tiebreak cannot be reproduced here.
+             Count it and treat as ignored; the coordinator fails the
+             load if any were seen. */
+          par_metrics->eq_slot_dups++;
+          if( FD_UNLIKELY( candidate->lamports!=lamports[ i ] ) ) par_metrics->eq_slot_lamports_diff++;
+          skip = 1;
+        } else {
+          existing = candidate;
+        }
+        break;
+      }
+      next_acc = candidate->map.next;
+    }
+
+    if( FD_UNLIKELY( skip ) ) {
+      stripe_lock_release( stripe );
+      file_offsets[ i ]  = ULONG_MAX; /* ignored dup burns no space */
+      ignored_lamports  += lamports[ i ];
+      ignored++;
+      continue;
+    }
+
+    if( FD_UNLIKELY( existing!=NULL ) ) {
+      /* In-place replace, still under the stripe lock so concurrent
+         same-chain walkers never observe a torn
+         (slot, lamports, size, offset) tuple. */
+      ulong old_sz  = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( existing->executable_size );
+      freed_off     = fd_accdb_acc_offset( existing );
+      freed_sz      = old_sz;
+      replaced_lamports += existing->lamports;
+      replaced++;
+
+      ulong file_off = fd_accdb_snapshot_worker_alloc( accdb, entry_sz, whead );
+      existing->cache_idx       = (uint)slot;
+      existing->lamports        = lamports[ i ];
+      existing->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
+      existing->offset_fork     = file_off;
+
+      stripe_lock_release( stripe );
+
+      fd_accdb_shmem_bytes_freed( accdb->shmem, freed_off, freed_sz );
+      par_metrics->disk_used_removed += old_sz;
+      par_metrics->disk_used_added   += entry_sz;
+      file_offsets[ i ] = file_off;
+      continue;
+    }
+
+    /* New insert.  Pool acquire is lock free and safe under the stripe
+       lock (it never takes a stripe lock itself). */
+    fd_accdb_accmeta_t * accmeta;
+    if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
+    else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
+    if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
+    uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
+
+    ulong file_off = fd_accdb_snapshot_worker_alloc( accdb, entry_sz, whead );
+    fd_memcpy( accmeta->key.pubkey, pubkeys[ i ], 32UL );
+    accmeta->key.generation   = gen;
+    accmeta->cache_idx        = (uint)slot;
+    accmeta->lamports         = lamports[ i ];
+    accmeta->executable_size  = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
+    accmeta->offset_fork      = file_off;
+    accmeta->map.next         = accdb->acc_map[ hashes[ i ] ];
+    FD_COMPILER_MFENCE();
+    accdb->acc_map[ hashes[ i ] ] = acc_idx;
+
+    stripe_lock_release( stripe );
+
+    par_metrics->disk_used_added += entry_sz;
+    par_metrics->accounts_total_added++;
+    file_offsets[ i ] = file_off;
+    loaded++;
+  }
+
+  *accounts_ignored      = ignored;
+  *accounts_replaced     = replaced;
+  *accounts_loaded       = loaded;
+  *out_replaced_lamports = replaced_lamports;
+  *out_ignored_lamports  = ignored_lamports;
+
+  return 0;
+}
+
+void
+fd_accdb_snapshot_flush_par_metrics( fd_accdb_t *                      accdb,
+                                     fd_accdb_snapshot_par_metrics_t * m ) {
+  if( m->disk_used_added      ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_used_bytes, m->disk_used_added   );
+  if( m->disk_used_removed    ) FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, m->disk_used_removed );
+  if( m->accounts_total_added ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->accounts_total,  m->accounts_total_added );
+  m->disk_used_added      = 0UL;
+  m->disk_used_removed    = 0UL;
+  m->accounts_total_added = 0UL;
+}
+
 /* fd_accdb_snapshot_verify_readback: sample live accounts from the
    index and pread each one's on-disk record header, verifying that the
    stored pubkey and data size match the index.  chain_cnt is a power of

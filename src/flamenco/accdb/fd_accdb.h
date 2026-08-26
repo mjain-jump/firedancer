@@ -720,6 +720,83 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
                                       ulong *                     out_replaced_lamports,
                                       ulong *                     out_ignored_lamports );
 
+/* fd_accdb_snapshot_bytes_freed marks [offset, offset+sz) of the
+   backing file as dead (freed) space.  Thread safe.  Used by parallel
+   snapshot loaders to release replaced record ranges. */
+
+void
+fd_accdb_snapshot_bytes_freed( fd_accdb_t * accdb,
+                               ulong        offset,
+                               ulong        sz );
+
+/* fd_accdb_snapshot_par_metrics_t buffers shared-metrics deltas and
+   duplicate-diagnostics for one parallel snapshot writer, so the hot
+   insert path does not touch shared counters.  Fold into the shared
+   metrics with fd_accdb_snapshot_flush_par_metrics. */
+
+struct fd_accdb_snapshot_par_metrics {
+  ulong disk_used_added;
+  ulong disk_used_removed;
+  ulong accounts_total_added;
+  ulong eq_slot_dups;          /* equal-slot cross-appendvec duplicate encounters */
+  ulong eq_slot_lamports_diff; /* subset of eq_slot_dups where the two versions' lamports differ */
+};
+
+typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
+
+/* fd_accdb_snapshot_write_batch_par_worker is the striped-lock
+   multi-writer counterpart of fd_accdb_snapshot_write_batch_worker
+   (full-snapshot mode only).  Multiple joiners may call it
+   concurrently, including for pubkeys that collide on the same hash
+   chain: each per-account chain walk + commit is serialized by a
+   striped spin lock (stripe = chain_idx & stripe_msk over the caller
+   provided stripe_locks array, which must be shared by all writers and
+   zero-initialized).  Pubkey hashing is internal (no routing).
+
+   The insert/replace/ignore decision is made BEFORE allocation, so
+   ignored duplicates burn no disk space.  Partition rotation is hoisted
+   outside the stripe lock so a partition fallocate never runs under a
+   contended lock.  Equal-slot cross-appendvec duplicates cannot be
+   tiebroken (worker-local offsets are not stream ordered): they are
+   counted in par_metrics->eq_slot_dups and treated as ignored; the
+   caller must fail the load if the count is nonzero.
+
+   file_offsets[i] receives the allocated offset of entry i, or
+   ULONG_MAX if the entry was ignored (the caller must then not write
+   the account's bytes).  Shared metrics deltas are accumulated in
+   par_metrics instead of the shared counters.
+
+   Returns 0 on success, -1 if the batch contained two entries with the
+   same pubkey (corrupt snapshot). */
+
+int
+fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
+                                          ulong                             cnt,
+                                          uchar const * const               pubkeys[],
+                                          ulong                             slot,
+                                          ulong const                       lamports[],
+                                          ulong const                       data_lens[],
+                                          int const                         executables[],
+                                          fd_accdb_snapshot_whead_t *       whead,
+                                          uint *                            stripe_locks,
+                                          ulong                             stripe_msk,
+                                          fd_accdb_snapshot_par_metrics_t * par_metrics,
+                                          ulong                             file_offsets[],
+                                          ulong *                           accounts_ignored,
+                                          ulong *                           accounts_replaced,
+                                          ulong *                           accounts_loaded,
+                                          ulong *                           out_replaced_lamports,
+                                          ulong *                           out_ignored_lamports );
+
+/* fd_accdb_snapshot_flush_par_metrics atomically folds the shared
+   metrics deltas accumulated in m (disk_used_added/removed,
+   accounts_total_added) into the shared metrics counters and zeroes
+   them.  The eq_slot_* diagnostics are left untouched. */
+
+void
+fd_accdb_snapshot_flush_par_metrics( fd_accdb_t *                      accdb,
+                                     fd_accdb_snapshot_par_metrics_t * m );
+
 /* fd_accdb_snapshot_worker_close hands off this writer's final
    partition at the end of a load: materializes the partition's
    write_offset from the private whead and books the dead tail slack
