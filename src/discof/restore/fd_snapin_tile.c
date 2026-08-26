@@ -231,6 +231,11 @@ struct fd_snapin_tile {
   } io_in[ FD_SNAPIN_WORKER_MAX ];
 
   ulong pending_job_cnt[ FD_SNAPIN_WORKER_MAX ];
+  ulong io_pub_cnt; /* snapin_io publishes so far in the current data
+                       frag callback, to respect STEM_BURST.  A frag
+                       packed with tiny appendvecs can otherwise flush
+                       more than STEM_BURST jobs (flush happens on slot
+                       change, not just every 8 accounts). */
 
   struct {
     ulong input_lamports;
@@ -947,6 +952,7 @@ publish_pending_job( fd_snapin_tile_t *  ctx,
                    out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
   io_out_advance( ctx, worker_idx );
   ctx->pending_job_cnt[ worker_idx ] = 0UL;
+  ctx->io_pub_cnt++;
 }
 
 static void
@@ -1240,6 +1246,8 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
     FD_LOG_ERR(( "invalid data frag bounds (chunk=%lu chunk0=%lu wmark=%lu sz=%lu mtu=%lu)", chunk, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark, sz, ctx->in[ in_idx ].mtu ));
   }
 
+  ctx->io_pub_cnt = 0UL;
+
   for(;;) {
     if( FD_UNLIKELY( sz-ctx->in[ in_idx ].pos==0UL ) ) break;
 
@@ -1452,6 +1460,11 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
     ctx->in[ in_idx ].pos += result->bytes_consumed;
     if( FD_LIKELY( ctx->full ) ) ctx->metrics.full_bytes_read        += result->bytes_consumed;
     else                         ctx->metrics.incremental_bytes_read += result->bytes_consumed;
+
+    /* An account batch flushes at most 8 jobs, so stopping 8 short of
+       STEM_BURST guarantees this callback never exceeds its credit
+       allotment.  The unconsumed tail of the frag is reprocessed. */
+    if( FD_UNLIKELY( ctx->io_pub_cnt>=FD_SNAPIN_IO_BURST-8UL ) ) early_exit = 1;
 
     if( FD_UNLIKELY( early_exit ) ) break;
   }
