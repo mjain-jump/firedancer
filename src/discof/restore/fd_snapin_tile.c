@@ -350,7 +350,14 @@ should_shutdown( fd_snapin_tile_t * ctx ) {
 
 static ulong
 scratch_align( void ) {
-  return 512UL;
+  /* Must cover the largest FD_LAYOUT_APPEND alignment in
+     scratch_footprint (the 4096-aligned worker write buffer).  The
+     footprint is computed from a zero base, so if the topology placed
+     the tile object at a smaller alignment the runtime layout could
+     consume up to align-scratch_align more bytes than the footprint and
+     overflow into the next workspace object (with >=2 workers that is
+     the next worker tile's ctx). */
+  return 4096UL;
 }
 
 static ulong

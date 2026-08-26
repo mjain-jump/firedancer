@@ -1623,6 +1623,93 @@ test_snapin_multiworker_routing_and_barrier( void ) {
   FD_TEST( test_pub_cnt==1UL && test_pub_out_idx[0]==17UL && test_pub_sig[0]==FD_SNAPSHOT_MSG_CTRL_FAIL );
 }
 
+/* The scratch footprint is computed from a zero base, so it only bounds
+   the runtime layout if no FD_LAYOUT_APPEND alignment exceeds
+   scratch_align() (the alignment the topology places the tile object
+   at).  A larger member alignment overflows the object into the next
+   workspace object at runtime — with >=2 workers the worker write
+   buffer clobbered the adjacent worker tile's ctx (role/lane_cnt),
+   crashing before_frag with a division by zero.  Replay both roles'
+   layouts from a worst-case base: aligned to scratch_align() but to
+   nothing larger.  Keep the appends in sync with scratch_footprint /
+   unprivileged_init. */
+static void
+test_snapin_scratch_layout_fits( void ) {
+  fd_topo_tile_t tile = {0};
+  tile.snapin.max_live_slots = 1024UL;
+
+  ulong align = scratch_align();
+  ulong base  = 3UL*align; /* aligned to scratch_align() only */
+
+  /* Worker role */
+  tile.kind_id = 1UL;
+  {
+    FD_SCRATCH_ALLOC_INIT( l, (void *)base );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t)                          );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile.snapin.max_live_slots )  );
+    FD_SCRATCH_ALLOC_APPEND( l, 4096UL,                    FD_SNAPIN_WRITE_BUF_SZ                            );
+    ulong end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
+    FD_TEST( end-base<=scratch_footprint( &tile ) );
+  }
+
+  /* Coordinator role */
+  tile.kind_id = 0UL;
+  {
+    FD_SCRATCH_ALLOC_INIT( l, (void *)base );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                                    );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),           fd_txncache_footprint( tile.snapin.max_live_slots )         );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),              fd_accdb_footprint( tile.snapin.max_live_slots )            );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_ssmanifest_parser_align(),  fd_ssmanifest_parser_footprint()                            );
+    FD_SCRATCH_ALLOC_APPEND( l, fd_slot_delta_parser_align(),  fd_slot_delta_parser_footprint()                            );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(blockhash_group_t),    sizeof(blockhash_group_t)*FD_SNAPIN_MAX_SLOT_DELTA_GROUPS   );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_sstxncache_hash_t), sizeof(fd_sstxncache_hash_t)*FD_SNAPIN_TXNCACHE_MAX_ENTRIES );
+    ulong end = FD_SCRATCH_ALLOC_FINI( l, 1UL );
+    FD_TEST( end-base<=scratch_footprint( &tile ) );
+  }
+}
+
+/* Worker before_frag dispatch across every in_idx/sig class, in the
+   2-worker topology shape for the SECOND worker (kind 2 = worker_idx 1,
+   snapin_io ring at in_idx 0, all eight snapdc lanes at in_idx 1..8):
+   the job ring is always processed, lane frags are consumed once
+   released and deferred otherwise, and the sig (data or any control) is
+   irrelevant on lanes — workers never take the coordinator's
+   expected-frame / control-barrier paths. */
+static void
+test_snapin_worker_before_frag_dispatch( void ) {
+  fd_snapin_tile_t ctx[ 1 ];
+  fd_memset( ctx, 0, sizeof(*ctx) );
+  ctx->role       = FD_SNAPIN_ROLE_ACCDB_WORKER;
+  ctx->worker_idx = 1UL;
+  ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
+  ctx->lane_cnt   = 8UL;
+  ctx->job_in_idx = 0UL;
+  ctx->in_lane[ 0 ] = ULONG_MAX;
+  for( ulong lane=0UL; lane<8UL; lane++ ) {
+    ctx->in_lane[ 1UL+lane ] = lane;
+    ctx->release[ lane ]     = 2UL*lane; /* distinct per-lane watermarks */
+  }
+
+  static const ulong sigs[ 6 ] = {
+    FD_SNAPSHOT_MSG_DATA,           FD_SNAPSHOT_MSG_CTRL_INIT_FULL, FD_SNAPSHOT_MSG_CTRL_FINI,
+    FD_SNAPSHOT_MSG_CTRL_ERROR,     FD_SNAPSHOT_MSG_CTRL_FAIL,      FD_SNAPSHOT_MSG_CTRL_SHUTDOWN,
+  };
+  for( ulong s=0UL; s<6UL; s++ ) {
+    /* Job ring: always processed, whatever the sig or seq. */
+    FD_TEST( before_frag( ctx, 0UL, 0UL,       sigs[ s ] )==0 );
+    FD_TEST( before_frag( ctx, 0UL, ULONG_MAX, sigs[ s ] )==0 );
+    for( ulong lane=0UL; lane<8UL; lane++ ) {
+      ulong in_idx  = 1UL+lane;
+      ulong release = ctx->release[ lane ];
+      FD_TEST( before_frag( ctx, in_idx, release,     sigs[ s ] )== 1 ); /* released: consume/skip */
+      FD_TEST( before_frag( ctx, in_idx, release+1UL, sigs[ s ] )==-1 ); /* held: defer, keep fseq */
+    }
+  }
+  /* Boot state: nothing released yet (release==ULONG_MAX==seq -1). */
+  ctx->release[ 3 ] = ULONG_MAX;
+  FD_TEST( before_frag( ctx, 4UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
+}
+
 /* Coordinator side of the frontier protocol: watermarks only advance at
    frag boundaries, FRONTIER jobs go to every worker ring on the
    consumed-frag interval and from the idle after_credit path, and every
@@ -1734,6 +1821,8 @@ main( int     argc,
   test_txncache_staging_evicts_oldest_slot();
   test_txncache_staging_fits_one_gigantic_page();
   test_txncache_staging_validates_stale_group_offsets();
+  test_snapin_scratch_layout_fits();
+  test_snapin_worker_before_frag_dispatch();
   test_snapin_worker_protocol();
   test_snapin_worker_ref_guard();
   test_snapin_coordinator_worker_handoff();
