@@ -122,19 +122,18 @@ fd_accdb_join_readonly( void *             ljoin,
    accounts never get a second write and therefore never get promoted
    by normal compaction-driven tiering.
 
-   A single-writer snapshot loader has exclusive write access to acc_pool.
-   Multi-writer loaders must shard ownership so that one worker exclusively
-   owns every acc_map hash chain for the duration of the load.
+   A single-writer snapshot loader has exclusive write access to
+   acc_pool.  Multi-writer loaders serialize hash-chain access with the
+   striped locks of fd_accdb_snapshot_write_batch_worker.
 
-   fd_accdb_snapshot_load_begin is the normal single-writer entry point.
-   fd_accdb_snapshot_load_begin_with_writers declares the number of joiners
-   that may concurrently mutate the snapshot index.  The coordinator calls
-   it before any writer starts and calls load_end after every writer stops.
-   Counts greater than one use the parallel acc_pool allocator and atomic
-   shared counters.  Disk reservations either stay serialized through one
-   coordinator (stream-order layout, fd_accdb_snapshot_reserve_batch) or
-   are made per-writer against private write heads
-   (fd_accdb_snapshot_worker_alloc; layout is then not stream-ordered). */
+   fd_accdb_snapshot_load_begin is the single-writer entry point.
+   fd_accdb_snapshot_load_begin_with_writers declares the number of
+   joiners that may concurrently mutate the snapshot index.  The
+   coordinator calls it before any writer starts and calls load_end
+   after every writer stops.  Counts greater than one use the parallel
+   acc_pool allocator and atomic shared counters, and the on-disk layout
+   is no longer stream-ordered (each writer appends into its own
+   partitions from a private write head). */
 
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
@@ -144,39 +143,16 @@ fd_accdb_snapshot_load_begin_with_writers( fd_accdb_t * accdb,
                                            ulong        writer_cnt );
 
 /* Each parallel snapshot index writer brackets its job stream with
-   writer_begin/writer_end.  This lets it amortize shared acc_pool allocation
-   over local blocks while returning any unused tail before the coordinator
-   ends or resets the load.  Full-snapshot single-writer callers may also use
-   this pair to opt into the same block allocator. */
+   writer_begin/writer_end.  This lets it amortize shared acc_pool
+   allocation over local blocks while returning any unused tail before
+   the coordinator ends or resets the load.  Single-writer callers may
+   also use this pair to opt into the same block allocator. */
 
 void
 fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb );
 
 void
 fd_accdb_snapshot_writer_end( fd_accdb_t * accdb );
-
-/* fd_accdb_snapshot_worker_idx selects the writer that owns pubkey's hash
-   chain.  worker_cnt must be a power of two.  During a multi-writer snapshot
-   load, callers must send every account in one hash chain to the same worker
-   and preserve stream order on each worker. */
-
-ulong
-fd_accdb_snapshot_worker_idx( fd_accdb_t const * accdb,
-                              uchar const        pubkey[ static 32 ],
-                              ulong              worker_cnt );
-
-/* fd_accdb_snapshot_route_batch computes each pubkey's full acc_map chain
-   index and owning snapshot writer.  worker_cnt must be a power of two and
-   cnt must be in [1,8].  Full chain indices are useful for cheaply filtering
-   intra-batch duplicate checks before comparing pubkey bytes. */
-
-void
-fd_accdb_snapshot_route_batch( fd_accdb_t const * accdb,
-                               ulong              cnt,
-                               uchar const * const pubkeys[],
-                               ulong              worker_cnt,
-                               ulong              worker_idxs[],
-                               ulong              chain_idxs[] );
 
 void
 fd_accdb_snapshot_load_end( fd_accdb_t * accdb );
@@ -586,27 +562,6 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
                              int                executable,
                              ulong *            out_replaced_lamports );
 
-/* fd_accdb_snapshot_write_batch processes up to 8 accounts at once,
-   using software prefetching to overlap hash chain memory latency with
-   useful work.  This function is not thread safe and must not be called
-   concurrently.  Each pubkey[i] points to a 32-byte public key.
-   *out_replaced_lamports is set to the sum of the lamports of all
-   accounts replaced by this batch (i.e. the previous lamports value of
-   each account whose acc was overwritten).  *out_ignored_lamports is
-   set to the sum of the lamports of all accounts ignored by this batch
-   (i.e. the lamports of each input account whose write was dropped
-   because an acc with a higher slot already exists).  Returns 0 on
-   success, -1 if the batch contained two entries with the same pubkey
-   (a corrupt-snapshot signal — the caller should flag the snapshot
-   malformed).  Output counters are not meaningful when -1 is returned.
-
-   slot must be <= UINT_MAX (see fd_accdb_snapshot_write_one
-   for the rationale).  Passing a larger slot crashes the process.
-
-   fork_id has the same semantics as in fd_accdb_snapshot_write_one:
-   USHORT_MAX for full-snapshot mode, otherwise incremental mode with
-   txn tracking on the specified fork. */
-
 /* fd_accdb_snapshot_prefetch_batch computes the hash chain bucket for each
    pubkey and issues a prefetch for it, then returns.  It performs no lookup
    and mutates nothing.
@@ -623,49 +578,6 @@ fd_accdb_snapshot_prefetch_batch( fd_accdb_t *        accdb,
                                   ulong               cnt,
                                   uchar const * const pubkeys[] );
 
-/* fd_accdb_snapshot_prefetch_chain_batch is the prehashed counterpart to
-   fd_accdb_snapshot_prefetch_batch.  chain_idxs must have been returned by
-   fd_accdb_snapshot_route_batch for this accdb and the same ordered pubkeys. */
-
-void
-fd_accdb_snapshot_prefetch_chain_batch( fd_accdb_t * accdb,
-                                        ulong        cnt,
-                                        ulong const  chain_idxs[] );
-
-/* fd_accdb_snapshot_reserve_batch reserves the on-disk locations for a
-   batch in stream order without mutating the account index.  This is the
-   ordered half of snapshot insertion: a coordinator may reserve offsets
-   and then hand the batch to an asynchronous index worker via
-   fd_accdb_snapshot_write_batch_preallocated.  Exactly one coordinator may
-   call this during a load.  cnt must be in [1,8]. */
-
-void
-fd_accdb_snapshot_reserve_batch( fd_accdb_t * accdb,
-                                 ulong        cnt,
-                                 ulong const  data_lens[],
-                                 ulong        file_offsets[] );
-
-/* fd_accdb_snapshot_write_batch_preallocated has the same index mutation,
-   duplicate handling, and output semantics as
-   fd_accdb_snapshot_write_batch, but uses offsets previously returned by
-   fd_accdb_snapshot_reserve_batch instead of advancing the write head. */
-
-int
-fd_accdb_snapshot_write_batch_preallocated( fd_accdb_t *        accdb,
-                                            fd_accdb_fork_id_t  fork_id,
-                                            ulong               cnt,
-                                            uchar const * const pubkeys[],
-                                            ulong               slot,
-                                            ulong  const        lamports[],
-                                            ulong  const        data_lens[],
-                                            int    const        executables[],
-                                            ulong  const        file_offsets[],
-                                            ulong *             accounts_ignored,
-                                            ulong *             accounts_replaced,
-                                            ulong *             accounts_loaded,
-                                            ulong *             out_replaced_lamports,
-                                            ulong *             out_ignored_lamports );
-
 /* fd_accdb_snapshot_whead_t is a snapshot writer's private layer-0
    write head.  Each parallel snapshot writer appends into its own
    exclusive set of partitions: allocation is lock-free except when
@@ -680,61 +592,12 @@ struct fd_accdb_snapshot_whead {
 
 typedef struct fd_accdb_snapshot_whead fd_accdb_snapshot_whead_t;
 
-/* fd_accdb_snapshot_worker_alloc reserves sz bytes at this writer's
-   private write head, rotating to a fresh partition when the current
-   one cannot fit sz (accounts never straddle a partition boundary; the
-   tail slack is booked when the partition is handed off).  Returns the
-   flat file offset of the reservation.  Write metrics are batched in
-   the joiner-local write_stats and published by
-   fd_accdb_flush_metrics. */
-
-ulong
-fd_accdb_snapshot_worker_alloc( fd_accdb_t *                accdb,
-                                ulong                       sz,
-                                fd_accdb_snapshot_whead_t * whead );
-
-/* fd_accdb_snapshot_write_batch_worker has the same duplicate handling
-   and output semantics as fd_accdb_snapshot_write_batch, but is the
-   full-snapshot multi-writer variant where each writer allocates its
-   own disk offsets: the insert/replace/ignore decision is made BEFORE
-   allocation, so ignored duplicates burn no disk space.  chain_idxs
-   must come from fd_accdb_snapshot_route_batch for the same ordered
-   pubkeys.  file_offsets[i] receives the allocated offset of entry i,
-   or ULONG_MAX if the entry was ignored (the caller must then not write
-   the account's bytes).  cnt must be in [1,8]. */
-
-int
-fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
-                                      ulong                       cnt,
-                                      uchar const * const         pubkeys[],
-                                      ulong const                 chain_idxs[],
-                                      ulong                       slot,
-                                      ulong const                 lamports[],
-                                      ulong const                 data_lens[],
-                                      int const                   executables[],
-                                      fd_accdb_snapshot_whead_t * whead,
-                                      ulong                       file_offsets[],
-                                      ulong *                     accounts_ignored,
-                                      ulong *                     accounts_replaced,
-                                      ulong *                     accounts_loaded,
-                                      ulong *                     out_replaced_lamports,
-                                      ulong *                     out_ignored_lamports );
-
-/* fd_accdb_snapshot_bytes_freed marks [offset, offset+sz) of the
-   backing file as dead (freed) space.  Thread safe.  Used by parallel
-   snapshot loaders to release replaced record ranges. */
-
-void
-fd_accdb_snapshot_bytes_freed( fd_accdb_t * accdb,
-                               ulong        offset,
-                               ulong        sz );
-
-/* fd_accdb_snapshot_par_metrics_t buffers shared-metrics deltas and
-   duplicate-diagnostics for one parallel snapshot writer, so the hot
+/* fd_accdb_snapshot_worker_metrics_t buffers shared-metrics deltas and
+   duplicate diagnostics for one parallel snapshot writer, so the hot
    insert path does not touch shared counters.  Fold into the shared
-   metrics with fd_accdb_snapshot_flush_par_metrics. */
+   metrics with fd_accdb_snapshot_flush_worker_metrics. */
 
-struct fd_accdb_snapshot_par_metrics {
+struct fd_accdb_snapshot_worker_metrics {
   ulong disk_used_added;
   ulong disk_used_removed;
   ulong accounts_total_added;
@@ -742,24 +605,25 @@ struct fd_accdb_snapshot_par_metrics {
   ulong eq_slot_lamports_diff; /* subset of eq_slot_dups where the two versions' lamports differ */
 };
 
-typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
+typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
 
-/* fd_accdb_snapshot_write_batch_par_worker is the striped-lock
-   multi-writer counterpart of fd_accdb_snapshot_write_batch_worker.
-   Multiple joiners may call it
-   concurrently, including for pubkeys that collide on the same hash
-   chain: each per-account chain walk + commit is serialized by a
-   striped spin lock (stripe = chain_idx & stripe_msk over the caller
-   provided stripe_locks array, which must be shared by all writers and
-   zero-initialized).  Pubkey hashing is internal (no routing).
+/* fd_accdb_snapshot_write_batch_worker has the same duplicate handling
+   and output semantics as fd_accdb_snapshot_write_batch, but multiple
+   joiners may call it concurrently, including for pubkeys that collide
+   on the same hash chain: each per-account chain walk + commit is
+   serialized by a striped spin lock (stripe = chain_idx & stripe_msk
+   over the caller provided stripe_locks array, which must be shared by
+   all writers and zero-initialized).  Only one stripe is ever held at a
+   time, so the locks cannot deadlock.
 
-   The insert/replace/ignore decision is made BEFORE allocation, so
-   ignored duplicates burn no disk space.  Partition rotation is hoisted
-   outside the stripe lock so a partition fallocate never runs under a
-   contended lock.  Equal-slot cross-appendvec duplicates cannot be
-   tiebroken (worker-local offsets are not stream ordered): they are
-   counted in par_metrics->eq_slot_dups and treated as ignored; the
-   caller must fail the load if the count is nonzero.
+   Each writer allocates its own disk offsets from whead, and the
+   insert/replace/ignore decision is made BEFORE allocation, so ignored
+   duplicates burn no disk space.  Partition rotation is hoisted outside
+   the stripe lock so a partition fallocate never runs under a contended
+   lock.  Equal-slot cross-appendvec duplicates cannot be tiebroken
+   (worker-local offsets are not stream ordered): they are counted in
+   metrics->eq_slot_dups and treated as ignored; the caller must fail
+   the load if the count is nonzero.
 
    fork_id has the same semantics as in fd_accdb_snapshot_write_batch:
    USHORT_MAX selects full-snapshot mode, otherwise incremental mode
@@ -771,39 +635,39 @@ typedef struct fd_accdb_snapshot_par_metrics fd_accdb_snapshot_par_metrics_t;
    file_offsets[i] receives the allocated offset of entry i, or
    ULONG_MAX if the entry was ignored (the caller must then not write
    the account's bytes).  Shared metrics deltas are accumulated in
-   par_metrics instead of the shared counters.
+   metrics instead of the shared counters.  cnt must be in [1,8].
 
    Returns 0 on success, -1 if the batch contained two entries with the
    same pubkey (corrupt snapshot). */
 
 int
-fd_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
-                                          fd_accdb_fork_id_t                fork_id,
-                                          ulong                             cnt,
-                                          uchar const * const               pubkeys[],
-                                          ulong                             slot,
-                                          ulong const                       lamports[],
-                                          ulong const                       data_lens[],
-                                          int const                         executables[],
-                                          fd_accdb_snapshot_whead_t *       whead,
-                                          uint *                            stripe_locks,
-                                          ulong                             stripe_msk,
-                                          fd_accdb_snapshot_par_metrics_t * par_metrics,
-                                          ulong                             file_offsets[],
-                                          ulong *                           accounts_ignored,
-                                          ulong *                           accounts_replaced,
-                                          ulong *                           accounts_loaded,
-                                          ulong *                           out_replaced_lamports,
-                                          ulong *                           out_ignored_lamports );
+fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
+                                      fd_accdb_fork_id_t                   fork_id,
+                                      ulong                                cnt,
+                                      uchar const * const                  pubkeys[],
+                                      ulong                                slot,
+                                      ulong const                          lamports[],
+                                      ulong const                          data_lens[],
+                                      int const                            executables[],
+                                      fd_accdb_snapshot_whead_t *          whead,
+                                      uint *                               stripe_locks,
+                                      ulong                                stripe_msk,
+                                      fd_accdb_snapshot_worker_metrics_t * metrics,
+                                      ulong                                file_offsets[],
+                                      ulong *                              accounts_ignored,
+                                      ulong *                              accounts_replaced,
+                                      ulong *                              accounts_loaded,
+                                      ulong *                              out_replaced_lamports,
+                                      ulong *                              out_ignored_lamports );
 
-/* fd_accdb_snapshot_flush_par_metrics atomically folds the shared
+/* fd_accdb_snapshot_flush_worker_metrics atomically folds the shared
    metrics deltas accumulated in m (disk_used_added/removed,
    accounts_total_added) into the shared metrics counters and zeroes
    them.  The eq_slot_* diagnostics are left untouched. */
 
 void
-fd_accdb_snapshot_flush_par_metrics( fd_accdb_t *                      accdb,
-                                     fd_accdb_snapshot_par_metrics_t * m );
+fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
+                                        fd_accdb_snapshot_worker_metrics_t * m );
 
 /* fd_accdb_snapshot_worker_close hands off this writer's final
    partition at the end of a load: materializes the partition's
@@ -827,6 +691,27 @@ fd_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
 void
 fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
                                    ulong        sample_max );
+
+/* fd_accdb_snapshot_write_batch processes up to 8 accounts at once,
+   using software prefetching to overlap hash chain memory latency with
+   useful work.  This function is not thread safe and must not be called
+   concurrently.  Each pubkey[i] points to a 32-byte public key.
+   *out_replaced_lamports is set to the sum of the lamports of all
+   accounts replaced by this batch (i.e. the previous lamports value of
+   each account whose acc was overwritten).  *out_ignored_lamports is
+   set to the sum of the lamports of all accounts ignored by this batch
+   (i.e. the lamports of each input account whose write was dropped
+   because an acc with a higher slot already exists).  Returns 0 on
+   success, -1 if the batch contained two entries with the same pubkey
+   (a corrupt-snapshot signal — the caller should flag the snapshot
+   malformed).  Output counters are not meaningful when -1 is returned.
+
+   slot must be <= UINT_MAX (see fd_accdb_snapshot_write_one
+   for the rationale).  Passing a larger slot crashes the process.
+
+   fork_id has the same semantics as in fd_accdb_snapshot_write_one:
+   USHORT_MAX for full-snapshot mode, otherwise incremental mode with
+   txn tracking on the specified fork. */
 
 int
 fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,

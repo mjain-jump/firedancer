@@ -64,8 +64,8 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_accdb_snapshot_prefetch_batch mock_accdb_snapshot_prefetch_batch
 #define fd_accdb_snapshot_writer_begin mock_accdb_snapshot_writer_begin
 #define fd_accdb_snapshot_writer_end mock_accdb_snapshot_writer_end
-#define fd_accdb_snapshot_write_batch_par_worker mock_accdb_snapshot_write_batch_par_worker
-#define fd_accdb_snapshot_flush_par_metrics mock_accdb_snapshot_flush_par_metrics
+#define fd_accdb_snapshot_write_batch_worker mock_accdb_snapshot_write_batch_worker
+#define fd_accdb_snapshot_flush_worker_metrics mock_accdb_snapshot_flush_worker_metrics
 #define fd_accdb_snapshot_worker_close mock_accdb_snapshot_worker_close
 #define fd_accdb_snapshot_verify_readback mock_accdb_snapshot_verify_readback
 #define fd_accdb_snapshot_load_begin_with_writers mock_accdb_snapshot_load_begin_with_writers
@@ -90,8 +90,8 @@ test_stem_publish( fd_stem_context_t * stem,
 #undef fd_accdb_purge
 #undef fd_accdb_attach_child
 #undef fd_accdb_reset
-#undef fd_accdb_snapshot_write_batch_par_worker
-#undef fd_accdb_snapshot_flush_par_metrics
+#undef fd_accdb_snapshot_write_batch_worker
+#undef fd_accdb_snapshot_flush_worker_metrics
 #undef fd_accdb_snapshot_worker_close
 #undef fd_accdb_snapshot_verify_readback
 #undef fd_accdb_snapshot_writer_end
@@ -126,29 +126,29 @@ mock_accdb_snapshot_prefetch_batch( fd_accdb_t *        accdb,
    accepted entries, and reports skip_mask entries as ignored (no
    allocation) and repl_mask entries as replaced. */
 int
-mock_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      accdb,
-                                            fd_accdb_fork_id_t                fork_id,
-                                            ulong                             cnt,
-                                            uchar const * const               pubkeys[],
-                                            ulong                             slot,
-                                            ulong const                       lamports[],
-                                            ulong const                       data_lens[],
-                                            int const                         executables[],
-                                            fd_accdb_snapshot_whead_t *       whead,
-                                            uint *                            stripe_locks,
-                                            ulong                             stripe_msk,
-                                            fd_accdb_snapshot_par_metrics_t * par_metrics,
-                                            ulong                             file_offsets[],
-                                            ulong *                           accounts_ignored,
-                                            ulong *                           accounts_replaced,
-                                            ulong *                           accounts_loaded,
-                                            ulong *                           out_replaced_lamports,
-                                            ulong *                           out_ignored_lamports ) {
+mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
+                                        fd_accdb_fork_id_t                   fork_id,
+                                        ulong                                cnt,
+                                        uchar const * const                  pubkeys[],
+                                        ulong                                slot,
+                                        ulong const                          lamports[],
+                                        ulong const                          data_lens[],
+                                        int const                            executables[],
+                                        fd_accdb_snapshot_whead_t *          whead,
+                                        uint *                               stripe_locks,
+                                        ulong                                stripe_msk,
+                                        fd_accdb_snapshot_worker_metrics_t * worker_metrics,
+                                        ulong                                file_offsets[],
+                                        ulong *                              accounts_ignored,
+                                        ulong *                              accounts_replaced,
+                                        ulong *                              accounts_loaded,
+                                        ulong *                              out_replaced_lamports,
+                                        ulong *                              out_ignored_lamports ) {
   (void)accdb;
   (void)whead;
   (void)stripe_locks;
   (void)stripe_msk;
-  (void)par_metrics;
+  (void)worker_metrics;
   FD_TEST( cnt && cnt<=8UL );
   test_accdb_worker_call_cnt++;
   test_accdb_worker_fork    = (ulong)fork_id.val;
@@ -179,8 +179,8 @@ mock_accdb_snapshot_write_batch_par_worker( fd_accdb_t *                      ac
 }
 
 void
-mock_accdb_snapshot_flush_par_metrics( fd_accdb_t *                      accdb,
-                                       fd_accdb_snapshot_par_metrics_t * m ) {
+mock_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
+                                          fd_accdb_snapshot_worker_metrics_t * m ) {
   (void)accdb;
   m->disk_used_added      = 0UL;
   m->disk_used_removed    = 0UL;

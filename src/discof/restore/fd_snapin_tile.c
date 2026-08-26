@@ -350,7 +350,7 @@ struct fd_snapin_tile {
   ulong   write_buf_used;
   ulong   flush_off;                               /* file offset of write_buf[0] */
   ulong   bytes_written;
-  fd_accdb_snapshot_par_metrics_t par_metrics[1];
+  fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
   fd_snapio_worker_snoop_t * my_snoop;
   ulong stake_log_max;
   struct {                                         /* streaming-path slot history capture */
@@ -1679,8 +1679,8 @@ worker_publish_ack( fd_snapin_tile_t *  ctx,
   ack->replaced_lamports     = ctx->worker.replaced_lamports;
   ack->ignored_lamports      = ctx->worker.ignored_lamports;
   ack->bytes_written         = ctx->bytes_written;
-  ack->eq_slot_dups          = ctx->par_metrics->eq_slot_dups;
-  ack->eq_slot_lamports_diff = ctx->par_metrics->eq_slot_lamports_diff;
+  ack->eq_slot_dups          = ctx->worker_metrics->eq_slot_dups;
+  ack->eq_slot_lamports_diff = ctx->worker_metrics->eq_slot_lamports_diff;
   ack->err                   = err;
   fd_stem_publish( stem, ctx->ack_out.idx, fd_snapin_io_ack_sig( ctx->generation, control ),
                    ctx->ack_out.chunk, sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL );
@@ -1737,7 +1737,7 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->rec_idx        = 0UL;
   worker_reset_write_engine( ctx );
   fd_memset( &ctx->worker,    0, sizeof(ctx->worker)    );
-  fd_memset( ctx->par_metrics, 0, sizeof(ctx->par_metrics) );
+  fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
   fd_memset( &ctx->cov_stats, 0, sizeof(ctx->cov_stats) );
   ctx->cov_stats.lag_min = ULONG_MAX;
   ctx->metrics.accounts_loaded   = 0UL;
@@ -2044,11 +2044,11 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
-                                                                data_lens, executables, &ctx->whead,
-                                                                ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
-                                                                file_offsets, &accounts_ignored, &accounts_replaced,
-                                                                &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
+                                                            data_lens, executables, &ctx->whead,
+                                                            ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->worker_metrics,
+                                                            file_offsets, &accounts_ignored, &accounts_replaced,
+                                                            &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
     return -1;
   }
 
@@ -2089,11 +2089,11 @@ worker_process_account_header( fd_snapin_tile_t *            ctx,
   ulong         file_offsets[ 1 ];
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
-                                                                data_lens, executables, &ctx->whead,
-                                                                ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
-                                                                file_offsets, &accounts_ignored, &accounts_replaced,
-                                                                &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
+                                                            data_lens, executables, &ctx->whead,
+                                                            ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->worker_metrics,
+                                                            file_offsets, &accounts_ignored, &accounts_replaced,
+                                                            &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
     return -1;
   }
   int ignored = file_offsets[ 0 ]==ULONG_MAX;
@@ -2341,7 +2341,7 @@ worker_try_complete_fini( fd_snapin_tile_t *  ctx,
   worker_buffer_flush( ctx );
   fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
   fd_accdb_snapshot_writer_end( ctx->accdb );
-  fd_accdb_snapshot_flush_par_metrics( ctx->accdb, ctx->par_metrics );
+  fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
   ctx->pending_fini = 0;
   ctx->state        = FD_SNAPSHOT_STATE_FINISHING;
 
