@@ -1014,7 +1014,7 @@ test_batch_stake_delegation( void ) {
     },
   };
 
-  FD_TEST( !process_account_batch( &ctx, &result, (fd_stem_context_t *)1UL ) );
+  FD_TEST( !process_account_batch( &ctx, &result ) );
   assert_stake_delegation( stake_delegations, &stake_account, &vote_account );
 
   free( banks_mem );
@@ -1042,7 +1042,7 @@ test_streaming_stake_delegation( void ) {
       .executable = 0,
     },
   };
-  FD_TEST( !process_account_header( &ctx, &header, (fd_stem_context_t *)1UL ) );
+  FD_TEST( !process_account_header( &ctx, &header ) );
 
   ulong split = sizeof(fd_stake_state_t)/2UL;
   fd_ssparse_advance_result_t data = {
@@ -1196,7 +1196,7 @@ test_txncache_staging_validates_stale_group_offsets( void ) {
   free( shmem );
 }
 
-/* Parallel loader (D9) role tests ***********************************/
+/* Parallel loader role tests ****************************************/
 
 static uchar test_worker_snoop_mem[ sizeof(fd_snapio_worker_snoop_t) + 64UL*sizeof(fd_snapio_stake_ent_t) ] __attribute__((aligned(64)));
 static fd_snapin_extent_t test_worker_fifo[ FD_SNAPIN_FIFO_CNT ];
