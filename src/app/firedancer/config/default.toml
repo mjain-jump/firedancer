@@ -978,9 +978,11 @@ telemetry = true
     # How many snapshot decompressor tiles to run.
     snapdc_tile_count = 1
 
-    # How many snapshot account-index tiles to run.  One tile preserves
-    # inline insertion.  Two uses one ordered parser/coordinator and one
-    # asynchronous accdb worker.  These tiles do not consume CPU when idle.
+    # How many snapshot loader tiles to run.  One tile parses the
+    # snapshot and inserts accounts inline.  With more than one, the
+    # first tile only walks the tar headers and assigns whole appendvecs
+    # to the remaining tiles, which parse, insert and write their share
+    # in parallel.  These tiles do not consume CPU when idle.
     snapin_tile_count = 1
 
     # How many snapshot compressor tiles to run.  These tiles do not

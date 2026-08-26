@@ -194,12 +194,14 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_wksp( topo, "snapct_repr"  );
 
   fd_topob_wksp( topo, "snapin_ct"    );
-  fd_topob_wksp( topo, "snapin_io"  );
-  fd_topob_wksp( topo, "snapio_ack" );
+  fd_topob_wksp( topo, "snapin_io"    );
+  fd_topob_wksp( topo, "snapio_ack"   );
 
-  /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH: worker
-     frag holds release on a frontier cadence, so extra depth is
-     release-lag slack between snapdc and the workers' deferred fseqs. */
+  /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH.  A
+     worker's fseq is its scan position, so this depth is the runway that
+     lets the coordinator's header walk (and the other workers) keep
+     going through one worker's write stall instead of convoying behind
+     it.  1024 frags is ~64 MiB per lane. */
   ulong snapdc_in_depth = 1024UL;
 
   fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
@@ -230,8 +232,9 @@ snapshot_load_topo( config_t * config ) {
     fd_topob_tile_in ( topo, "snapin", worker_idx+1UL, "metric_in", "snapin_io",  worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_out( topo, "snapin", worker_idx+1UL,              "snapio_ack", worker_idx );
     fd_topob_tile_in ( topo, "snapin", 0UL,            "metric_in", "snapio_ack", worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-    /* Workers hold every snapdc lane's frags (deferred reliable
-       consumption) while ring jobs reference their bytes. */
+    /* Every worker is a full reliable consumer of every snapdc lane: it
+       parses the appendvecs assigned to it straight out of the lane
+       frags, and holds the lane head until its assignments cover it. */
     FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", worker_idx+1UL, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   }
 
@@ -539,8 +542,10 @@ snapshot_load_cmd_fn( args_t *   args,
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     snapin_all_metrics[ i ] = fd_metrics_tile( tile->metrics );
   }
-  ulong snapin_work_begin = snapin_tile_cnt>1UL ? 1UL                 : 0UL;
-  ulong snapin_work_cnt   = snapin_tile_cnt>1UL ? snapin_tile_cnt-1UL : 1UL;
+  /* snapin tile 0 is the coordinator, tiles 1.. are the accdb workers.
+     Only the workers insert accounts, so the coordinator's
+     ACCOUNT_LOADED gauge stays 0 for the whole load. */
+  ulong snapin_worker_cnt = snapin_tile_cnt-1UL;
   ulong volatile *       snapdc_metrics[ FD_TOPO_MAX_TILE_IN_LINKS ];
   for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
     fd_topo_tile_t * snapdc_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapdc", i ) ];
@@ -612,8 +617,8 @@ snapshot_load_cmd_fn( args_t *   args,
       snapin_wait[ i ] = metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
                        + metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
     }
-    for( ulong i=0UL; i<snapin_work_cnt; i++ ) {
-      acc_cnt += snapin_all_metrics[ snapin_work_begin+i ][ MIDX( GAUGE, SNAPIN, ACCOUNT_LOADED ) ];
+    for( ulong i=0UL; i<snapin_worker_cnt; i++ ) {
+      acc_cnt += snapin_all_metrics[ 1UL+i ][ MIDX( GAUGE, SNAPIN, ACCOUNT_LOADED ) ];
     }
 
     char const * phase = phase_cstr( snapct_metrics[ MIDX( GAUGE, SNAPCT, STATE ) ] );
@@ -654,11 +659,12 @@ snapshot_load_cmd_fn( args_t *   args,
       for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
         snapin_busy[ i ] = clamp_pct( 100.0-( ( (double)( snapin_wait[ i ]-snapin_wait_old[ i ] )*ns_per_tick )/1e7 ) );
       }
-      for( ulong i=0UL; i<snapin_work_cnt; i++ ) snapin_busy_avg += snapin_busy[ snapin_work_begin+i ];
-      snapin_busy_avg /= (double)snapin_work_cnt;
+      for( ulong i=0UL; i<snapin_worker_cnt; i++ ) snapin_busy_avg += snapin_busy[ 1UL+i ];
+      snapin_busy_avg /= (double)snapin_worker_cnt;
 
-      /* Note: worker busy%% is biased high — lane-frag deferrals
-         (before_frag -1) land in processing regimes. */
+      /* Worker busy%% is biased high: a worker that defers a lane frag
+         (before_frag -1, waiting for byte coverage) is charged to a
+         processing regime, not to a waiting one. */
       double busy[ 4 ] = {
         clamp_pct( 100.0-( ( (double)( snapld_wait-snapld_wait_old )*ns_per_tick )/1e7 ) ),
         snapdc_busy_avg,
@@ -690,10 +696,10 @@ snapshot_load_cmd_fn( args_t *   args,
                 c_dim, i, c_norm,
                 sev_color( color, snapdc_busy[ i ] ), snapdc_busy[ i ], c_dim, c_norm );
       }
-      for( ulong i=0UL; i<snapin_work_cnt; i++ ) {
+      for( ulong i=0UL; i<snapin_worker_cnt; i++ ) {
         printf( " %swk%lu%s %s%3.0f%s%%%s",
                 c_dim, i, c_norm,
-                sev_color( color, snapin_busy[ snapin_work_begin+i ] ), snapin_busy[ snapin_work_begin+i ], c_dim, c_norm );
+                sev_color( color, snapin_busy[ 1UL+i ] ), snapin_busy[ 1UL+i ], c_dim, c_norm );
       }
       printf( "\n" );
       fflush( stdout );

@@ -259,7 +259,6 @@ fd_topo_obj_callbacks_t fd_obj_cb_backup = {
   .new       = backup_new_cb,
 };
 
-
 static ulong
 snapio_snoop_footprint_cb( fd_topo_t const *     topo,
                            fd_topo_obj_t const * obj ) {
