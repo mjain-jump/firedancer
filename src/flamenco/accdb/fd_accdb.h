@@ -131,8 +131,10 @@ fd_accdb_join_readonly( void *             ljoin,
    that may concurrently mutate the snapshot index.  The coordinator calls
    it before any writer starts and calls load_end after every writer stops.
    Counts greater than one use the parallel acc_pool allocator and atomic
-   shared counters.  Disk reservations remain serialized through one
-   coordinator so account bytes retain snapshot stream order. */
+   shared counters.  Disk reservations either stay serialized through one
+   coordinator (stream-order layout, fd_accdb_snapshot_reserve_batch) or
+   are made per-writer against private write heads
+   (fd_accdb_snapshot_worker_alloc; layout is then not stream-ordered). */
 
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
@@ -664,29 +666,82 @@ fd_accdb_snapshot_write_batch_preallocated( fd_accdb_t *        accdb,
                                             ulong *             out_replaced_lamports,
                                             ulong *             out_ignored_lamports );
 
-/* fd_accdb_snapshot_write_batch_preallocated_prehashed is identical to
-   fd_accdb_snapshot_write_batch_preallocated, except it reuses chain_idxs
-   previously returned by fd_accdb_snapshot_route_batch instead of hashing
-   the pubkeys again.  The chain indices must correspond to this accdb and
-   the same ordered pubkeys.  Call fd_accdb_snapshot_prefetch_chain_batch
-   first when the chain heads are not already warm. */
+/* fd_accdb_snapshot_whead_t is a snapshot writer's private layer-0
+   write head.  Each parallel snapshot writer appends into its own
+   exclusive set of partitions: allocation is lock-free except when
+   rotating to a fresh partition (which takes the shared partition
+   lock).  val is an opaque packed (partition idx, offset) pair;
+   initialize both fields to zero before the first allocation. */
+
+struct fd_accdb_snapshot_whead {
+  ulong val;
+  int   has_partition;
+};
+
+typedef struct fd_accdb_snapshot_whead fd_accdb_snapshot_whead_t;
+
+/* fd_accdb_snapshot_worker_alloc reserves sz bytes at this writer's
+   private write head, rotating to a fresh partition when the current
+   one cannot fit sz (accounts never straddle a partition boundary; the
+   tail slack is booked when the partition is handed off).  Returns the
+   flat file offset of the reservation.  Write metrics are batched in
+   the joiner-local write_stats and published by
+   fd_accdb_flush_metrics. */
+
+ulong
+fd_accdb_snapshot_worker_alloc( fd_accdb_t *                accdb,
+                                ulong                       sz,
+                                fd_accdb_snapshot_whead_t * whead );
+
+/* fd_accdb_snapshot_write_batch_worker has the same duplicate handling
+   and output semantics as fd_accdb_snapshot_write_batch, but is the
+   full-snapshot multi-writer variant where each writer allocates its
+   own disk offsets: the insert/replace/ignore decision is made BEFORE
+   allocation, so ignored duplicates burn no disk space.  chain_idxs
+   must come from fd_accdb_snapshot_route_batch for the same ordered
+   pubkeys.  file_offsets[i] receives the allocated offset of entry i,
+   or ULONG_MAX if the entry was ignored (the caller must then not write
+   the account's bytes).  cnt must be in [1,8]. */
 
 int
-fd_accdb_snapshot_write_batch_preallocated_prehashed( fd_accdb_t *        accdb,
-                                                      fd_accdb_fork_id_t  fork_id,
-                                                      ulong               cnt,
-                                                      uchar const * const pubkeys[],
-                                                      ulong const         chain_idxs[],
-                                                      ulong               slot,
-                                                      ulong const         lamports[],
-                                                      ulong const         data_lens[],
-                                                      int const           executables[],
-                                                      ulong const         file_offsets[],
-                                                      ulong *             accounts_ignored,
-                                                      ulong *             accounts_replaced,
-                                                      ulong *             accounts_loaded,
-                                                      ulong *             out_replaced_lamports,
-                                                      ulong *             out_ignored_lamports );
+fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
+                                      ulong                       cnt,
+                                      uchar const * const         pubkeys[],
+                                      ulong const                 chain_idxs[],
+                                      ulong                       slot,
+                                      ulong const                 lamports[],
+                                      ulong const                 data_lens[],
+                                      int const                   executables[],
+                                      fd_accdb_snapshot_whead_t * whead,
+                                      ulong                       file_offsets[],
+                                      ulong *                     accounts_ignored,
+                                      ulong *                     accounts_replaced,
+                                      ulong *                     accounts_loaded,
+                                      ulong *                     out_replaced_lamports,
+                                      ulong *                     out_ignored_lamports );
+
+/* fd_accdb_snapshot_worker_close hands off this writer's final
+   partition at the end of a load: materializes the partition's
+   write_offset from the private whead and books the dead tail slack
+   (mirroring what change_partition does on rotation).  Compaction
+   enqueue is deliberately skipped; fd_accdb_snapshot_load_end's sweep
+   re-checks every partition.  Idempotent (no-op without an open
+   partition); resets whead so a later load starts fresh. */
+
+void
+fd_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
+                                fd_accdb_snapshot_whead_t * whead );
+
+/* fd_accdb_snapshot_verify_readback samples up to sample_max live
+   accounts from the index and preads each one's on-disk record header
+   at fd_accdb_acc_offset, verifying that the stored pubkey and data
+   size match the index entry.  FD_LOG_ERR on any mismatch.  Intended as
+   a post-load gate for multi-writer snapshot loading, where the on-disk
+   layout is no longer stream-ordered. */
+
+void
+fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
+                                   ulong        sample_max );
 
 int
 fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,

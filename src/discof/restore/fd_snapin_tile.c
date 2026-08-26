@@ -27,12 +27,17 @@
 #include "generated/fd_snapin_tile_seccomp.h"
 
 #include <errno.h>
+#include <unistd.h>
 
 #define NAME "snapin"
 
 #define FD_SNAPIN_ROLE_COORDINATOR  (0)
 #define FD_SNAPIN_ROLE_ACCDB_WORKER (1)
 #define FD_SNAPIN_WORKER_MAX        (FD_SNAPIN_TILE_MAX-1UL)
+
+/* Per-worker staging buffer for buffered pwrites into the worker's own
+   accdb partitions (same size as the deleted snapwr tile's buffer). */
+#define FD_SNAPIN_WRITE_BUF_SZ      (2UL<<20)
 
 /* The snapin tile is a state machine that parses and loads a full
    and optionally an incremental snapshot.  It is currently responsible
@@ -237,11 +242,53 @@ struct fd_snapin_tile {
                        more than STEM_BURST jobs (flush happens on slot
                        change, not just every 8 accounts). */
 
+  /* Coordinator: the lane data frag currently being parsed.  Jobs pin
+     (lane,seq,chunk) references into it; pending jobs are flushed when
+     the frag is fully consumed so no unpublished job outlives its
+     frag's entry into the released frontier. */
+  struct {
+    ulong         lane;
+    ulong         seq;
+    ulong         chunk;
+    uchar const * base;
+  } cur_frag;
+
+  /* Coordinator: per-lane released-seq frontier.  lane_consumed_seq is
+     bumped only when a lane frag has been fully consumed (or dropped in
+     ERROR state) — never mid-frag.  Workers may consume (and thus
+     release to the producer) lane frags up to these watermarks. */
+  ulong lane_consumed_seq[ FD_SNAPIN_IO_LANE_MAX ];
+  int   io_frontier_dirty;         /* frontier advanced since last emission */
+  ulong io_frags_since_frontier;   /* consumed frags since last emission */
+  ulong io_jobs_since_credit;      /* account jobs published since last after_credit */
+
+  /* Coordinator: in-flight slow-path (non-batch) account. */
+  struct {
+    ulong worker_idx;
+    ulong remaining;   /* data bytes still to forward as DATA refs */
+  } slow;
+
   struct {
     ulong input_lamports;
     ulong replaced_lamports;
     ulong ignored_lamports;
   } worker;
+
+  /* Worker: lane holds + write engine. */
+  ulong job_in_idx;                                /* in link carrying jobs */
+  ulong in_lane[ FD_TOPO_MAX_TILE_IN_LINKS ];      /* in_idx -> lane (ULONG_MAX for job link) */
+  ulong release[ FD_SNAPIN_IO_LANE_MAX ];          /* released frontier (ULONG_MAX = none) */
+  fd_accdb_snapshot_whead_t whead;                 /* private layer-0 write head */
+  uchar * write_buf;
+  ulong   write_buf_used;
+  ulong   flush_off;                               /* file offset of write_buf[0] */
+  struct {
+    int   active;      /* HEADER received, data still streaming */
+    int   accepted;    /* 0 = ignored duplicate: drop the data bytes */
+    ulong data_len;
+    ulong received;
+    ulong file_off;    /* allocated meta offset; data at +sizeof(disk_meta) */
+  } open_acc;
 
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
   ulong gui_config_acct_off;  /* bytes accumulated so far into the current gui_out link chunk */
@@ -312,6 +359,7 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                                    );
   if( FD_UNLIKELY( tile->kind_id!=FD_SNAPIN_ROLE_COORDINATOR ) ) {
     l = FD_LAYOUT_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    l = FD_LAYOUT_APPEND( l, 4096UL,           FD_SNAPIN_WRITE_BUF_SZ                            );
     return FD_LAYOUT_FINI( l, scratch_align() );
   }
   l = FD_LAYOUT_APPEND( l, fd_txncache_align(),           fd_txncache_footprint( tile->snapin.max_live_slots )        );
@@ -953,6 +1001,33 @@ publish_pending_job( fd_snapin_tile_t *  ctx,
   io_out_advance( ctx, worker_idx );
   ctx->pending_job_cnt[ worker_idx ] = 0UL;
   ctx->io_pub_cnt++;
+  ctx->io_jobs_since_credit++;
+}
+
+/* publish_frontier_jobs sends the per-lane released-seq frontier to
+   every worker ring.  Must only be called when no unpublished pending
+   job references a frag covered by lane_consumed_seq — guaranteed
+   because pending jobs are pinned to the in-flight frag (whose seq is
+   not yet in lane_consumed_seq) and flushed when the frag completes. */
+
+static void
+publish_frontier_jobs( fd_snapin_tile_t *  ctx,
+                       fd_stem_context_t * stem ) {
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+    fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+    job->kind       = FD_SNAPIN_IO_KIND_FRONTIER;
+    job->worker_idx = worker_idx;
+    job->generation = ctx->generation;
+    job->control    = ULONG_MAX;
+    job->cnt        = 0UL;
+    fd_memcpy( job->frontier, ctx->lane_consumed_seq, sizeof(ctx->lane_consumed_seq) );
+    fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
+                     out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+    io_out_advance( ctx, worker_idx );
+  }
+  ctx->io_frontier_dirty       = 0;
+  ctx->io_frags_since_frontier = 0UL;
 }
 
 static void
@@ -971,20 +1046,20 @@ discard_all_pending_jobs( fd_snapin_tile_t * ctx ) {
 __attribute__((always_inline)) static inline void
 append_worker_job( fd_snapin_tile_t *  ctx,
                    ulong               worker_idx,
-                   uchar const *       pubkey,
+                   ulong               ent_off,
+                   ulong               data_len,
                    ulong               chain_idx,
                    ulong               slot,
-                   ulong               lamports,
-                   ulong               data_len,
-                   int                 executable,
-                   ulong               file_offset,
                    fd_accdb_fork_id_t  fork_id,
                    fd_stem_context_t * stem ) {
   fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
   fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
   ulong cnt = ctx->pending_job_cnt[ worker_idx ];
 
-  if( FD_UNLIKELY( cnt && (job->slot!=slot || job->fork_id!=fork_id.val) ) ) {
+  if( FD_UNLIKELY( cnt && (job->slot!=slot || job->fork_id!=fork_id.val ||
+                           job->lane!=ctx->cur_frag.lane ||
+                           job->seq!=ctx->cur_frag.seq ||
+                           job->chunk!=ctx->cur_frag.chunk) ) ) {
     publish_pending_job( ctx, worker_idx, stem );
     job = fd_chunk_to_laddr( out->mem, out->chunk );
     cnt = 0UL;
@@ -998,19 +1073,135 @@ append_worker_job( fd_snapin_tile_t *  ctx,
     job->cnt        = 0UL;
     job->slot       = slot;
     job->fork_id    = fork_id.val;
+    job->lane       = ctx->cur_frag.lane;
+    job->seq        = ctx->cur_frag.seq;
+    job->chunk      = ctx->cur_frag.chunk;
   }
 
   FD_TEST( cnt<8UL );
-  fd_memcpy( job->pubkeys[ cnt ], pubkey, 32UL );
+  job->ent_off [ cnt ] = (uint)ent_off;
+  job->data_len[ cnt ] = (uint)data_len;
   fd_snapin_io_job_set_chain_idx( job, cnt, chain_idx );
-  job->lamports   [ cnt ] = lamports;
-  job->data_lens  [ cnt ] = data_len;
-  job->executables[ cnt ] = executable;
-  job->file_offsets[ cnt ] = file_offset;
   job->cnt = ++cnt;
   ctx->pending_job_cnt[ worker_idx ] = cnt;
 
   if( FD_UNLIKELY( cnt==8UL ) ) publish_pending_job( ctx, worker_idx, stem );
+}
+
+/* dispatch_account_batch: coordinator io path for a parser batch.  All
+   entries live in the current (held) frag; jobs carry frag refs and the
+   worker reads the account fields and data bytes from the frag. */
+
+static int
+dispatch_account_batch( fd_snapin_tile_t *  ctx,
+                        uchar const * const entries[],
+                        ulong               cnt,
+                        uchar const * const pubkeys[],
+                        ulong               slot,
+                        ulong const         data_lens[],
+                        fd_stem_context_t * stem ) {
+  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
+
+  ctx->metrics.total_accounts_processed += cnt;
+  ctx->metrics.total_account_batches_processed++;
+
+  ulong worker_idxs[ 8 ];
+  ulong chain_idxs [ 8 ];
+  fd_accdb_snapshot_route_batch( ctx->accdb, cnt, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
+
+  for( ulong i=1UL; i<cnt; i++ ) {
+    for( ulong j=0UL; j<i; j++ ) {
+      if( FD_LIKELY( chain_idxs[ i ]!=chain_idxs[ j ] ) ) continue;
+      if( FD_UNLIKELY( !memcmp( pubkeys[ i ], pubkeys[ j ], 32UL ) ) ) {
+        FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single parser batch (entries %lu and %lu, slot %lu)", j, i, slot ));
+        return -1;
+      }
+    }
+  }
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    append_worker_job( ctx, worker_idxs[ i ], (ulong)(entries[ i ]-ctx->cur_frag.base),
+                       data_lens[ i ], chain_idxs[ i ], slot, fork_id, stem );
+  }
+  return 0;
+}
+
+/* dispatch_account_header: coordinator io path for a slow-path account.
+   The header may straddle input frags, so its decoded fields travel by
+   value; the data bytes follow as DATA frag refs attributed FIFO by the
+   owning worker.  Flushes the worker's pending batch job first so
+   per-chain stream order is preserved in the ring. */
+
+static int
+dispatch_account_header( fd_snapin_tile_t *                  ctx,
+                         fd_ssparse_advance_result_t const * result,
+                         fd_stem_context_t *                 stem ) {
+  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
+
+  ctx->metrics.total_accounts_processed += 1UL;
+  ctx->metrics.total_account_batches_processed++;
+
+  uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
+  ulong worker_idxs[ 1 ];
+  ulong chain_idxs [ 1 ];
+  fd_accdb_snapshot_route_batch( ctx->accdb, 1UL, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
+
+  publish_pending_job( ctx, worker_idxs[ 0 ], stem );
+
+  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idxs[ 0 ] ];
+  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+  job->kind       = FD_SNAPIN_IO_KIND_HEADER;
+  job->worker_idx = worker_idxs[ 0 ];
+  job->generation = ctx->generation;
+  job->control    = ULONG_MAX;
+  job->cnt        = 1UL;
+  job->slot       = result->account_header.slot;
+  job->fork_id    = fork_id.val;
+  fd_memcpy( job->hdr.pubkey, result->account_header.pubkey, 32UL );
+  fd_memcpy( job->hdr.owner,  result->account_header.owner,  32UL );
+  job->hdr.lamports   = result->account_header.lamports;
+  job->hdr.data_len   = result->account_header.data_len;
+  job->hdr.chain_idx  = chain_idxs[ 0 ];
+  job->hdr.executable = result->account_header.executable;
+  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
+                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+  io_out_advance( ctx, worker_idxs[ 0 ] );
+  ctx->io_pub_cnt++;
+  ctx->io_jobs_since_credit++;
+
+  ctx->slow.worker_idx = worker_idxs[ 0 ];
+  ctx->slow.remaining  = result->account_header.data_len;
+  return 1;
+}
+
+/* dispatch_account_data: forward one contiguous run of the in-flight
+   slow-path account's data bytes as a frag ref. */
+
+static void
+dispatch_account_data( fd_snapin_tile_t *                  ctx,
+                       fd_ssparse_advance_result_t const * result,
+                       fd_stem_context_t *                 stem ) {
+  FD_TEST( result->account_data.data_sz<=ctx->slow.remaining );
+
+  fd_snapin_out_link_t * out = &ctx->io_out[ ctx->slow.worker_idx ];
+  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+  job->kind       = FD_SNAPIN_IO_KIND_DATA;
+  job->worker_idx = ctx->slow.worker_idx;
+  job->generation = ctx->generation;
+  job->control    = ULONG_MAX;
+  job->cnt        = 0UL;
+  job->lane       = ctx->cur_frag.lane;
+  job->seq        = ctx->cur_frag.seq;
+  job->chunk      = ctx->cur_frag.chunk;
+  job->off        = (uint)(ulong)(result->account_data.data-ctx->cur_frag.base);
+  job->sz         = (uint)result->account_data.data_sz;
+  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
+                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+  io_out_advance( ctx, ctx->slow.worker_idx );
+  ctx->io_pub_cnt++;
+  ctx->io_jobs_since_credit++;
+
+  ctx->slow.remaining -= result->account_data.data_sz;
 }
 
 static int
@@ -1022,34 +1213,11 @@ write_account_batch( fd_snapin_tile_t *  ctx,
                      ulong const         data_lens[],
                      int const           executables[],
                      fd_stem_context_t * stem ) {
+  (void)stem;
   fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
 
   ctx->metrics.total_accounts_processed += cnt;
   ctx->metrics.total_account_batches_processed++;
-
-  if( FD_UNLIKELY( ctx->io_enabled ) ) {
-    ulong worker_idxs[ 8 ];
-    ulong chain_idxs [ 8 ];
-    fd_accdb_snapshot_route_batch( ctx->accdb, cnt, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
-
-    for( ulong i=1UL; i<cnt; i++ ) {
-      for( ulong j=0UL; j<i; j++ ) {
-        if( FD_LIKELY( chain_idxs[ i ]!=chain_idxs[ j ] ) ) continue;
-        if( FD_UNLIKELY( !memcmp( pubkeys[ i ], pubkeys[ j ], 32UL ) ) ) {
-          FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single parser batch (entries %lu and %lu, slot %lu)", j, i, slot ));
-          return -1;
-        }
-      }
-    }
-
-    ulong file_offsets[ 8 ];
-    fd_accdb_snapshot_reserve_batch( ctx->accdb, cnt, data_lens, file_offsets );
-    for( ulong i=0UL; i<cnt; i++ ) {
-      append_worker_job( ctx, worker_idxs[ i ], pubkeys[ i ], chain_idxs[ i ], slot, lamports[ i ], data_lens[ i ], executables[ i ],
-                         file_offsets[ i ], fork_id, stem );
-    }
-    return 1;
-  }
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, cnt, pubkeys, slot, lamports, data_lens,
@@ -1118,6 +1286,9 @@ process_account_batch( fd_snapin_tile_t *            ctx,
     }
   }
 
+  if( FD_UNLIKELY( ctx->io_enabled ) ) {
+    return fd_int_if( dispatch_account_batch( ctx, entries, cnt, pubkeys, batch_slot, data_lens, stem )<0, -1, 0 );
+  }
   return fd_int_if( write_account_batch( ctx, cnt, pubkeys, batch_slot, lamports, data_lens, executables, stem )<0, -1, 0 );
 }
 
@@ -1125,12 +1296,17 @@ static int
 process_account_header( fd_snapin_tile_t *            ctx,
                         fd_ssparse_advance_result_t * result,
                         fd_stem_context_t *           stem ) {
-  uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
-  ulong lamports   [ 1 ] = { result->account_header.lamports   };
-  ulong data_lens  [ 1 ] = { result->account_header.data_len  };
-  int   executables[ 1 ] = { result->account_header.executable };
-  int account = write_account_batch( ctx, 1UL, pubkeys, result->account_header.slot,
-                                     lamports, data_lens, executables, stem );
+  int account;
+  if( FD_UNLIKELY( ctx->io_enabled ) ) {
+    account = dispatch_account_header( ctx, result, stem );
+  } else {
+    uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
+    ulong lamports   [ 1 ] = { result->account_header.lamports   };
+    ulong data_lens  [ 1 ] = { result->account_header.data_len  };
+    int   executables[ 1 ] = { result->account_header.executable };
+    account = write_account_batch( ctx, 1UL, pubkeys, result->account_header.slot,
+                                   lamports, data_lens, executables, stem );
+  }
   if( FD_UNLIKELY( account<0 ) ) return -1;
 
   /* Snoop SlotHistory sysvar.  Streaming path: arm the capture window
@@ -1408,6 +1584,10 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
       case FD_SSPARSE_ADVANCE_ACCOUNT_DATA:
         process_account_data( ctx, result );
 
+        if( FD_UNLIKELY( ctx->io_enabled && ctx->slow.remaining ) ) {
+          dispatch_account_data( ctx, result, stem );
+        }
+
         /* Account data may span multiple input chunks (when an account
            straddles a decompressed chunk boundary), so we copy each
            piece into the gui_out dcache and only publish once the full
@@ -1461,16 +1641,24 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
     if( FD_LIKELY( ctx->full ) ) ctx->metrics.full_bytes_read        += result->bytes_consumed;
     else                         ctx->metrics.incremental_bytes_read += result->bytes_consumed;
 
-    /* An account batch flushes at most 8 jobs, so stopping 8 short of
-       STEM_BURST guarantees this callback never exceeds its credit
-       allotment.  The unconsumed tail of the frag is reprocessed. */
-    if( FD_UNLIKELY( ctx->io_pub_cnt>=FD_SNAPIN_IO_BURST-8UL ) ) early_exit = 1;
+    /* An account batch flushes at most 8 jobs, and the callback tail
+       may add up to worker_cnt frag-end flushes plus worker_cnt
+       frontier jobs (and an idle after_credit in the same stem
+       iteration up to worker_cnt more), so stop 24 short of STEM_BURST
+       to guarantee this callback never exceeds its credit allotment.
+       The unconsumed tail of the frag is reprocessed. */
+    if( FD_UNLIKELY( ctx->io_pub_cnt>=FD_SNAPIN_IO_BURST-24UL ) ) early_exit = 1;
 
     if( FD_UNLIKELY( early_exit ) ) break;
   }
 
   int reprocess_frag = ctx->in[ in_idx ].pos<sz;
-  if( FD_LIKELY( !reprocess_frag ) ) ctx->in[ in_idx ].pos = 0UL;
+  if( FD_LIKELY( !reprocess_frag ) ) {
+    ctx->in[ in_idx ].pos = 0UL;
+    /* The frag is fully consumed and about to enter the released
+       frontier: no unpublished job may keep referencing it. */
+    if( FD_UNLIKELY( ctx->io_enabled ) ) publish_all_pending_jobs( ctx, stem );
+  }
   return reprocess_frag;
 }
 
@@ -1507,11 +1695,17 @@ publish_worker_control( fd_snapin_tile_t *  ctx,
     job->cnt        = 0UL;
     job->slot       = 0UL;
     job->fork_id    = ULONG_MAX;
+    /* Controls also carry the frontier: post-barrier this releases the
+       lanes' preceding data frags (the control copies themselves enter
+       the frontier once consumed, released by the next FRONTIER). */
+    fd_memcpy( job->frontier, ctx->lane_consumed_seq, sizeof(ctx->lane_consumed_seq) );
     fd_stem_publish( stem, out->idx, control,
                      out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
     io_out_advance( ctx, worker_idx );
   }
-  ctx->pending_worker_control = control;
+  ctx->io_frontier_dirty       = 0;
+  ctx->io_frags_since_frontier = 0UL;
+  ctx->pending_worker_control  = control;
 }
 
 static void
@@ -1548,6 +1742,75 @@ worker_publish_ack( fd_snapin_tile_t *  ctx,
   ack_out_advance( ctx );
 }
 
+/* Worker staging buffer: buffered pwrites into the worker's own accdb
+   partitions (cloned from the deleted snapwr tile's buffer_write/flush,
+   with an explicit flush_off because per-worker offsets are only
+   sequential within a partition). */
+
+static void
+worker_buffer_flush( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( !ctx->write_buf_used ) ) return;
+
+  ulong sz  = ctx->write_buf_used;
+  ulong off = ctx->flush_off;
+  ulong bytes_written = 0UL;
+  while( bytes_written<sz ) {
+    long res = pwrite( FD_ACCDB_FD_RW, ctx->write_buf+bytes_written, sz-bytes_written, (long)(off+bytes_written) );
+    if( FD_UNLIKELY( -1L==res ) ) {
+      if( FD_LIKELY( errno==EINTR ) ) continue;
+      FD_LOG_ERR(( "error writing to disk (%d-%s)", errno, fd_io_strerror( errno ) ));
+    }
+    bytes_written += (ulong)res;
+  }
+  ctx->flush_off      += sz;
+  ctx->write_buf_used  = 0UL;
+}
+
+static void
+worker_buffer_write( fd_snapin_tile_t * ctx,
+                     ulong              file_off,
+                     uchar const *      data,
+                     ulong              sz ) {
+  /* Force a flush whenever the next offset is not the natural append
+     point (first write, or the allocator rotated to a new partition). */
+  if( FD_UNLIKELY( file_off!=ctx->flush_off+ctx->write_buf_used ) ) {
+    worker_buffer_flush( ctx );
+    ctx->flush_off = file_off;
+  }
+  while( sz ) {
+    ulong avail = FD_SNAPIN_WRITE_BUF_SZ - ctx->write_buf_used;
+    ulong n     = fd_ulong_min( sz, avail );
+    fd_memcpy( ctx->write_buf + ctx->write_buf_used, data, n );
+    ctx->write_buf_used += n;
+    data += n;
+    sz   -= n;
+    if( FD_UNLIKELY( ctx->write_buf_used==FD_SNAPIN_WRITE_BUF_SZ ) ) worker_buffer_flush( ctx );
+  }
+}
+
+static void
+worker_stage_meta( fd_snapin_tile_t * ctx,
+                   ulong              file_off,
+                   uchar const *      pubkey,
+                   uchar const *      owner,
+                   ulong              data_len ) {
+  fd_accdb_disk_meta_t meta;
+  fd_memcpy( meta.pubkey, pubkey, 32UL );
+  meta.size       = (uint)data_len;
+  meta.generation = 0U;
+  fd_memcpy( meta.owner, owner, 32UL );
+  worker_buffer_write( ctx, file_off, meta.b, sizeof(fd_accdb_disk_meta_t) );
+}
+
+static void
+worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
+  ctx->write_buf_used      = 0UL;
+  ctx->flush_off           = 0UL;
+  ctx->whead.val           = 0UL;
+  ctx->whead.has_partition = 0;
+  fd_memset( &ctx->open_acc, 0, sizeof(ctx->open_acc) );
+}
+
 static void
 worker_fail( fd_snapin_tile_t *  ctx,
              fd_stem_context_t * stem,
@@ -1555,39 +1818,101 @@ worker_fail( fd_snapin_tile_t *  ctx,
              int                 err ) {
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
   FD_LOG_WARNING(( "snapshot accdb worker failed (%d-%s)", err, fd_io_strerror( err ) ));
+  ctx->write_buf_used = 0UL; /* drop staged bytes; whead reset happens on CTRL FAIL */
   fd_accdb_snapshot_writer_end( ctx->accdb );
   ctx->state = FD_SNAPSHOT_STATE_ERROR;
   worker_publish_ack( ctx, stem, generation, FD_SNAPSHOT_MSG_CTRL_ERROR, err );
 }
 
+/* worker_apply_frontier advances the per-lane released watermarks
+   (monotone: frontiers can arrive slightly stale relative to a CTRL's
+   copy).  Everything the worker has deferred at or below the watermark
+   becomes consumable, which returns the lanes' flow-control credits to
+   snapdc.  Ring order guarantees every job referencing a released frag
+   was already processed. */
+
 static void
-worker_handle_batch( fd_snapin_tile_t *       ctx,
+worker_apply_frontier( fd_snapin_tile_t *         ctx,
+                       fd_snapin_io_job_t const * job ) {
+  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) {
+    if( FD_LIKELY( fd_seq_gt( job->frontier[ lane ], ctx->release[ lane ] ) ) ) {
+      ctx->release[ lane ] = job->frontier[ lane ];
+    }
+  }
+}
+
+/* worker_resolve_ref validates a (lane,seq,chunk,off,sz) frag reference
+   and returns its local address, or NULL on a protocol violation.  The
+   ref must be newer than everything this worker has released: the
+   deferred fseq on that lane is what keeps the producer from recycling
+   the bytes. */
+
+static uchar const *
+worker_resolve_ref( fd_snapin_tile_t *         ctx,
+                    fd_snapin_io_job_t const * job,
+                    ulong                      off,
+                    ulong                      sz ) {
+  ulong lane = job->lane;
+  if( FD_UNLIKELY( lane>=ctx->lane_cnt ) ) return NULL;
+  if( FD_UNLIKELY( job->chunk<ctx->in[ lane ].chunk0 || job->chunk>ctx->in[ lane ].wmark ) ) return NULL;
+  if( FD_UNLIKELY( off>ctx->in[ lane ].mtu || sz>ctx->in[ lane ].mtu-off ) ) return NULL;
+  if( FD_UNLIKELY( !fd_seq_gt( job->seq, ctx->release[ lane ] ) ) ) return NULL;
+  return (uchar const *)fd_chunk_to_laddr_const( ctx->in[ lane ].wksp, job->chunk )+off;
+}
+
+static void
+worker_handle_batch( fd_snapin_tile_t *         ctx,
                      fd_snapin_io_job_t const * job,
-                     fd_stem_context_t *      stem ) {
+                     fd_stem_context_t *        stem ) {
   if( FD_UNLIKELY( job->generation!=ctx->generation ||
                    ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
-                   !job->cnt || job->cnt>8UL || job->fork_id>USHORT_MAX ) ) {
+                   !job->cnt || job->cnt>8UL || job->fork_id!=USHORT_MAX ||
+                   (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
     worker_fail( ctx, stem, job->generation, EPROTO );
     return;
   }
 
-  uchar const * pubkeys  [ 8 ];
+  uchar const * entries   [ 8 ];
+  uchar const * pubkeys   [ 8 ];
   ulong         chain_idxs[ 8 ];
+  ulong         lamports  [ 8 ];
+  ulong         data_lens [ 8 ];
+  int           executables[ 8 ];
   for( ulong i=0UL; i<job->cnt; i++ ) {
-    pubkeys  [ i ] = job->pubkeys[ i ];
-    chain_idxs[ i ] = fd_snapin_io_job_chain_idx( job, i );
+    ulong data_len = (ulong)job->data_len[ i ];
+    uchar const * e = worker_resolve_ref( ctx, job, (ulong)job->ent_off[ i ], FD_SNAPIN_IO_ENT_DATA_OFF+data_len );
+    if( FD_UNLIKELY( !e ) ) {
+      worker_fail( ctx, stem, job->generation, EPROTO );
+      return;
+    }
+    entries    [ i ] = e;
+    pubkeys    [ i ] = e+FD_SNAPIN_IO_ENT_PUBKEY_OFF;
+    chain_idxs [ i ] = fd_snapin_io_job_chain_idx( job, i );
+    lamports   [ i ] = fd_ulong_load_8_fast( e+FD_SNAPIN_IO_ENT_LAMPORTS_OFF );
+    data_lens  [ i ] = data_len;
+    executables[ i ] = e[ FD_SNAPIN_IO_ENT_EXEC_OFF ];
   }
+  /* Re-issue the chain-head prefetch at insertion even though the
+     coordinator precomputed the indices (worker-local latency hiding). */
   fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, job->cnt, chain_idxs );
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_fork_id_t fork_id = { .val = (ushort)job->fork_id };
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_preallocated_prehashed( ctx->accdb, fork_id, job->cnt, pubkeys,
-                                                                            chain_idxs, job->slot, job->lamports,
-                                                                            job->data_lens, job->executables, job->file_offsets,
-                                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
-                                                                            &replaced_lamports, &ignored_lamports ) ) ) {
+  ulong file_offsets[ 8 ];
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, job->cnt, pubkeys, chain_idxs, job->slot,
+                                                            lamports, data_lens, executables, &ctx->whead, file_offsets,
+                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
+                                                            &replaced_lamports, &ignored_lamports ) ) ) {
     worker_fail( ctx, stem, job->generation, EINVAL );
     return;
+  }
+
+  for( ulong i=0UL; i<job->cnt; i++ ) {
+    if( FD_UNLIKELY( file_offsets[ i ]==ULONG_MAX ) ) continue; /* ignored dup burns no space */
+    worker_stage_meta( ctx, file_offsets[ i ], pubkeys[ i ], entries[ i ]+FD_SNAPIN_IO_ENT_OWNER_OFF, data_lens[ i ] );
+    if( FD_LIKELY( data_lens[ i ] ) ) {
+      worker_buffer_write( ctx, file_offsets[ i ]+sizeof(fd_accdb_disk_meta_t),
+                           entries[ i ]+FD_SNAPIN_IO_ENT_DATA_OFF, data_lens[ i ] );
+    }
   }
 
   ctx->metrics.accounts_ignored  += accounts_ignored;
@@ -1596,10 +1921,85 @@ worker_handle_batch( fd_snapin_tile_t *       ctx,
   ctx->metrics.total_accounts_processed += job->cnt;
   ctx->metrics.total_account_batches_processed++;
   for( ulong i=0UL; i<job->cnt; i++ ) {
-    ctx->worker.input_lamports = fd_ulong_sat_add( ctx->worker.input_lamports, job->lamports[ i ] );
+    ctx->worker.input_lamports = fd_ulong_sat_add( ctx->worker.input_lamports, lamports[ i ] );
   }
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
+}
+
+static void
+worker_handle_header( fd_snapin_tile_t *         ctx,
+                      fd_snapin_io_job_t const * job,
+                      fd_stem_context_t *        stem ) {
+  if( FD_UNLIKELY( job->generation!=ctx->generation ||
+                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
+                   job->fork_id!=USHORT_MAX ||
+                   (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  uchar const * pubkeys   [ 1 ] = { job->hdr.pubkey     };
+  ulong         chain_idxs[ 1 ] = { job->hdr.chain_idx  };
+  ulong         lamports  [ 1 ] = { job->hdr.lamports   };
+  ulong         data_lens [ 1 ] = { job->hdr.data_len   };
+  int           executables[ 1 ] = { job->hdr.executable };
+  fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, 1UL, chain_idxs );
+
+  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
+  ulong file_offsets[ 1 ];
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, 1UL, pubkeys, chain_idxs, job->slot,
+                                                            lamports, data_lens, executables, &ctx->whead, file_offsets,
+                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
+                                                            &replaced_lamports, &ignored_lamports ) ) ) {
+    worker_fail( ctx, stem, job->generation, EINVAL );
+    return;
+  }
+
+  ctx->open_acc.active   = 1;
+  ctx->open_acc.accepted = file_offsets[ 0 ]!=ULONG_MAX;
+  ctx->open_acc.data_len = job->hdr.data_len;
+  ctx->open_acc.received = 0UL;
+  ctx->open_acc.file_off = file_offsets[ 0 ];
+  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
+    worker_stage_meta( ctx, file_offsets[ 0 ], job->hdr.pubkey, job->hdr.owner, job->hdr.data_len );
+  }
+  if( FD_UNLIKELY( !job->hdr.data_len ) ) ctx->open_acc.active = 0;
+
+  ctx->metrics.accounts_ignored  += accounts_ignored;
+  ctx->metrics.accounts_replaced += accounts_replaced;
+  ctx->metrics.accounts_loaded   += accounts_loaded;
+  ctx->metrics.total_accounts_processed += 1UL;
+  ctx->metrics.total_account_batches_processed++;
+  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    job->hdr.lamports );
+  ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
+  ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
+}
+
+static void
+worker_handle_data( fd_snapin_tile_t *         ctx,
+                    fd_snapin_io_job_t const * job,
+                    fd_stem_context_t *        stem ) {
+  ulong sz = (ulong)job->sz;
+  if( FD_UNLIKELY( job->generation!=ctx->generation ||
+                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
+                   !ctx->open_acc.active ||
+                   sz>ctx->open_acc.data_len-ctx->open_acc.received ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  uchar const * data = worker_resolve_ref( ctx, job, (ulong)job->off, sz );
+  if( FD_UNLIKELY( !data ) ) {
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
+    worker_buffer_write( ctx, ctx->open_acc.file_off+sizeof(fd_accdb_disk_meta_t)+ctx->open_acc.received, data, sz );
+  }
+  ctx->open_acc.received += sz;
+  if( FD_LIKELY( ctx->open_acc.received==ctx->open_acc.data_len ) ) ctx->open_acc.active = 0;
 }
 
 static void
@@ -1607,8 +2007,20 @@ worker_handle_control( fd_snapin_tile_t *       ctx,
                        fd_snapin_io_job_t const * job,
                        fd_stem_context_t *      stem ) {
   ulong control = job->control;
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_FULL ||
-                   control==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) {
+
+  /* Controls carry the frontier: apply it first so the lanes' frags
+     preceding this control are releasable regardless of what the
+     control itself does. */
+  worker_apply_frontier( ctx, job );
+
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) {
+    /* Explicit-offset workers cannot support incremental recovery; the
+       coordinator hard-errors before publishing this. */
+    worker_fail( ctx, stem, job->generation, EPROTO );
+    return;
+  }
+
+  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_FULL ) ) {
     if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_IDLE ) ) {
       worker_fail( ctx, stem, job->generation, EPROTO );
       return;
@@ -1617,6 +2029,7 @@ worker_handle_control( fd_snapin_tile_t *       ctx,
     ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
     fd_accdb_snapshot_writer_begin( ctx->accdb );
     worker_reset_attempt( ctx );
+    worker_reset_write_engine( ctx );
     worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
     return;
   }
@@ -1627,6 +2040,10 @@ worker_handle_control( fd_snapin_tile_t *       ctx,
   }
 
   if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) {
+    /* Drop staged bytes and forget the private write head: the
+       partitions themselves are released by the coordinator's
+       fd_accdb_reset, which it only runs after every worker acked. */
+    worker_reset_write_engine( ctx );
     fd_accdb_snapshot_writer_end( ctx->accdb );
     ctx->state = FD_SNAPSHOT_STATE_IDLE;
     worker_reset_attempt( ctx );
@@ -1637,10 +2054,17 @@ worker_handle_control( fd_snapin_tile_t *       ctx,
 
   switch( control ) {
     case FD_SNAPSHOT_MSG_CTRL_FINI:
-      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
+                       (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
         worker_fail( ctx, stem, job->generation, EPROTO );
         return;
       }
+      /* Make every staged byte durable and hand off the final
+         partition (stamps write_offset, books the tail slack) before
+         acking: the coordinator's DONE-side readback and load_end run
+         only after all FINI acks. */
+      worker_buffer_flush( ctx );
+      fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
       fd_accdb_snapshot_writer_end( ctx->accdb );
       ctx->state = FD_SNAPSHOT_STATE_FINISHING;
       break;
@@ -1681,9 +2105,14 @@ worker_handle_frag( fd_snapin_tile_t *  ctx,
     worker_fail( ctx, stem, job->generation, EPROTO );
     return;
   }
-  if( FD_LIKELY( job->kind==FD_SNAPIN_IO_KIND_BATCH ) ) worker_handle_batch( ctx, job, stem );
-  else if( FD_LIKELY( job->kind==FD_SNAPIN_IO_KIND_CTRL ) ) worker_handle_control( ctx, job, stem );
-  else worker_fail( ctx, stem, job->generation, EPROTO );
+  switch( job->kind ) {
+    case FD_SNAPIN_IO_KIND_BATCH:    worker_handle_batch( ctx, job, stem );   break;
+    case FD_SNAPIN_IO_KIND_HEADER:   worker_handle_header( ctx, job, stem );  break;
+    case FD_SNAPIN_IO_KIND_DATA:     worker_handle_data( ctx, job, stem );    break;
+    case FD_SNAPIN_IO_KIND_FRONTIER: worker_apply_frontier( ctx, job );       break;
+    case FD_SNAPIN_IO_KIND_CTRL:     worker_handle_control( ctx, job, stem ); break;
+    default:                         worker_fail( ctx, stem, job->generation, EPROTO ); break;
+  }
 }
 
 /* Finish reverting a failed attempt only after every accdb worker has
@@ -1785,7 +2214,10 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_INIT_FULL:
     case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
-      if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR && ctx->worker_cnt>1UL ) ) {
+      if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR && ctx->io_enabled ) ) {
+        /* Even one explicit-offset worker changes the on-disk layout,
+           which makes save_whead/revert_whead (whead[0]-based) recovery
+           meaningless.  Hard-error for ALL worker counts. */
         FD_LOG_WARNING(( "incremental snapshot loading with %lu accdb workers is not implemented", ctx->worker_cnt ));
         transition_malformed( ctx, stem );
         forward_msg = 0;
@@ -1793,6 +2225,8 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
       if( FD_UNLIKELY( ctx->io_enabled ) ) ctx->generation++;
       discard_all_pending_jobs( ctx );
+      ctx->slow.worker_idx = 0UL;
+      ctx->slow.remaining  = 0UL;
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->expected_frame = 0UL;
@@ -1919,7 +2353,9 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
 
       ctx->recovery.capitalization = ctx->capitalization;
-      fd_accdb_snapshot_save_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
+      /* save_whead is whead[0]-based and meaningless under explicit
+         per-worker offsets; INIT_INCR hard-errors in io mode anyway. */
+      if( FD_LIKELY( !ctx->io_enabled ) ) fd_accdb_snapshot_save_whead( ctx->accdb, &ctx->recovery.accdb_metadata );
       ctx->recovery.feature_snoop = *ctx->feature_snoop;
 
       /* Backup metric counters */
@@ -1959,6 +2395,11 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
 
       fd_accdb_snapshot_load_end( ctx->accdb );
+
+      /* Multi-writer layout is not stream-ordered: gate on a sampled
+         index->file readback (workers flushed + closed their partitions
+         before acking FINI, so the bytes are visible here). */
+      if( FD_UNLIKELY( ctx->io_enabled ) ) fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL );
 
       fd_feature_snoop_finalize( &ctx->bank->f.features, ctx->bank_slot, &ctx->epoch_schedule, ctx->feature_snoop );
 
@@ -2020,12 +2461,34 @@ ack_worker_idx( fd_snapin_tile_t const * ctx,
   return ULONG_MAX;
 }
 
+/* coordinator_mark_lane_consumed: a lane frag is done (fully consumed
+   or dropped) — it may enter the released frontier.  Only ever called
+   at frag boundaries; pending jobs pinned to the frag were flushed
+   before this. */
+
+static inline void
+coordinator_mark_lane_consumed( fd_snapin_tile_t * ctx,
+                                ulong              lane,
+                                ulong              seq ) {
+  ctx->lane_consumed_seq[ lane ] = seq;
+  ctx->io_frontier_dirty = 1;
+  ctx->io_frags_since_frontier++;
+}
+
 static inline int
 before_frag( fd_snapin_tile_t * ctx,
              ulong              in_idx,
-             ulong              seq    FD_PARAM_UNUSED,
+             ulong              seq,
              ulong              sig ) {
-  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) return 0;
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    /* Jobs are always processed.  Lane frags are consumed (without
+       touching the bytes) once released by the coordinator's frontier,
+       and deferred otherwise: the deferred fseq is what holds the
+       producer off any bytes still referenced by in-flight jobs. */
+    if( FD_LIKELY( in_idx==ctx->job_in_idx ) ) return 0;
+    ulong lane = ctx->in_lane[ in_idx ];
+    return fd_seq_gt( seq, ctx->release[ lane ] ) ? -1 : 1;
+  }
 
   if( FD_UNLIKELY( ctx->io_enabled && ack_worker_idx( ctx, in_idx )!=ULONG_MAX ) ) return 0;
 
@@ -2036,7 +2499,14 @@ before_frag( fd_snapin_tile_t * ctx,
   /* If we're currently in ERROR state we should only process FAIL
      control frags */
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
-    return sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
+    int drop = sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
+    /* Dropped lane frags still advance the frontier (no job will ever
+       reference them) so idle workers keep returning lane credits and
+       the FAIL control can reach us. */
+    if( FD_UNLIKELY( drop && ctx->io_enabled && in_idx<ctx->lane_cnt ) ) {
+      coordinator_mark_lane_consumed( ctx, in_idx, seq );
+    }
+    return drop;
   }
 
   if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
@@ -2062,9 +2532,17 @@ static inline int
 handle_lane_data_frag( fd_snapin_tile_t *  ctx,
                        fd_stem_context_t * stem,
                        ulong               in_idx,
+                       ulong               seq,
                        ulong               chunk,
                        ulong               sz,
                        ulong               ctl ) {
+  /* Pin the frag for job refs.  Valid across partial-consumption
+     reprocessing: the same frag re-enters with the same identity. */
+  ctx->cur_frag.lane  = in_idx;
+  ctx->cur_frag.seq   = seq;
+  ctx->cur_frag.chunk = chunk;
+  ctx->cur_frag.base  = (uchar const *)fd_chunk_to_laddr_const( ctx->in[ in_idx ].wksp, chunk );
+
   /* EOM marks the end of a frame */
   int eom = !!fd_frag_meta_ctl_eom( ctl );
 
@@ -2118,7 +2596,7 @@ handle_control_barrier( fd_snapin_tile_t *  ctx,
 static inline int
 returnable_frag( fd_snapin_tile_t *  ctx,
                  ulong               in_idx,
-                 ulong               seq    FD_PARAM_UNUSED,
+                 ulong               seq,
                  ulong               sig,
                  ulong               chunk,
                  ulong               sz,
@@ -2128,7 +2606,7 @@ returnable_frag( fd_snapin_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
     FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
-    FD_TEST( in_idx==0UL );
+    FD_TEST( in_idx==ctx->job_in_idx );
     worker_handle_frag( ctx, chunk, sz, stem );
     return 0;
   }
@@ -2141,10 +2619,45 @@ returnable_frag( fd_snapin_tile_t *  ctx,
 
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
 
-  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_lane_data_frag( ctx, stem, in_idx, chunk, sz, ctl );
+  int reprocess = 0;
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) reprocess = handle_lane_data_frag( ctx, stem, in_idx, seq, chunk, sz, ctl );
   else                                           handle_control_barrier( ctx, stem, in_idx, sig, chunk, sz );
 
-  return 0;
+  /* Frontier bookkeeping: any lane frag we are done with (data or
+     control copy; pending refs into it were flushed) may be released to
+     the workers.  Emit the frontier every
+     FD_SNAPIN_IO_FRONTIER_INTERVAL consumed frags; the idle
+     after_credit path covers job-less stretches (manifest, errors). */
+  if( FD_UNLIKELY( ctx->io_enabled && !reprocess && in_idx<ctx->lane_cnt ) ) {
+    coordinator_mark_lane_consumed( ctx, in_idx, seq );
+    if( FD_UNLIKELY( ctx->io_frags_since_frontier>=FD_SNAPIN_IO_FRONTIER_INTERVAL &&
+                     ctx->pending_worker_control==ULONG_MAX ) ) {
+      publish_frontier_jobs( ctx, stem );
+    }
+  }
+
+  return reprocess;
+}
+
+static inline void
+after_credit( fd_snapin_tile_t *  ctx,
+              fd_stem_context_t * stem,
+              int *               opt_poll_in FD_PARAM_UNUSED,
+              int *               charge_busy ) {
+  if( FD_LIKELY( is_accdb_worker( ctx ) || !ctx->io_enabled ) ) return;
+
+  /* Idle-deadlock fix: when the coordinator consumed lane frags without
+     producing jobs (manifest / status cache / ERROR drops), the workers
+     never see a job carrying the advanced frontier, keep deferring the
+     lanes, and snapdc stalls on their fseqs.  Emit the frontier from
+     here whenever it advanced but no account job went out. */
+  int idle = !ctx->io_jobs_since_credit;
+  ctx->io_jobs_since_credit = 0UL;
+  if( FD_UNLIKELY( ctx->io_frontier_dirty && idle &&
+                   ctx->pending_worker_control==ULONG_MAX ) ) {
+    publish_frontier_jobs( ctx, stem );
+    *charge_busy = 1;
+  }
 }
 
 static ulong
@@ -2229,24 +2742,53 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
 
   if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
-    void * _accdb = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    void * _accdb     = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    void * _write_buf = FD_SCRATCH_ALLOC_APPEND( l, 4096UL,           FD_SNAPIN_WRITE_BUF_SZ                            );
     void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
     fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
     FD_TEST( accdb_shmem );
     ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
     FD_TEST( ctx->accdb );
 
-    if( FD_UNLIKELY( tile->in_cnt!=1UL ) ) {
-      FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu ins, expected one snapin_io link", tile->kind_id, tile->in_cnt ));
+    ctx->write_buf = _write_buf;
+    worker_reset_write_engine( ctx );
+
+    /* One snapin_io job ring, plus every snapdc_in lane held (reliably)
+       for frag refs. */
+    ctx->job_in_idx = ULONG_MAX;
+    for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+      fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
+      fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
+      if( FD_UNLIKELY( !strcmp( in_link->name, "snapin_io" ) ) ) {
+        FD_TEST( in_link->kind_id==ctx->worker_idx && ctx->job_in_idx==ULONG_MAX );
+        ctx->job_in_idx        = i;
+        ctx->in_lane[ i ]      = ULONG_MAX;
+        ctx->io_in[ 0 ].wksp   = in_wksp->wksp;
+        ctx->io_in[ 0 ].chunk0 = fd_dcache_compact_chunk0( ctx->io_in[ 0 ].wksp, in_link->dcache );
+        ctx->io_in[ 0 ].wmark  = fd_dcache_compact_wmark( ctx->io_in[ 0 ].wksp, in_link->dcache, in_link->mtu );
+        ctx->io_in[ 0 ].mtu    = in_link->mtu;
+        FD_TEST( ctx->io_in[ 0 ].mtu==FD_SNAPIN_IO_JOB_SLOT_SZ );
+        continue;
+      }
+      FD_TEST( !strcmp( in_link->name, "snapdc_in" ) );
+      ulong lane = in_link->kind_id;
+      FD_TEST( lane<FD_SNAPIN_IO_LANE_MAX && !ctx->in[ lane ].wksp );
+      ctx->in_lane[ i ]      = lane;
+      ctx->in[ lane ].wksp   = in_wksp->wksp;
+      ctx->in[ lane ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ lane ].wksp, in_link->dcache );
+      ctx->in[ lane ].wmark  = fd_dcache_compact_wmark( ctx->in[ lane ].wksp, in_link->dcache, in_link->mtu );
+      ctx->in[ lane ].mtu    = in_link->mtu;
+      ctx->in[ lane ].pos    = 0UL;
+      ctx->lane_cnt++;
     }
-    fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ 0 ] ];
-    FD_TEST( !strcmp( in_link->name, "snapin_io" ) && in_link->kind_id==ctx->worker_idx );
-    fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
-    ctx->io_in[ 0 ].wksp   = in_wksp->wksp;
-    ctx->io_in[ 0 ].chunk0 = fd_dcache_compact_chunk0( ctx->io_in[ 0 ].wksp, in_link->dcache );
-    ctx->io_in[ 0 ].wmark  = fd_dcache_compact_wmark( ctx->io_in[ 0 ].wksp, in_link->dcache, in_link->mtu );
-    ctx->io_in[ 0 ].mtu    = in_link->mtu;
-    FD_TEST( ctx->io_in[ 0 ].mtu==FD_SNAPIN_IO_JOB_SLOT_SZ );
+    if( FD_UNLIKELY( ctx->job_in_idx==ULONG_MAX || !ctx->lane_cnt || tile->in_cnt!=ctx->lane_cnt+1UL ) ) {
+      FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu ins, expected one snapin_io link plus 1..%lu snapdc_in lanes",
+                   tile->kind_id, tile->in_cnt, FD_SNAPIN_IO_LANE_MAX ));
+    }
+    for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) {
+      FD_TEST( ctx->in[ lane ].wksp );
+      ctx->release[ lane ] = ULONG_MAX; /* nothing released yet */
+    }
 
     ctx->ack_out = out1( topo, tile, "snapio_ack", ctx->worker_idx );
     if( FD_UNLIKELY( ctx->ack_out.idx==ULONG_MAX || ctx->ack_out.mtu!=FD_SNAPIN_IO_ACK_SLOT_SZ ) ) {
@@ -2344,9 +2886,17 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( ctx->io_enabled ) ) {
     for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) FD_TEST( ctx->ack_in_idx[ worker_idx ]!=ULONG_MAX );
     FD_TEST( tile->in_cnt==ctx->lane_cnt+ctx->worker_cnt );
+    FD_TEST( ctx->lane_cnt<=FD_SNAPIN_IO_LANE_MAX );
   } else {
     FD_TEST( tile->in_cnt==ctx->lane_cnt );
   }
+
+  for( ulong lane=0UL; lane<FD_SNAPIN_IO_LANE_MAX; lane++ ) ctx->lane_consumed_seq[ lane ] = ULONG_MAX;
+  ctx->io_frontier_dirty       = 0;
+  ctx->io_frags_since_frontier = 0UL;
+  ctx->io_jobs_since_credit    = 0UL;
+  ctx->slow.worker_idx         = 0UL;
+  ctx->slow.remaining          = 0UL;
 
   ctx->gui_config_acct_sz  = 0UL;
   ctx->gui_config_acct_off = 0UL;
@@ -2384,6 +2934,7 @@ unprivileged_init( fd_topo_t const *      topo,
 #define STEM_CALLBACK_METRICS_WRITE   metrics_write
 #define STEM_CALLBACK_BEFORE_FRAG     before_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG returnable_frag
+#define STEM_CALLBACK_AFTER_CREDIT    after_credit
 
 #include "../../disco/stem/fd_stem.c"
 

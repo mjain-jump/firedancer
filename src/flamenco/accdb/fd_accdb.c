@@ -600,6 +600,70 @@ fd_accdb_snapshot_load_end( fd_accdb_t * accdb ) {
   spin_lock_release( &accdb->shmem->partition_lock );
 }
 
+/* Reserve sz bytes at a snapshot writer's private write head, modeled
+   on allocate_next_compaction_write: the head itself is joiner-private
+   (no atomics), only partition rotation takes the shared partition
+   lock.  change_partition handles pool acquisition, Cold tagging while
+   snapshot_loading is set, fallocate, and the partition_max CAS. */
+
+ulong
+fd_accdb_snapshot_worker_alloc( fd_accdb_t *                accdb,
+                                ulong                       sz,
+                                fd_accdb_snapshot_whead_t * whead ) {
+  FD_TEST( sz<=accdb->shmem->partition_sz );
+
+  accdb_offset_t offset = { .val = whead->val };
+  if( FD_UNLIKELY( !whead->has_partition ||
+                   packed_partition_offset( &offset )+sz>accdb->shmem->partition_sz ) ) {
+    accdb_offset_t next;
+    spin_lock_acquire( &accdb->shmem->partition_lock );
+    change_partition( accdb, &offset, &next, &whead->has_partition, 0 );
+    spin_lock_release( &accdb->shmem->partition_lock );
+    offset = next;
+  }
+  whead->val = offset.val+sz;
+
+  /* Batch write metrics in the joiner-local write_stats (flushed by
+     fd_accdb_flush_metrics, which is atomic-safe). */
+  ulong partition_idx = packed_partition_idx( &offset );
+  if( FD_LIKELY( accdb->write_stats.num_ops ) &&
+      FD_UNLIKELY( accdb->write_stats.partition_idx!=partition_idx ) ) {
+    fd_accdb_flush_metrics( accdb );
+  }
+  accdb->write_stats.partition_idx  = partition_idx;
+  accdb->write_stats.bytes         += sz;
+  accdb->write_stats.num_ops++;
+
+  return packed_partition_file_offset( &offset, accdb->shmem->partition_sz );
+}
+
+void
+fd_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
+                                fd_accdb_snapshot_whead_t * whead ) {
+  fd_accdb_flush_metrics( accdb );
+  if( FD_UNLIKELY( !whead->has_partition ) ) return;
+
+  accdb_offset_t offset = { .val = whead->val };
+  ulong partition_idx = packed_partition_idx( &offset );
+  ulong write_offset  = packed_partition_offset( &offset );
+  ulong tail_sz       = accdb->shmem->partition_sz-write_offset;
+
+  /* Mirrors the closing half of change_partition: materialize the dense
+     record log's end for background_compact's walk and book the dead
+     tail slack.  Compaction enqueue is deliberately skipped —
+     fd_accdb_snapshot_load_end's sweep re-checks every partition. */
+  spin_lock_acquire( &accdb->shmem->partition_lock );
+  fd_accdb_partition_t * partition = partition_pool_ele( accdb->partition_pool, partition_idx );
+  partition->write_offset = write_offset;
+  FD_ATOMIC_FETCH_AND_ADD( &partition->bytes_freed, tail_sz );
+  FD_VOLATILE( partition->filled_ticks ) = (long)fd_tickcount();
+  FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, tail_sz );
+  spin_lock_release( &accdb->shmem->partition_lock );
+
+  whead->val           = 0UL;
+  whead->has_partition = 0;
+}
+
 static inline uint
 delta_chain( fd_accdb_shmem_t const * accdb,
              uchar const              pubkey[ 32 ] ) {
@@ -4476,30 +4540,194 @@ fd_accdb_snapshot_write_batch_preallocated( fd_accdb_t *        accdb,
                                              out_replaced_lamports, out_ignored_lamports, 1 );
 }
 
+/* fd_accdb_snapshot_write_batch_worker: full-snapshot multi-writer
+   insert where each writer allocates its own disk offsets.  Same phase
+   structure as fd_accdb_snapshot_write_batch_impl, but the
+   insert/replace/ignore decision is made BEFORE allocation so ignored
+   duplicates burn no disk space (there is no separate byte writer that
+   has to stay in sync with a global stream-order write head). */
+
 int
-fd_accdb_snapshot_write_batch_preallocated_prehashed( fd_accdb_t *        accdb,
-                                                      fd_accdb_fork_id_t  fork_id,
-                                                      ulong               cnt,
-                                                      uchar const * const pubkeys[],
-                                                      ulong const         chain_idxs[],
-                                                      ulong               slot,
-                                                      ulong const         lamports[],
-                                                      ulong const         data_lens[],
-                                                      int const           executables[],
-                                                      ulong const         file_offsets[],
-                                                      ulong *             accounts_ignored,
-                                                      ulong *             accounts_replaced,
-                                                      ulong *             accounts_loaded,
-                                                      ulong *             out_replaced_lamports,
-                                                      ulong *             out_ignored_lamports ) {
-  if( FD_LIKELY( fork_id.val==USHORT_MAX ) ) {
-    return fd_accdb_snapshot_write_batch_impl( accdb, fork_id, cnt, pubkeys, chain_idxs, slot, lamports, data_lens, executables, file_offsets,
-                                               accounts_ignored, accounts_replaced, accounts_loaded,
-                                               out_replaced_lamports, out_ignored_lamports, 0 );
+fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                accdb,
+                                      ulong                       cnt,
+                                      uchar const * const         pubkeys[],
+                                      ulong const                 chain_idxs[],
+                                      ulong                       slot,
+                                      ulong const                 lamports[],
+                                      ulong const                 data_lens[],
+                                      int const                   executables[],
+                                      fd_accdb_snapshot_whead_t * whead,
+                                      ulong                       file_offsets[],
+                                      ulong *                     accounts_ignored,
+                                      ulong *                     accounts_replaced,
+                                      ulong *                     accounts_loaded,
+                                      ulong *                     out_replaced_lamports,
+                                      ulong *                     out_ignored_lamports ) {
+  FD_TEST( cnt && cnt<=8UL );
+
+  /* Snapshot slots are stored in the 32-bit cache_idx scratch field
+     during loading. */
+  if( FD_UNLIKELY( slot>UINT_MAX ) ) FD_LOG_ERR(( "snapshot slot %lu exceeds 2^32-1, accdb format must be widened", slot ));
+  if( FD_UNLIKELY( accdb->shmem->root_fork_id.val==USHORT_MAX ) ) {
+    FD_LOG_ERR(( "snapshot_write_batch_worker called without a root fork attached" ));
   }
-  return fd_accdb_snapshot_write_batch_impl( accdb, fork_id, cnt, pubkeys, chain_idxs, slot, lamports, data_lens, executables, file_offsets,
-                                             accounts_ignored, accounts_replaced, accounts_loaded,
-                                             out_replaced_lamports, out_ignored_lamports, 1 );
+  uint  gen       = accdb->fork_pool[ accdb->shmem->root_fork_id.val ].shmem->generation;
+  ulong chain_msk = accdb->shmem->chain_cnt - 1UL;
+
+  ulong ignored           = 0UL;
+  ulong replaced          = 0UL;
+  ulong loaded            = 0UL;
+  ulong replaced_lamports = 0UL;
+  ulong ignored_lamports  = 0UL;
+
+  /* Phase 1: walk chains looking for duplicates.  This writer owns
+     every chain in the batch exclusively, so plain loads/stores are
+     safe.  If the existing entry has a higher slot, mark skip.
+     Otherwise save the entry for in-place update (write_one
+     semantics). */
+
+  fd_accdb_accmeta_t * existing[ 8 ];
+  int                  skip    [ 8 ];
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    if( FD_UNLIKELY( chain_idxs[ i ]>chain_msk ) ) FD_LOG_ERR(( "snapshot chain index %lu exceeds mask %lu", chain_idxs[ i ], chain_msk ));
+    existing[ i ] = NULL;
+    skip    [ i ] = 0;
+    __builtin_prefetch( &accdb->acc_map[ chain_idxs[ i ] ], 1, 1 );
+  }
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    ulong next_acc = accdb->acc_map[ chain_idxs[ i ] ];
+
+    if( FD_LIKELY( next_acc!=UINT_MAX ) ) {
+      __builtin_prefetch( &accdb->acc_pool[ next_acc ], 0, 1 );
+    }
+
+    while( next_acc!=UINT_MAX ) {
+      fd_accdb_accmeta_t * candidate = &accdb->acc_pool[ next_acc ];
+
+      if( FD_LIKELY( candidate->map.next!=UINT_MAX ) ) {
+        __builtin_prefetch( &accdb->acc_pool[ candidate->map.next ], 0, 1 );
+      }
+
+      if( FD_UNLIKELY( !memcmp( pubkeys[ i ], candidate->key.pubkey, 32UL ) ) ) {
+        if( FD_LIKELY( (ulong)candidate->cache_idx>slot ) ) skip[ i ] = 1;
+        else                                                existing[ i ] = candidate;
+        break;
+      }
+      next_acc = candidate->map.next;
+    }
+  }
+
+  /* Phase 2: commit.  Allocate disk space only for accepted entries. */
+
+  ulong used_bytes_added   = 0UL;
+  ulong used_bytes_removed = 0UL;
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    if( FD_UNLIKELY( skip[ i ] ) ) {
+      file_offsets[ i ]  = ULONG_MAX;
+      ignored_lamports  += lamports[ i ];
+      ignored++;
+      continue;
+    }
+
+    fd_accdb_accmeta_t * accmeta;
+
+    if( FD_UNLIKELY( existing[ i ] ) ) {
+      accmeta = existing[ i ];
+      /* The old version's disk space is now dead. */
+      ulong old_sz = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( accmeta->executable_size );
+      fd_accdb_shmem_bytes_freed( accdb->shmem, fd_accdb_acc_offset( accmeta ), old_sz );
+      used_bytes_removed += old_sz;
+      replaced_lamports  += accmeta->lamports;
+      replaced++;
+    } else {
+      if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
+      else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
+      if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
+
+      uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
+
+      fd_memcpy( accmeta->key.pubkey, pubkeys[ i ], 32UL );
+      accmeta->key.generation       = gen;
+      accmeta->map.next             = accdb->acc_map[ chain_idxs[ i ] ];
+      accdb->acc_map[ chain_idxs[ i ] ] = acc_idx;
+      loaded++;
+    }
+
+    accmeta->cache_idx       = (uint)slot;
+    accmeta->lamports        = lamports[ i ];
+    accmeta->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
+    ulong entry_sz       = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+    ulong file_off       = fd_accdb_snapshot_worker_alloc( accdb, entry_sz, whead );
+    accmeta->offset_fork = file_off;
+    file_offsets[ i ]    = file_off;
+    used_bytes_added    += entry_sz;
+  }
+
+  if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) {
+    accdb->snapshot_pool_cache.disk_used_added      += used_bytes_added;
+    accdb->snapshot_pool_cache.disk_used_removed    += used_bytes_removed;
+    accdb->snapshot_pool_cache.accounts_total_added += loaded;
+  } else {
+    FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_used_bytes, used_bytes_added   );
+    FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, used_bytes_removed );
+    FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->accounts_total,  loaded             );
+  }
+
+  *accounts_ignored      = ignored;
+  *accounts_replaced     = replaced;
+  *accounts_loaded       = loaded;
+  *out_replaced_lamports = replaced_lamports;
+  *out_ignored_lamports  = ignored_lamports;
+
+  return 0;
+}
+
+/* fd_accdb_snapshot_verify_readback: sample live accounts from the
+   index and pread each one's on-disk record header, verifying that the
+   stored pubkey and data size match the index.  chain_cnt is a power of
+   two and pubkey->chain hashing is uniform, so a contiguous chain range
+   is a uniform sample of the account set (and, under chain-sharded
+   multi-writer loading, alternates across every writer's partitions). */
+
+void
+fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
+                                   ulong        sample_max ) {
+  ulong chain_cnt = accdb->shmem->chain_cnt;
+  ulong start     = fd_ulong_hash( (ulong)fd_tickcount() ) & (chain_cnt-1UL);
+  ulong checked   = 0UL;
+
+  for( ulong walked=0UL; walked<chain_cnt && checked<sample_max; walked++ ) {
+    ulong chain = (start+walked) & (chain_cnt-1UL);
+    for( uint acc_idx=accdb->acc_map[ chain ]; acc_idx!=UINT_MAX && checked<sample_max; ) {
+      fd_accdb_accmeta_t const * accmeta = &accdb->acc_pool[ acc_idx ];
+      ulong file_off = fd_accdb_acc_offset( accmeta );
+
+      fd_accdb_disk_meta_t meta;
+      ulong rd = 0UL;
+      while( rd<sizeof(meta) ) {
+        long res = pread( accdb->fd, meta.b+rd, sizeof(meta)-rd, (long)(file_off+rd) );
+        if( FD_UNLIKELY( res==-1L && errno==EINTR ) ) continue;
+        if( FD_UNLIKELY( res<=0L ) ) FD_LOG_ERR(( "snapshot readback verification pread failed at offset %lu (%d-%s)", file_off, errno, fd_io_strerror( errno ) ));
+        rd += (ulong)res;
+      }
+
+      if( FD_UNLIKELY( memcmp( meta.pubkey, accmeta->key.pubkey, 32UL ) ||
+                       meta.size!=FD_ACCDB_SIZE_DATA( accmeta->executable_size ) ) ) {
+        FD_LOG_ERR(( "snapshot readback verification failed at offset %lu: "
+                     "index pubkey %016lx... size %u vs disk pubkey %016lx... size %u",
+                     file_off,
+                     fd_ulong_bswap( FD_LOAD( ulong, accmeta->key.pubkey ) ), FD_ACCDB_SIZE_DATA( accmeta->executable_size ),
+                     fd_ulong_bswap( FD_LOAD( ulong, meta.pubkey ) ),         meta.size ));
+      }
+      checked++;
+      acc_idx = accmeta->map.next;
+    }
+  }
+
+  FD_LOG_NOTICE(( "snapshot readback verification passed (%lu accounts sampled)", checked ));
 }
 
 int

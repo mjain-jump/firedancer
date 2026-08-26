@@ -160,18 +160,19 @@ snapshot_load_topo( config_t * config ) {
   ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
   FOR(snapdc_tile_cnt) fd_topob_tile( topo, "snapdc", "snapdc", "metric_in", ULONG_MAX, 0, 0, 0 )->allow_shutdown = 1;
 
-  /* "snapin": Snapshot parser tile */
+  /* "snapin": Snapshot parser tile.  There is no snapwr tile in this
+     topology: the accdb workers do the file writes into their own
+     exclusive partitions, so at least one worker is required. */
   fd_topob_wksp( topo, "snapin" );
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
+  if( FD_UNLIKELY( snapin_tile_cnt<2UL ) ) {
+    FD_LOG_ERR(( "snapshot-load requires [layout.snapin_tile_count] >= 2 (coordinator plus at least one accdb worker doing the file writes)" ));
+  }
   ulong snapin_worker_cnt = snapin_tile_cnt-1UL;
   FOR(snapin_tile_cnt) {
     fd_topo_tile_t * tile = fd_topob_tile( topo, "snapin", "snapin", "metric_in", ULONG_MAX, 0, 0, 0 );
     tile->allow_shutdown = 1;
   }
-
-  fd_topob_wksp( topo, "snapwr" );
-  fd_topo_tile_t * snapwr_tile = fd_topob_tile( topo, "snapwr", "snapwr", "metric_in", ULONG_MAX, 0, 0, 0 );
-  snapwr_tile->allow_shutdown = 1;
 
   fd_topob_wksp( topo, "diag" );
   fd_topob_tile( topo, "diag", "diag", "metric_in", ULONG_MAX, 0, 0, 0 );
@@ -185,28 +186,26 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_wksp( topo, "snapct_repr"  );
 
   fd_topob_wksp( topo, "snapin_ct"    );
-  fd_topob_wksp( topo, "snapwr_ct"    );
-  if( FD_UNLIKELY( snapin_worker_cnt ) ) {
-    fd_topob_wksp( topo, "snapin_io"  );
-    fd_topob_wksp( topo, "snapio_ack" );
-  }
+  fd_topob_wksp( topo, "snapin_io"  );
+  fd_topob_wksp( topo, "snapio_ack" );
+
+  /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH: worker
+     frag holds release on a frontier cadence, so extra depth is
+     release-lag slack between snapdc and the workers' deferred fseqs. */
+  ulong snapdc_in_depth = 1024UL;
 
   fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
   fd_topob_link( topo, "snapld_dc",    "snapld_dc",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
-  FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU, 1UL );
+  FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
   fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL )->permit_no_consumers = 1;
   fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
 
   fd_topob_link( topo, "snapin_ct", "snapin_ct",   128UL,  0UL,                             1UL );
-  fd_topob_link( topo, "snapwr_ct", "snapwr_ct",   128UL,  0UL,                             1UL );
-  if( FD_UNLIKELY( snapin_worker_cnt ) ) {
-    for( ulong worker_idx=0UL; worker_idx<snapin_worker_cnt; worker_idx++ ) {
-      fd_topob_link( topo, "snapin_io",  "snapin_io",  FD_SNAPIN_IO_DEPTH, FD_SNAPIN_IO_JOB_SLOT_SZ, FD_SNAPIN_IO_BURST );
-      fd_topob_link( topo, "snapio_ack", "snapio_ack", 128UL,              FD_SNAPIN_IO_ACK_SLOT_SZ, 1UL );
-    }
+  for( ulong worker_idx=0UL; worker_idx<snapin_worker_cnt; worker_idx++ ) {
+    fd_topob_link( topo, "snapin_io",  "snapin_io",  FD_SNAPIN_IO_DEPTH, FD_SNAPIN_IO_JOB_SLOT_SZ, FD_SNAPIN_IO_BURST );
+    fd_topob_link( topo, "snapio_ack", "snapio_ack", 128UL,              FD_SNAPIN_IO_ACK_SLOT_SZ, 1UL );
   }
   fd_topob_tile_in( topo, "snapct",  0UL, "metric_in", "snapin_ct",  0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-  fd_topob_tile_in( topo, "snapct",  0UL, "metric_in", "snapwr_ct",  0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
 
   fd_topob_tile_in ( topo, "snapct",  0UL, "metric_in", "snapld_dc",    0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "snapct",  0UL,              "snapct_ld",    0UL                                       );
@@ -218,16 +217,15 @@ snapshot_load_topo( config_t * config ) {
   FOR(snapdc_tile_cnt) fd_topob_tile_in ( topo, "snapin", 0UL, "metric_in", "snapdc_in", i,   FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "snapin",  0UL,              "snapin_manif", 0UL                                       );
   fd_topob_tile_out( topo, "snapin",  0UL,              "snapin_ct",    0UL                                       );
-  if( FD_UNLIKELY( snapin_worker_cnt ) ) {
-    for( ulong worker_idx=0UL; worker_idx<snapin_worker_cnt; worker_idx++ ) {
-      fd_topob_tile_out( topo, "snapin", 0UL,                        "snapin_io",  worker_idx );
-      fd_topob_tile_in ( topo, "snapin", worker_idx+1UL, "metric_in", "snapin_io",  worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-      fd_topob_tile_out( topo, "snapin", worker_idx+1UL,              "snapio_ack", worker_idx );
-      fd_topob_tile_in ( topo, "snapin", 0UL,            "metric_in", "snapio_ack", worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-    }
+  for( ulong worker_idx=0UL; worker_idx<snapin_worker_cnt; worker_idx++ ) {
+    fd_topob_tile_out( topo, "snapin", 0UL,                        "snapin_io",  worker_idx );
+    fd_topob_tile_in ( topo, "snapin", worker_idx+1UL, "metric_in", "snapin_io",  worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    fd_topob_tile_out( topo, "snapin", worker_idx+1UL,              "snapio_ack", worker_idx );
+    fd_topob_tile_in ( topo, "snapin", 0UL,            "metric_in", "snapio_ack", worker_idx, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    /* Workers hold every snapdc lane's frags (deferred reliable
+       consumption) while ring jobs reference their bytes. */
+    FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", worker_idx+1UL, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   }
-  FOR(snapdc_tile_cnt) fd_topob_tile_in ( topo, "snapwr", 0UL, "metric_in", "snapdc_in", i,   FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-  fd_topob_tile_out( topo, "snapwr",  0UL,              "snapwr_ct",    0UL                                       );
 
   fd_topo_tile_t * snapin_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", 0UL ) ];
   fd_topob_tile_uses( topo, snapin_tile, txncache_obj,   FD_SHMEM_JOIN_MODE_READ_WRITE );
@@ -514,7 +512,6 @@ snapshot_load_cmd_fn( args_t *   args,
   fd_topo_tile_t * snapct_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapct", 0UL ) ];
   fd_topo_tile_t * snapld_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapld", 0UL ) ];
   fd_topo_tile_t * snapin_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", 0UL ) ];
-  fd_topo_tile_t * snapwr_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapwr", 0UL ) ];
   ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
 
@@ -527,7 +524,6 @@ snapshot_load_cmd_fn( args_t *   args,
   ulong volatile * const snapct_metrics = fd_metrics_tile( snapct_tile->metrics );
   ulong volatile * const snapld_metrics = fd_metrics_tile( snapld_tile->metrics );
   ulong volatile * const snapin_metrics = fd_metrics_tile( snapin_tile->metrics );
-  ulong volatile * const snapwr_metrics = fd_metrics_tile( snapwr_tile->metrics );
   ulong volatile *       snapin_all_metrics[ FD_SNAPIN_TILE_MAX ];
   for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
@@ -545,8 +541,7 @@ snapshot_load_cmd_fn( args_t *   args,
   ulong decomp_off_old   = 0UL;
   ulong snapld_wait_old  = 0UL;
   ulong snapdc_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
-  ulong snapin_wait_old  = 0UL;
-  ulong snapwr_wait_old  = 0UL;
+  ulong snapin_wait_old[ FD_SNAPIN_TILE_MAX ] = {0};
   ulong acc_cnt_old      = 0UL;
 
   int color = fd_log_colorize() && isatty( STDOUT_FILENO );
@@ -557,7 +552,7 @@ snapshot_load_cmd_fn( args_t *   args,
   sleep( 1 );
   if( watch ) {
     printf( "%scomp%s compressed %s·%s %sraw%s uncompressed %s·%s %sacc%s accounts %s·%s "
-            "%sbusy%s %%%s of load·decompress·insert·write, yellow when the bottleneck%s\n",
+            "%sbusy%s %%%s of load·decompress·coordinator·workers, yellow when the bottleneck%s\n",
             c_dim, c_norm, c_dim, c_norm,
             c_dim, c_norm, c_dim, c_norm,
             c_dim, c_norm, c_dim, c_norm,
@@ -569,7 +564,6 @@ snapshot_load_cmd_fn( args_t *   args,
   for(;;) {
     ulong snapct_status = FD_VOLATILE_CONST( snapct_metrics[ MIDX( GAUGE, TILE, STATUS ) ] );
     ulong snapld_status = FD_VOLATILE_CONST( snapld_metrics[ MIDX( GAUGE, TILE, STATUS ) ] );
-    ulong snapwr_status = FD_VOLATILE_CONST( snapwr_metrics[ MIDX( GAUGE, TILE, STATUS ) ] );
     int snapin_shutdown = 1;
     for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
       snapin_shutdown &= FD_VOLATILE_CONST( snapin_all_metrics[ i ][ MIDX( GAUGE, TILE, STATUS ) ] )==2UL;
@@ -579,7 +573,7 @@ snapshot_load_cmd_fn( args_t *   args,
       snapdc_shutdown &= FD_VOLATILE_CONST( snapdc_metrics[ i ][ MIDX( GAUGE, TILE, STATUS ) ] )==2UL;
     }
 
-    if( FD_UNLIKELY( snapct_status==2UL && snapld_status==2UL && snapdc_shutdown && snapin_shutdown && snapwr_status==2UL ) ) break;
+    if( FD_UNLIKELY( snapct_status==2UL && snapld_status==2UL && snapdc_shutdown && snapin_shutdown ) ) break;
 
     long cur = fd_log_wallclock();
     if( FD_UNLIKELY( cur<next ) ) {
@@ -601,22 +595,21 @@ snapshot_load_cmd_fn( args_t *   args,
     /* Waiting on either neighbor counts as not busy */
     ulong snapld_wait  = snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
                        + snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
-    ulong snapin_wait = 0UL;
+    ulong snapin_wait[ FD_SNAPIN_TILE_MAX ];
     ulong acc_cnt     = 0UL;
-    for( ulong i=0UL; i<snapin_work_cnt; i++ ) {
-      ulong volatile * metrics = snapin_all_metrics[ snapin_work_begin+i ];
-      snapin_wait += metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
-                   + metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
-      acc_cnt     += metrics[ MIDX( GAUGE, SNAPIN, ACCOUNT_LOADED ) ];
+    for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
+      ulong volatile * metrics = snapin_all_metrics[ i ];
+      snapin_wait[ i ] = metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
+                       + metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
     }
-    ulong snapwr_wait  = snapwr_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
-                       + snapwr_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
+    for( ulong i=0UL; i<snapin_work_cnt; i++ ) {
+      acc_cnt += snapin_all_metrics[ snapin_work_begin+i ][ MIDX( GAUGE, SNAPIN, ACCOUNT_LOADED ) ];
+    }
 
     char const * phase = phase_cstr( snapct_metrics[ MIDX( GAUGE, SNAPCT, STATE ) ] );
     ulong consumed, dc_in, dc_out, size_bytes;
     if( FD_UNLIKELY( !strcmp( phase, "incr" ) ) ) {
-      consumed   = fd_ulong_min( snapin_metrics[ MIDX( GAUGE, SNAPIN, INCREMENTAL_BYTES_READ ) ],
-                                 snapwr_metrics[ MIDX( GAUGE, SNAPWR, INCREMENTAL_BYTES_READ ) ] );
+      consumed   = snapin_metrics[ MIDX( GAUGE, SNAPIN, INCREMENTAL_BYTES_READ ) ];
       dc_in      = 0UL;
       dc_out     = 0UL;
       for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
@@ -625,8 +618,7 @@ snapshot_load_cmd_fn( args_t *   args,
       }
       size_bytes = snapct_metrics[ MIDX( GAUGE, SNAPCT, INCREMENTAL_SIZE_BYTES ) ];
     } else {
-      consumed   = fd_ulong_min( snapin_metrics[ MIDX( GAUGE, SNAPIN, FULL_BYTES_READ ) ],
-                                 snapwr_metrics[ MIDX( GAUGE, SNAPWR, FULL_BYTES_READ ) ] );
+      consumed   = snapin_metrics[ MIDX( GAUGE, SNAPIN, FULL_BYTES_READ ) ];
       dc_in      = 0UL;
       dc_out     = 0UL;
       for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
@@ -647,11 +639,21 @@ snapshot_load_cmd_fn( args_t *   args,
       }
       snapdc_busy_avg /= (double)snapdc_tile_cnt;
 
+      double snapin_busy[ FD_SNAPIN_TILE_MAX ];
+      double snapin_busy_avg = 0.0;
+      for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
+        snapin_busy[ i ] = clamp_pct( 100.0-( ( (double)( snapin_wait[ i ]-snapin_wait_old[ i ] )*ns_per_tick )/1e7 ) );
+      }
+      for( ulong i=0UL; i<snapin_work_cnt; i++ ) snapin_busy_avg += snapin_busy[ snapin_work_begin+i ];
+      snapin_busy_avg /= (double)snapin_work_cnt;
+
+      /* Note: worker busy%% is biased high — lane-frag deferrals
+         (before_frag -1) land in processing regimes. */
       double busy[ 4 ] = {
         clamp_pct( 100.0-( ( (double)( snapld_wait-snapld_wait_old )*ns_per_tick )/1e7 ) ),
         snapdc_busy_avg,
-        clamp_pct( 100.0-( ( (double)( snapin_wait-snapin_wait_old )*ns_per_tick )/(1e7*(double)snapin_work_cnt) ) ),
-        clamp_pct( 100.0-( ( (double)( snapwr_wait-snapwr_wait_old )*ns_per_tick )/1e7 ) ),
+        snapin_busy[ 0 ],
+        snapin_busy_avg,
       };
 
       char bar[ 256 ];
@@ -666,7 +668,7 @@ snapshot_load_cmd_fn( args_t *   args,
               c_dim, c_norm, (double)( decomp_off-decomp_off_old )/1e9, c_dim, c_norm,
               c_dim, c_norm, (double)( acc_cnt   -acc_cnt_old    )/1e6, c_dim, c_norm );
 
-      static char const * tile_key[ 4 ] = { "ld", "dc(avg)", "in", "wr" };
+      static char const * tile_key[ 4 ] = { "ld", "dc(avg)", "co", "wk(avg)" };
       printf( "  %sbusy%s", c_dim, c_norm );
       for( ulong i=0UL; i<4UL; i++ ) {
         printf( " %s%s%s %s%3.0f%s%%%s",
@@ -678,6 +680,11 @@ snapshot_load_cmd_fn( args_t *   args,
                 c_dim, i, c_norm,
                 sev_color( color, snapdc_busy[ i ] ), snapdc_busy[ i ], c_dim, c_norm );
       }
+      for( ulong i=0UL; i<snapin_work_cnt; i++ ) {
+        printf( " %swk%lu%s %s%3.0f%s%%%s",
+                c_dim, i, c_norm,
+                sev_color( color, snapin_busy[ snapin_work_begin+i ] ), snapin_busy[ snapin_work_begin+i ], c_dim, c_norm );
+      }
       printf( "\n" );
       fflush( stdout );
     }
@@ -687,8 +694,9 @@ snapshot_load_cmd_fn( args_t *   args,
     for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
       snapdc_wait_old[ i ] = snapdc_wait[ i ];
     }
-    snapin_wait_old  = snapin_wait;
-    snapwr_wait_old  = snapwr_wait;
+    for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
+      snapin_wait_old[ i ] = snapin_wait[ i ];
+    }
     acc_cnt_old      = acc_cnt;
 
     next+=1000L*1000L*1000L;
