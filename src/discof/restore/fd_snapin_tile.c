@@ -105,6 +105,42 @@ struct fd_snapin_out_link {
 };
 typedef struct fd_snapin_out_link fd_snapin_out_link_t;
 
+/* Parallel-loader state (D9 tar-boundary sharding).  The snapin tile
+   has two roles, selected by kind_id:
+
+     kind 0 (coordinator): the existing snapin state machine.  With
+       workers attached it runs the ssparse appendvec passthrough: it
+       never parses individual accounts, but instead assigns whole
+       appendvecs to workers at tar-header parse time (ASSIGN on the
+       owning worker's snapin_io ring) and publishes a scalar
+       stream-offset coverage watermark ("assignments complete below X")
+       to every worker.  It still fully parses/verifies the manifest +
+       status cache, owns the control protocol with snapct (forwarding
+       each control only after all workers acked it on their own lane
+       barriers), and merges the workers' snoop staging at end of load.
+
+     kind 1..N (worker): a fused parse+insert+write loader.  It consumes
+       the same snapdc_in lanes (full reliable consumer with the same
+       expected-frame rotation), holds its stream cursor behind the
+       published byte coverage (returnable-frag hold), parses the
+       appendvecs assigned to it via fd_ssparse_accv_init, inserts
+       accounts via the striped-lock decide-then-allocate accdb path,
+       and pwrite()s the packed disk records at its own explicit
+       offsets. */
+
+#define FD_SNAPIN_FIFO_CNT (1UL<<15) /* pending owned appendvecs; covers the max in-flight fctl window */
+
+struct fd_snapin_extent {
+  ulong body_off;      /* stream offset of appendvec body */
+  ulong body_sz;       /* tar entry size in bytes */
+  ulong slot;
+  ulong appendvec_idx; /* stream sequence number */
+};
+
+typedef struct fd_snapin_extent fd_snapin_extent_t;
+
+FD_STATIC_ASSERT( FD_SNAPIN_WORKER_MAX<=FD_SNAPIO_WORKER_MAX, snapin_worker_max );
+
 struct fd_snapin_tile {
   int  role;
   int  io_enabled;
@@ -116,12 +152,12 @@ struct fd_snapin_tile {
   ulong worker_idx;
   ulong worker_cnt;
   ulong ack_in_idx[ FD_SNAPIN_WORKER_MAX ];
-  ulong generation;
+  ulong generation;         /* attempt counter, bumped at the first INIT frag (both roles, in lockstep via their lane barriers) */
   ulong pending_worker_control;
   ulong pending_worker_ack_mask;
   ulong expected_frame;
   ulong pending_control;    /* control message expected from snapdc tiles */
-  uchar control_seen[ FD_TOPO_MAX_TILE_IN_LINKS ];
+  uchar control_seen[ FD_SNAPIN_IO_LANE_MAX ]; /* lane indexed */
 
   ulong seed;
   long boot_timestamp;
@@ -235,38 +271,36 @@ struct fd_snapin_tile {
     ulong       mtu;
   } io_in[ FD_SNAPIN_WORKER_MAX ];
 
-  ulong pending_job_cnt[ FD_SNAPIN_WORKER_MAX ];
   ulong io_pub_cnt; /* snapin_io publishes so far in the current data
                        frag callback, to respect STEM_BURST.  A frag
-                       packed with tiny appendvecs can otherwise flush
-                       more than STEM_BURST jobs (flush happens on slot
-                       change, not just every 8 accounts). */
+                       packed with tiny appendvecs can otherwise publish
+                       more than STEM_BURST jobs. */
 
-  /* Coordinator: the lane data frag currently being parsed.  Jobs pin
-     (lane,seq,chunk) references into it; pending jobs are flushed when
-     the frag is fully consumed so no unpublished job outlives its
-     frag's entry into the released frontier. */
+  /* Coordinator (io_enabled): tar-boundary sharding state. */
+  ulong stream_cursor;             /* decompressed-stream bytes consumed */
+  ulong appendvec_seq;
+  ulong covered_until;             /* coordinator: end of last fully-assigned entry;
+                                      worker: assignments complete below this offset */
+  int   io_watermark_dirty;        /* watermark advanced since last broadcast */
+  ulong io_frags_since_watermark;  /* consumed lane frags since last broadcast */
+  ulong io_jobs_since_credit;      /* ring publishes since last after_credit */
+  int   abort_published;           /* ABORT published for this attempt? */
+  int   snoop_merged;              /* snoop staging merged for this attempt? */
+  ulong worker_assigned_bytes[ FD_SNAPIN_WORKER_MAX ];
+  fd_snapio_worker_snoop_t * snoops[ FD_SNAPIN_WORKER_MAX ];
   struct {
-    ulong         lane;
-    ulong         seq;
-    ulong         chunk;
-    uchar const * base;
-  } cur_frag;
-
-  /* Coordinator: per-lane released-seq frontier.  lane_consumed_seq is
-     bumped only when a lane frag has been fully consumed (or dropped in
-     ERROR state) — never mid-frag.  Workers may consume (and thus
-     release to the producer) lane frags up to these watermarks. */
-  ulong lane_consumed_seq[ FD_SNAPIN_IO_LANE_MAX ];
-  int   io_frontier_dirty;         /* frontier advanced since last emission */
-  ulong io_frags_since_frontier;   /* consumed frags since last emission */
-  ulong io_jobs_since_credit;      /* account jobs published since last after_credit */
-
-  /* Coordinator: in-flight slow-path (non-batch) account. */
-  struct {
-    ulong worker_idx;
-    ulong remaining;   /* data bytes still to forward as DATA refs */
-  } slow;
+    ulong eq_slot_dups;
+    ulong eq_slot_lamports_diff;
+    ulong bytes_written;
+  } worker_fold; /* folded from FINI acks */
+  struct {       /* step-0 measurement: appendvec size distribution */
+    ulong cnt;
+    ulong bytes;
+    ulong max_sz;
+    ulong over_64m_cnt;
+    ulong over_256m_bytes;
+    ulong log2_hist[ 48 ];
+  } av_stats;
 
   struct {
     ulong input_lamports;
@@ -274,21 +308,49 @@ struct fd_snapin_tile {
     ulong ignored_lamports;
   } worker;
 
-  /* Worker: lane holds + write engine. */
-  ulong job_in_idx;                                /* in link carrying jobs */
+  /* Worker: coverage-gated appendvec scan + write engine. */
+  ulong job_in_idx;                                /* in link carrying ring jobs */
   ulong in_lane[ FD_TOPO_MAX_TILE_IN_LINKS ];      /* in_idx -> lane (ULONG_MAX for job link) */
-  ulong release[ FD_SNAPIN_IO_LANE_MAX ];          /* released frontier (ULONG_MAX = none) */
+  int   eos_seen;
+  int   pending_fini;                              /* FINI barrier complete, ack deferred until work drains */
+  ulong cursor;                                    /* stream offset consumed by this worker */
+  fd_snapin_extent_t * fifo;                       /* owned appendvecs not yet started */
+  ulong fifo_head;
+  ulong fifo_tail;
+  int   av_active;
+  fd_snapin_extent_t cur_av;
+  ulong av_consumed;                               /* bytes of cur_av body consumed */
+  ulong rec_idx;                                   /* record index within cur_av */
   fd_accdb_snapshot_whead_t whead;                 /* private layer-0 write head */
   uchar * write_buf;
   ulong   write_buf_used;
   ulong   flush_off;                               /* file offset of write_buf[0] */
-  struct {
-    int   active;      /* HEADER received, data still streaming */
-    int   accepted;    /* 0 = ignored duplicate: drop the data bytes */
+  ulong   bytes_written;
+  fd_accdb_snapshot_par_metrics_t par_metrics[1];
+  fd_snapio_worker_snoop_t * my_snoop;
+  ulong stake_log_max;
+  struct {                                         /* streaming-path slot history capture */
+    int   capturing;
+    ulong write_pos;
     ulong data_len;
+  } sh_reasm;
+  ulong reasm_av_idx;                              /* stream tags captured at arm time */
+  ulong reasm_rec_idx;
+  struct {
+    int   accepted;    /* 0 = ignored duplicate: drop the data bytes */
     ulong received;
     ulong file_off;    /* allocated meta offset; data at +sizeof(disk_meta) */
   } open_acc;
+  struct {                                         /* day-1 instrumentation (logged at FINI) */
+    ulong hold_reprocess;                          /* coverage-hold lane reprocesses */
+    ulong lag_samples;                             /* coverage lag sampled at each coverage advance */
+    ulong lag_sum;
+    ulong lag_min;
+    ulong lag_max;
+  } cov_stats;
+
+  /* both roles */
+  uint * stripe_locks;
 
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
   ulong gui_config_acct_off;  /* bytes accumulated so far into the current gui_out link chunk */
@@ -365,8 +427,9 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                                    );
   if( FD_UNLIKELY( tile->kind_id!=FD_SNAPIN_ROLE_COORDINATOR ) ) {
-    l = FD_LAYOUT_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
-    l = FD_LAYOUT_APPEND( l, 4096UL,           FD_SNAPIN_WRITE_BUF_SZ                            );
+    l = FD_LAYOUT_APPEND( l, fd_accdb_align(),            fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_extent_t), FD_SNAPIN_FIFO_CNT*sizeof(fd_snapin_extent_t)     );
+    l = FD_LAYOUT_APPEND( l, 4096UL,                      FD_SNAPIN_WRITE_BUF_SZ                            );
     return FD_LAYOUT_FINI( l, scratch_align() );
   }
   l = FD_LAYOUT_APPEND( l, fd_txncache_align(),           fd_txncache_footprint( tile->snapin.max_live_slots )        );
@@ -602,12 +665,77 @@ ack_out_advance( fd_snapin_tile_t * ctx ) {
                                                 ctx->ack_out.wmark );
 }
 
+/* Coordinator: publish one job on a worker's ring. */
+
+static void
+publish_io_job( fd_snapin_tile_t *  ctx,
+                fd_stem_context_t * stem,
+                ulong               worker_idx,
+                ulong               kind,
+                ulong               appendvec_idx,
+                ulong               slot,
+                ulong               body_off,
+                ulong               body_sz,
+                ulong               covered_until ) {
+  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
+  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
+  job->kind          = kind;
+  job->generation    = ctx->generation;
+  job->appendvec_idx = appendvec_idx;
+  job->slot          = slot;
+  job->body_off      = body_off;
+  job->body_sz       = body_sz;
+  job->covered_until = covered_until;
+  fd_stem_publish( stem, out->idx, kind, out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
+  io_out_advance( ctx, worker_idx );
+  ctx->io_pub_cnt++;
+  ctx->io_jobs_since_credit++;
+}
+
+/* Coordinator: broadcast the coverage watermark to every worker ring.
+   ASSIGN-before-watermark invariant: covered_until only ever reflects
+   fully-assigned entries, and the owning worker's ASSIGN was published
+   on its ring before covered_until advanced past the entry. */
+
+static void
+publish_watermarks( fd_snapin_tile_t *  ctx,
+                    fd_stem_context_t * stem ) {
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_WATERMARK, 0UL, 0UL, 0UL, 0UL, ctx->covered_until );
+  }
+  ctx->io_watermark_dirty       = 0;
+  ctx->io_frags_since_watermark = 0UL;
+}
+
+/* Coordinator: on any failure of the current attempt, unblock workers
+   that may be holding lane frags waiting for byte coverage that will
+   never come.  ABORT makes them drop the attempt and drain data until
+   FAIL. */
+
+static void
+publish_abort( fd_snapin_tile_t *  ctx,
+               fd_stem_context_t * stem ) {
+  if( FD_UNLIKELY( !ctx->io_enabled || ctx->abort_published ) ) return;
+  ctx->abort_published = 1;
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_ABORT, 0UL, 0UL, 0UL, 0UL, 0UL );
+  }
+}
+
 static void
 transition_malformed( fd_snapin_tile_t *  ctx,
                       fd_stem_context_t * stem ) {
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
   ctx->state = FD_SNAPSHOT_STATE_ERROR;
-  fd_memset( ctx->pending_job_cnt, 0, sizeof(ctx->pending_job_cnt) );
+  if( FD_UNLIKELY( ctx->io_enabled ) ) {
+    publish_abort( ctx, stem );
+    /* Stop waiting for acks of an abandoned control (FAIL acks must
+       still be collected so the revert stays deferred). */
+    if( ctx->pending_worker_control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) {
+      ctx->pending_worker_control  = ULONG_MAX;
+      ctx->pending_worker_ack_mask = 0UL;
+    }
+  }
   fd_stem_publish( stem, ctx->ct_out.idx, FD_SNAPSHOT_MSG_CTRL_ERROR, 0UL, 0UL, 0UL, 0UL, 0UL );
 }
 
@@ -993,231 +1121,6 @@ snoop_stake_delegation( fd_snapin_tile_t *  ctx,
       FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
 }
 
-static void
-publish_pending_job( fd_snapin_tile_t *  ctx,
-                     ulong               worker_idx,
-                     fd_stem_context_t * stem ) {
-  ulong cnt = ctx->pending_job_cnt[ worker_idx ];
-  if( FD_UNLIKELY( !cnt ) ) return;
-
-  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
-  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-  FD_TEST( job->kind==FD_SNAPIN_IO_KIND_BATCH && job->worker_idx==worker_idx && job->cnt==cnt );
-  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
-                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
-  io_out_advance( ctx, worker_idx );
-  ctx->pending_job_cnt[ worker_idx ] = 0UL;
-  ctx->io_pub_cnt++;
-  ctx->io_jobs_since_credit++;
-}
-
-static void
-publish_all_pending_jobs( fd_snapin_tile_t *  ctx,
-                          fd_stem_context_t * stem ) {
-  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    publish_pending_job( ctx, worker_idx, stem );
-  }
-}
-
-/* publish_frontier_jobs sends the per-lane released-seq frontier to
-   every worker ring.  Safe with respect to in-flight refs because
-   lane_consumed_seq only ever contains fully-consumed frags: pending
-   jobs are pinned to the in-flight frag (whose seq is not yet in the
-   frontier).  Pending jobs are flushed first anyway — they are staged
-   in-place in the ring slot this would otherwise clobber (reachable
-   from after_credit while a yielded data-frag callback still has jobs
-   staged). */
-
-static void
-publish_frontier_jobs( fd_snapin_tile_t *  ctx,
-                       fd_stem_context_t * stem ) {
-  publish_all_pending_jobs( ctx, stem );
-  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
-    fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-    job->kind       = FD_SNAPIN_IO_KIND_FRONTIER;
-    job->worker_idx = worker_idx;
-    job->generation = ctx->generation;
-    job->control    = ULONG_MAX;
-    job->cnt        = 0UL;
-    fd_memcpy( job->frontier, ctx->lane_consumed_seq, sizeof(ctx->lane_consumed_seq) );
-    fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
-                     out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
-    io_out_advance( ctx, worker_idx );
-  }
-  ctx->io_frontier_dirty       = 0;
-  ctx->io_frags_since_frontier = 0UL;
-}
-
-static inline void
-discard_all_pending_jobs( fd_snapin_tile_t * ctx ) {
-  fd_memset( ctx->pending_job_cnt, 0, sizeof(ctx->pending_job_cnt) );
-}
-
-__attribute__((always_inline)) static inline void
-append_worker_job( fd_snapin_tile_t *  ctx,
-                   ulong               worker_idx,
-                   ulong               ent_off,
-                   ulong               data_len,
-                   ulong               chain_idx,
-                   ulong               slot,
-                   fd_accdb_fork_id_t  fork_id,
-                   fd_stem_context_t * stem ) {
-  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
-  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-  ulong cnt = ctx->pending_job_cnt[ worker_idx ];
-
-  if( FD_UNLIKELY( cnt && (job->slot!=slot || job->fork_id!=fork_id.val ||
-                           job->lane!=ctx->cur_frag.lane ||
-                           job->seq!=ctx->cur_frag.seq ||
-                           job->chunk!=ctx->cur_frag.chunk) ) ) {
-    publish_pending_job( ctx, worker_idx, stem );
-    job = fd_chunk_to_laddr( out->mem, out->chunk );
-    cnt = 0UL;
-  }
-
-  if( FD_UNLIKELY( !cnt ) ) {
-    job->kind       = FD_SNAPIN_IO_KIND_BATCH;
-    job->worker_idx = worker_idx;
-    job->generation = ctx->generation;
-    job->control    = ULONG_MAX;
-    job->cnt        = 0UL;
-    job->slot       = slot;
-    job->fork_id    = fork_id.val;
-    job->lane       = ctx->cur_frag.lane;
-    job->seq        = ctx->cur_frag.seq;
-    job->chunk      = ctx->cur_frag.chunk;
-  }
-
-  FD_TEST( cnt<8UL );
-  job->ent_off [ cnt ] = (uint)ent_off;
-  job->data_len[ cnt ] = (uint)data_len;
-  fd_snapin_io_job_set_chain_idx( job, cnt, chain_idx );
-  job->cnt = ++cnt;
-  ctx->pending_job_cnt[ worker_idx ] = cnt;
-
-  if( FD_UNLIKELY( cnt==8UL ) ) publish_pending_job( ctx, worker_idx, stem );
-}
-
-/* dispatch_account_batch: coordinator io path for a parser batch.  All
-   entries live in the current (held) frag; jobs carry frag refs and the
-   worker reads the account fields and data bytes from the frag. */
-
-static int
-dispatch_account_batch( fd_snapin_tile_t *  ctx,
-                        uchar const * const entries[],
-                        ulong               cnt,
-                        uchar const * const pubkeys[],
-                        ulong               slot,
-                        ulong const         data_lens[],
-                        fd_stem_context_t * stem ) {
-  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
-
-  ctx->metrics.total_accounts_processed += cnt;
-  ctx->metrics.total_account_batches_processed++;
-
-  ulong worker_idxs[ 8 ];
-  ulong chain_idxs [ 8 ];
-  fd_accdb_snapshot_route_batch( ctx->accdb, cnt, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
-
-  for( ulong i=1UL; i<cnt; i++ ) {
-    for( ulong j=0UL; j<i; j++ ) {
-      if( FD_LIKELY( chain_idxs[ i ]!=chain_idxs[ j ] ) ) continue;
-      if( FD_UNLIKELY( !memcmp( pubkeys[ i ], pubkeys[ j ], 32UL ) ) ) {
-        FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single parser batch (entries %lu and %lu, slot %lu)", j, i, slot ));
-        return -1;
-      }
-    }
-  }
-
-  for( ulong i=0UL; i<cnt; i++ ) {
-    append_worker_job( ctx, worker_idxs[ i ], (ulong)(entries[ i ]-ctx->cur_frag.base),
-                       data_lens[ i ], chain_idxs[ i ], slot, fork_id, stem );
-  }
-  return 0;
-}
-
-/* dispatch_account_header: coordinator io path for a slow-path account.
-   The header may straddle input frags, so its decoded fields travel by
-   value; the data bytes follow as DATA frag refs attributed FIFO by the
-   owning worker.  Flushes the worker's pending batch job first so
-   per-chain stream order is preserved in the ring. */
-
-static int
-dispatch_account_header( fd_snapin_tile_t *                  ctx,
-                         fd_ssparse_advance_result_t const * result,
-                         fd_stem_context_t *                 stem ) {
-  fd_accdb_fork_id_t fork_id = ctx->full ? (fd_accdb_fork_id_t){ .val = USHORT_MAX } : ctx->accdb_incr_fork_id;
-
-  ctx->metrics.total_accounts_processed += 1UL;
-  ctx->metrics.total_account_batches_processed++;
-
-  uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
-  ulong worker_idxs[ 1 ];
-  ulong chain_idxs [ 1 ];
-  fd_accdb_snapshot_route_batch( ctx->accdb, 1UL, pubkeys, ctx->worker_cnt, worker_idxs, chain_idxs );
-
-  publish_pending_job( ctx, worker_idxs[ 0 ], stem );
-
-  fd_snapin_out_link_t * out = &ctx->io_out[ worker_idxs[ 0 ] ];
-  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-  job->kind       = FD_SNAPIN_IO_KIND_HEADER;
-  job->worker_idx = worker_idxs[ 0 ];
-  job->generation = ctx->generation;
-  job->control    = ULONG_MAX;
-  job->cnt        = 1UL;
-  job->slot       = result->account_header.slot;
-  job->fork_id    = fork_id.val;
-  fd_memcpy( job->hdr.pubkey, result->account_header.pubkey, 32UL );
-  fd_memcpy( job->hdr.owner,  result->account_header.owner,  32UL );
-  job->hdr.lamports   = result->account_header.lamports;
-  job->hdr.data_len   = result->account_header.data_len;
-  job->hdr.chain_idx  = chain_idxs[ 0 ];
-  job->hdr.executable = result->account_header.executable;
-  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
-                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
-  io_out_advance( ctx, worker_idxs[ 0 ] );
-  ctx->io_pub_cnt++;
-  ctx->io_jobs_since_credit++;
-
-  ctx->slow.worker_idx = worker_idxs[ 0 ];
-  ctx->slow.remaining  = result->account_header.data_len;
-  return 1;
-}
-
-/* dispatch_account_data: forward one contiguous run of the in-flight
-   slow-path account's data bytes as a frag ref. */
-
-static void
-dispatch_account_data( fd_snapin_tile_t *                  ctx,
-                       fd_ssparse_advance_result_t const * result,
-                       fd_stem_context_t *                 stem ) {
-  FD_TEST( result->account_data.data_sz<=ctx->slow.remaining );
-  /* No batch job can be staged in this slot: the HEADER flushed it and
-     stream order admits no new account until this one's data ends. */
-  FD_TEST( !ctx->pending_job_cnt[ ctx->slow.worker_idx ] );
-
-  fd_snapin_out_link_t * out = &ctx->io_out[ ctx->slow.worker_idx ];
-  fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-  job->kind       = FD_SNAPIN_IO_KIND_DATA;
-  job->worker_idx = ctx->slow.worker_idx;
-  job->generation = ctx->generation;
-  job->control    = ULONG_MAX;
-  job->cnt        = 0UL;
-  job->lane       = ctx->cur_frag.lane;
-  job->seq        = ctx->cur_frag.seq;
-  job->chunk      = ctx->cur_frag.chunk;
-  job->off        = (uint)(ulong)(result->account_data.data-ctx->cur_frag.base);
-  job->sz         = (uint)result->account_data.data_sz;
-  fd_stem_publish( stem, out->idx, FD_SNAPSHOT_MSG_DATA,
-                   out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
-  io_out_advance( ctx, ctx->slow.worker_idx );
-  ctx->io_pub_cnt++;
-  ctx->io_jobs_since_credit++;
-
-  ctx->slow.remaining -= result->account_data.data_sz;
-}
-
 static int
 write_account_batch( fd_snapin_tile_t *  ctx,
                      ulong               cnt,
@@ -1266,10 +1169,10 @@ process_account_batch( fd_snapin_tile_t *            ctx,
 
   /* Resolve pubkey pointers first and start the acc_map prefetch, so the
      per-account loop below runs while those lines are in flight.  In the
-     multi-worker path the coordinator does not touch the acc_map; each
-     worker issues this prefetch before insertion instead. */
+     multi-worker path the coordinator never sees account results (the
+     appendvec passthrough skips them). */
   for( ulong i=0UL; i<cnt; i++ ) pubkeys[ i ] = entries[ i ] + 16UL;
-  if( FD_LIKELY( !ctx->io_enabled ) ) fd_accdb_snapshot_prefetch_batch( ctx->accdb, cnt, pubkeys );
+  fd_accdb_snapshot_prefetch_batch( ctx->accdb, cnt, pubkeys );
 
   for( ulong i=0UL; i<cnt; i++ ) {
     uchar const * e = entries[ i ];
@@ -1300,9 +1203,6 @@ process_account_batch( fd_snapin_tile_t *            ctx,
     }
   }
 
-  if( FD_UNLIKELY( ctx->io_enabled ) ) {
-    return fd_int_if( dispatch_account_batch( ctx, entries, cnt, pubkeys, batch_slot, data_lens, stem )<0, -1, 0 );
-  }
   return fd_int_if( write_account_batch( ctx, cnt, pubkeys, batch_slot, lamports, data_lens, executables, stem )<0, -1, 0 );
 }
 
@@ -1310,17 +1210,12 @@ static int
 process_account_header( fd_snapin_tile_t *            ctx,
                         fd_ssparse_advance_result_t * result,
                         fd_stem_context_t *           stem ) {
-  int account;
-  if( FD_UNLIKELY( ctx->io_enabled ) ) {
-    account = dispatch_account_header( ctx, result, stem );
-  } else {
-    uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
-    ulong lamports   [ 1 ] = { result->account_header.lamports   };
-    ulong data_lens  [ 1 ] = { result->account_header.data_len  };
-    int   executables[ 1 ] = { result->account_header.executable };
-    account = write_account_batch( ctx, 1UL, pubkeys, result->account_header.slot,
-                                   lamports, data_lens, executables, stem );
-  }
+  uchar const * pubkeys[ 1 ] = { result->account_header.pubkey };
+  ulong lamports   [ 1 ] = { result->account_header.lamports   };
+  ulong data_lens  [ 1 ] = { result->account_header.data_len  };
+  int   executables[ 1 ] = { result->account_header.executable };
+  int account = write_account_batch( ctx, 1UL, pubkeys, result->account_header.slot,
+                                     lamports, data_lens, executables, stem );
   if( FD_UNLIKELY( account<0 ) ) return -1;
 
   /* Snoop SlotHistory sysvar.  Streaming path: arm the capture window
@@ -1440,6 +1335,14 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
 
   for(;;) {
     if( FD_UNLIKELY( sz-ctx->in[ in_idx ].pos==0UL ) ) break;
+    /* Cap ring publishes per callback (one frag can hold up to ~127 tar
+       headers); the unconsumed tail of the frag is reprocessed with
+       fresh credits.  A single parse step can add up to worker_cnt (<=8)
+       publishes (REGION/EOS broadcast) past the cap, and the callback
+       tail plus an idle after_credit in the same stem iteration can add
+       up to worker_cnt watermarks each, plus manifest/ct publishes: cap
+       at BURST-32 so the total stays under STEM_BURST. */
+    if( FD_UNLIKELY( ctx->io_enabled && ctx->io_pub_cnt>=FD_SNAPIN_IO_BURST-32UL ) ) break;
 
     uchar const * data = (uchar const *)fd_chunk_to_laddr_const( ctx->in[ in_idx ].wksp, chunk ) + ctx->in[ in_idx ].pos;
 
@@ -1453,6 +1356,44 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         return 0;
       case FD_SSPARSE_ADVANCE_AGAIN:
         break;
+      case FD_SSPARSE_ADVANCE_APPENDVEC: {
+        /* io_enabled only (passthrough).  Assign the whole appendvec to
+           the least-loaded worker: publish the ASSIGN on that worker's
+           ring, then advance the coverage watermark through the entry
+           (ASSIGN before watermark; the inline covered_until gives the
+           owner its coverage for free, other workers get it on the
+           periodic broadcast). */
+        ulong body_sz  = result->appendvec.data_sz;
+        ulong body_off = ctx->stream_cursor + result->bytes_consumed;
+        ulong w = 0UL;
+        for( ulong i=1UL; i<ctx->worker_cnt; i++ ) {
+          if( ctx->worker_assigned_bytes[ i ]<ctx->worker_assigned_bytes[ w ] ) w = i;
+        }
+        ctx->worker_assigned_bytes[ w ] += body_sz;
+        ulong end = body_off + fd_ulong_align_up( body_sz, 512UL );
+        ctx->covered_until = fd_ulong_max( ctx->covered_until, end );
+        publish_io_job( ctx, stem, w, FD_SNAPIN_IO_KIND_ASSIGN, ctx->appendvec_seq++,
+                        result->appendvec.slot, body_off, body_sz, ctx->covered_until );
+        ctx->io_watermark_dirty = 1;
+
+        ctx->av_stats.cnt++;
+        ctx->av_stats.bytes += body_sz;
+        ctx->av_stats.max_sz = fd_ulong_max( ctx->av_stats.max_sz, body_sz );
+        if( FD_UNLIKELY( body_sz>(64UL<<20) ) )  ctx->av_stats.over_64m_cnt++;
+        if( FD_UNLIKELY( body_sz>(256UL<<20) ) ) ctx->av_stats.over_256m_bytes += body_sz;
+        ctx->av_stats.log2_hist[ fd_ulong_min( (ulong)fd_ulong_find_msb( fd_ulong_max( body_sz, 1UL ) ), 47UL ) ]++;
+        break;
+      }
+      case FD_SSPARSE_ADVANCE_REGION: {
+        /* io_enabled only: publish coverage for a non-appendvec entry
+           BEFORE parsing it, so workers can skip-release the (multi-GiB)
+           manifest/status-cache frags while the coordinator parses. */
+        ulong body_off = ctx->stream_cursor + result->bytes_consumed;
+        ulong end = body_off + fd_ulong_align_up( result->region.data_sz, 512UL );
+        ctx->covered_until = fd_ulong_max( ctx->covered_until, end );
+        publish_watermarks( ctx, stem );
+        break;
+      }
       case FD_SSPARSE_ADVANCE_MANIFEST:
       case FD_SSPARSE_ADVANCE_MANIFEST_DONE: {
         if( FD_UNLIKELY( ctx->flags.manifest_done ) ) {
@@ -1598,10 +1539,6 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
       case FD_SSPARSE_ADVANCE_ACCOUNT_DATA:
         process_account_data( ctx, result );
 
-        if( FD_UNLIKELY( ctx->io_enabled && ctx->slow.remaining ) ) {
-          dispatch_account_data( ctx, result, stem );
-        }
-
         /* Account data may span multiple input chunks (when an account
            straddles a decompressed chunk boundary), so we copy each
            piece into the gui_out dcache and only publish once the full
@@ -1638,6 +1575,11 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         }
         break;
       case FD_SSPARSE_ADVANCE_DONE:
+        if( FD_UNLIKELY( ctx->io_enabled ) ) {
+          for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+            publish_io_job( ctx, stem, worker_idx, FD_SNAPIN_IO_KIND_EOS, 0UL, 0UL, 0UL, 0UL, 0UL );
+          }
+        }
         ctx->state = FD_SNAPSHOT_STATE_FINISHING;
         break;
       default:
@@ -1652,27 +1594,15 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
     }
 
     ctx->in[ in_idx ].pos += result->bytes_consumed;
+    ctx->stream_cursor    += result->bytes_consumed;
     if( FD_LIKELY( ctx->full ) ) ctx->metrics.full_bytes_read        += result->bytes_consumed;
     else                         ctx->metrics.incremental_bytes_read += result->bytes_consumed;
-
-    /* An account batch flushes at most 8 jobs, and the callback tail
-       may add up to worker_cnt frag-end flushes plus worker_cnt
-       frontier jobs (and an idle after_credit in the same stem
-       iteration up to worker_cnt more), so stop 24 short of STEM_BURST
-       to guarantee this callback never exceeds its credit allotment.
-       The unconsumed tail of the frag is reprocessed. */
-    if( FD_UNLIKELY( ctx->io_pub_cnt>=FD_SNAPIN_IO_BURST-24UL ) ) early_exit = 1;
 
     if( FD_UNLIKELY( early_exit ) ) break;
   }
 
   int reprocess_frag = ctx->in[ in_idx ].pos<sz;
-  if( FD_LIKELY( !reprocess_frag ) ) {
-    ctx->in[ in_idx ].pos = 0UL;
-    /* The frag is fully consumed and about to enter the released
-       frontier: no unpublished job may keep referencing it. */
-    if( FD_UNLIKELY( ctx->io_enabled ) ) publish_all_pending_jobs( ctx, stem );
-  }
+  if( FD_LIKELY( !reprocess_frag ) ) ctx->in[ in_idx ].pos = 0UL;
   return reprocess_frag;
 }
 
@@ -1688,72 +1618,92 @@ validate_capitalization( fd_snapin_tile_t * ctx ) {
   return 0;
 }
 
-static void
-publish_worker_control( fd_snapin_tile_t *  ctx,
-                        fd_stem_context_t * stem,
-                        ulong               control ) {
-  FD_TEST( ctx->io_enabled );
-  FD_TEST( ctx->pending_worker_control==ULONG_MAX );
-
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) discard_all_pending_jobs( ctx );
-  else                                                     publish_all_pending_jobs( ctx, stem );
-
-  ctx->pending_worker_ack_mask = 0UL;
-  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
-    fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
-    job->kind       = FD_SNAPIN_IO_KIND_CTRL;
-    job->worker_idx = worker_idx;
-    job->generation = ctx->generation;
-    job->control    = control;
-    job->cnt        = 0UL;
-    job->slot       = 0UL;
-    job->fork_id    = ULONG_MAX;
-    /* Controls also carry the frontier: post-barrier this releases the
-       lanes' preceding data frags (the control copies themselves enter
-       the frontier once consumed, released by the next FRONTIER). */
-    fd_memcpy( job->frontier, ctx->lane_consumed_seq, sizeof(ctx->lane_consumed_seq) );
-    fd_stem_publish( stem, out->idx, control,
-                     out->chunk, sizeof(fd_snapin_io_job_t), 0UL, 0UL, 0UL );
-    io_out_advance( ctx, worker_idx );
-  }
-  ctx->io_frontier_dirty       = 0;
-  ctx->io_frags_since_frontier = 0UL;
-  ctx->pending_worker_control  = control;
-}
-
-static void
-worker_reset_attempt( fd_snapin_tile_t * ctx ) {
-  ctx->metrics.accounts_ignored  = 0UL;
-  ctx->metrics.accounts_replaced = 0UL;
-  ctx->metrics.accounts_loaded   = 0UL;
-  ctx->metrics.total_accounts_processed       = 0UL;
-  ctx->metrics.total_account_batches_processed = 0UL;
-  ctx->worker.input_lamports    = 0UL;
-  ctx->worker.replaced_lamports = 0UL;
-  ctx->worker.ignored_lamports  = 0UL;
-}
+/* Worker role ********************************************************/
 
 static void
 worker_publish_ack( fd_snapin_tile_t *  ctx,
                     fd_stem_context_t * stem,
-                    ulong               generation,
                     ulong               control,
                     int                 err ) {
   fd_snapin_io_ack_t * ack = fd_chunk_to_laddr( ctx->ack_out.mem, ctx->ack_out.chunk );
-  ack->worker_idx        = ctx->worker_idx;
-  ack->generation        = generation;
-  ack->control           = control;
-  ack->accounts_ignored  = ctx->metrics.accounts_ignored;
-  ack->accounts_replaced = ctx->metrics.accounts_replaced;
-  ack->accounts_loaded   = ctx->metrics.accounts_loaded;
-  ack->input_lamports    = ctx->worker.input_lamports;
-  ack->replaced_lamports = ctx->worker.replaced_lamports;
-  ack->ignored_lamports  = ctx->worker.ignored_lamports;
-  ack->err                = err;
-  fd_stem_publish( stem, ctx->ack_out.idx, fd_snapin_io_ack_sig( generation, control ),
+  ack->worker_idx            = ctx->worker_idx;
+  ack->generation            = ctx->generation;
+  ack->control               = control;
+  ack->accounts_ignored      = ctx->metrics.accounts_ignored;
+  ack->accounts_replaced     = ctx->metrics.accounts_replaced;
+  ack->accounts_loaded       = ctx->metrics.accounts_loaded;
+  ack->input_lamports        = ctx->worker.input_lamports;
+  ack->replaced_lamports     = ctx->worker.replaced_lamports;
+  ack->ignored_lamports      = ctx->worker.ignored_lamports;
+  ack->bytes_written         = ctx->bytes_written;
+  ack->eq_slot_dups          = ctx->par_metrics->eq_slot_dups;
+  ack->eq_slot_lamports_diff = ctx->par_metrics->eq_slot_lamports_diff;
+  ack->err                   = err;
+  fd_stem_publish( stem, ctx->ack_out.idx, fd_snapin_io_ack_sig( ctx->generation, control ),
                    ctx->ack_out.chunk, sizeof(fd_snapin_io_ack_t), 0UL, 0UL, 0UL );
   ack_out_advance( ctx );
+}
+
+/* Enter the ERROR state and (unless silent, e.g. on a coordinator ABORT
+   that already knows) send an unsolicited ERROR ack so the coordinator
+   can fail the attempt and unblock the other workers. */
+
+static void
+worker_enter_error( fd_snapin_tile_t *  ctx,
+                    fd_stem_context_t * stem,
+                    int                 err,
+                    int                 silent ) {
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
+  ctx->state        = FD_SNAPSHOT_STATE_ERROR;
+  ctx->pending_fini = 0;
+  if( FD_LIKELY( !silent ) ) {
+    FD_LOG_WARNING(( "snapshot accdb worker %lu failed (%d-%s)", ctx->worker_idx, err, fd_io_strerror( err ) ));
+    worker_publish_ack( ctx, stem, FD_SNAPSHOT_MSG_CTRL_ERROR, err );
+  }
+}
+
+static void
+worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
+  ctx->write_buf_used      = 0UL;
+  ctx->flush_off           = 0UL;
+  ctx->bytes_written       = 0UL;
+  ctx->whead.val           = 0UL;
+  ctx->whead.has_partition = 0;
+  fd_memset( &ctx->open_acc, 0, sizeof(ctx->open_acc) );
+}
+
+static void
+worker_reset_attempt( fd_snapin_tile_t * ctx ) {
+  ctx->expected_frame = 0UL;
+  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) ctx->in[ lane ].pos = 0UL;
+  ctx->eos_seen       = 0;
+  ctx->pending_fini   = 0;
+  ctx->covered_until  = 0UL;
+  ctx->cursor         = 0UL;
+  ctx->fifo_head      = 0UL;
+  ctx->fifo_tail      = 0UL;
+  ctx->av_active      = 0;
+  ctx->av_consumed    = 0UL;
+  ctx->rec_idx        = 0UL;
+  worker_reset_write_engine( ctx );
+  fd_memset( &ctx->worker,    0, sizeof(ctx->worker)    );
+  fd_memset( ctx->par_metrics, 0, sizeof(ctx->par_metrics) );
+  fd_memset( &ctx->cov_stats, 0, sizeof(ctx->cov_stats) );
+  ctx->cov_stats.lag_min = ULONG_MAX;
+  ctx->metrics.accounts_loaded   = 0UL;
+  ctx->metrics.accounts_replaced = 0UL;
+  ctx->metrics.accounts_ignored  = 0UL;
+  ctx->metrics.total_accounts_processed        = 0UL;
+  ctx->metrics.total_account_batches_processed = 0UL;
+  ctx->sh_reasm.capturing      = 0;
+  ctx->feature_reasm.capturing = 0;
+  ctx->stake_reasm.capturing   = 0;
+  fd_ssparse_init( ctx->ssparse );
+  fd_ssparse_batch_enable( ctx->ssparse, 1 );
+  /* Reset the shared snoop staging owned by this worker */
+  ctx->my_snoop->slot_history.captured = 0;
+  fd_memset( &ctx->my_snoop->feature_snoop, 0, sizeof(fd_feature_snoop_t) );
+  ctx->my_snoop->stake_cnt = 0UL;
 }
 
 /* Worker staging buffer: buffered pwrites into the worker's own accdb
@@ -1774,7 +1724,8 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
       if( FD_LIKELY( errno==EINTR ) ) continue;
       FD_LOG_ERR(( "error writing to disk (%d-%s)", errno, fd_io_strerror( errno ) ));
     }
-    bytes_written += (ulong)res;
+    bytes_written      += (ulong)res;
+    ctx->bytes_written += (ulong)res;
   }
   ctx->flush_off      += sz;
   ctx->write_buf_used  = 0UL;
@@ -1816,317 +1767,752 @@ worker_stage_meta( fd_snapin_tile_t * ctx,
   worker_buffer_write( ctx, file_off, meta.b, sizeof(fd_accdb_disk_meta_t) );
 }
 
-static void
-worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
-  ctx->write_buf_used      = 0UL;
-  ctx->flush_off           = 0UL;
-  ctx->whead.val           = 0UL;
-  ctx->whead.has_partition = 0;
-  fd_memset( &ctx->open_acc, 0, sizeof(ctx->open_acc) );
+/* Snoop staging.  Precedence tags are (slot, appendvec_idx, record_idx)
+   for slot history (slot>= replaces, matching the sequential loader's
+   stream-order rule) and (appendvec_idx, record_idx) stream position
+   for features/stakes. */
+
+static inline int
+worker_sh_wins( fd_snapio_worker_snoop_t const * ws,
+                ulong slot, ulong av, ulong rec ) {
+  if( !ws->slot_history.captured ) return 1;
+  if( slot!=ws->slot_history.slot ) return slot>ws->slot_history.slot;
+  if( av!=ws->slot_history.appendvec_idx ) return av>ws->slot_history.appendvec_idx;
+  return rec>=ws->slot_history.record_idx;
 }
 
 static void
-worker_fail( fd_snapin_tile_t *  ctx,
-             fd_stem_context_t * stem,
-             ulong               generation,
-             int                 err ) {
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
-  FD_LOG_WARNING(( "snapshot accdb worker failed (%d-%s)", err, fd_io_strerror( err ) ));
-  ctx->write_buf_used = 0UL; /* drop staged bytes; whead reset happens on CTRL FAIL */
-  fd_accdb_snapshot_writer_end( ctx->accdb );
-  ctx->state = FD_SNAPSHOT_STATE_ERROR;
-  worker_publish_ack( ctx, stem, generation, FD_SNAPSHOT_MSG_CTRL_ERROR, err );
+worker_snoop_slot_history_contig( fd_snapin_tile_t * ctx,
+                                  ulong              slot,
+                                  ulong              rec_idx,
+                                  ulong              lamports,
+                                  ulong              data_len,
+                                  uchar const *      owner,
+                                  int                executable,
+                                  uchar const *      data ) {
+  fd_snapio_worker_snoop_t * ws = ctx->my_snoop;
+  if( FD_UNLIKELY( data_len>FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ) ) return;
+  if( FD_UNLIKELY( !worker_sh_wins( ws, slot, ctx->cur_av.appendvec_idx, rec_idx ) ) ) return;
+  ws->slot_history.slot          = slot;
+  ws->slot_history.appendvec_idx = ctx->cur_av.appendvec_idx;
+  ws->slot_history.record_idx    = rec_idx;
+  ws->slot_history.lamports      = lamports;
+  ws->slot_history.data_len      = data_len;
+  ws->slot_history.executable    = executable;
+  fd_memcpy( ws->slot_history.owner, owner, 32UL );
+  fd_memcpy( ws->slot_history.buf, data, data_len );
+  ws->slot_history.captured      = 1;
 }
 
-/* worker_apply_frontier advances the per-lane released watermarks
-   (monotone: frontiers can arrive slightly stale relative to a CTRL's
-   copy).  Everything the worker has deferred at or below the watermark
-   becomes consumable, which returns the lanes' flow-control credits to
-   snapdc.  Ring order guarantees every job referencing a released frag
-   was already processed. */
+static void
+worker_snoop_feature( fd_snapin_tile_t * ctx,
+                      uchar const *      pubkey,
+                      ulong              lamports,
+                      uchar const *      owner,
+                      uchar const *      data,
+                      ulong              data_len,
+                      ulong              av_idx,
+                      ulong              rec_idx ) {
+  if( FD_LIKELY( !lamports ) ) return;
+  if( FD_LIKELY( memcmp( owner, fd_solana_feature_program_id.uc, 32UL ) ) ) return;
+  fd_feature_id_t const * id = fd_feature_id_query( fd_ulong_load_8( pubkey ) );
+  if( FD_UNLIKELY( !id || !fd_pubkey_eq( (fd_pubkey_t const *)pubkey, &id->id ) ) ) return;
+  fd_feature_t feature[1];
+  if( FD_UNLIKELY( data_len<sizeof(fd_feature_t) || !fd_feature_decode( feature, data, data_len ) ) ) return;
+
+  fd_snapio_worker_snoop_t * ws = ctx->my_snoop;
+  ws->feature_snoop.present        [ id->index ] = 1;
+  ws->feature_snoop.is_active      [ id->index ] = feature->is_active;
+  ws->feature_snoop.activation_slot[ id->index ] = feature->activation_slot;
+  ws->feature_av [ id->index ] = av_idx;
+  ws->feature_rec[ id->index ] = rec_idx;
+}
 
 static void
-worker_apply_frontier( fd_snapin_tile_t *         ctx,
-                       fd_snapin_io_job_t const * job ) {
-  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) {
-    if( FD_LIKELY( fd_seq_gt( job->frontier[ lane ], ctx->release[ lane ] ) ) ) {
-      ctx->release[ lane ] = job->frontier[ lane ];
+worker_snoop_stake( fd_snapin_tile_t * ctx,
+                    uchar const *      pubkey,
+                    ulong              lamports,
+                    ulong              data_len,
+                    uchar const *      data,
+                    ulong              data_sz,
+                    ulong              av_idx,
+                    ulong              rec_idx ) {
+  fd_stake_state_t const * stake_state = fd_stake_state_view( data, data_sz );
+  if( FD_UNLIKELY( !stake_state || stake_state->stake_type!=FD_STAKE_STATE_STAKE ) ) return;
+
+  fd_delegation_t const * delegation = &stake_state->stake.stake.delegation;
+  if( FD_UNLIKELY( ( delegation->activation_epoch!=ULONG_MAX &&
+                    delegation->activation_epoch>=(ulong)USHORT_MAX ) ||
+                   ( delegation->deactivation_epoch!=ULONG_MAX &&
+                    delegation->deactivation_epoch>=(ulong)USHORT_MAX ) ) ) return;
+
+  fd_snapio_worker_snoop_t * ws = ctx->my_snoop;
+  if( FD_UNLIKELY( ws->stake_cnt>=ctx->stake_log_max ) ) {
+    FD_LOG_ERR(( "stake snoop log overflow (worker %lu, max %lu)", ctx->worker_idx, ctx->stake_log_max ));
+  }
+  fd_snapio_stake_ent_t * ent = &fd_snapio_worker_stake_log( ws )[ ws->stake_cnt ];
+  fd_memcpy( ent->pubkey, pubkey, 32UL );
+  fd_memcpy( ent->voter, delegation->voter_pubkey.uc, 32UL );
+  ent->stake              = delegation->stake;
+  ent->activation_epoch   = delegation->activation_epoch;
+  ent->deactivation_epoch = delegation->deactivation_epoch;
+  ent->credits_observed   = stake_state->stake.stake.credits_observed;
+  ent->lamports           = lamports;
+  ent->appendvec_idx      = av_idx;
+  ent->record_idx         = rec_idx;
+  ent->data_len           = (uint)data_len;
+  FD_COMPILER_MFENCE();
+  ws->stake_cnt++;
+}
+
+/* worker_cov_advance advances the worker's coverage watermark and
+   samples the coverage lag (runway ahead of the scan cursor) for the
+   day-1 throttling instrumentation. */
+
+static inline void
+worker_cov_advance( fd_snapin_tile_t * ctx,
+                    ulong              until ) {
+  if( FD_LIKELY( until<=ctx->covered_until ) ) return;
+  ctx->covered_until = until;
+  ulong lag = until - fd_ulong_min( ctx->cursor, until );
+  ctx->cov_stats.lag_samples++;
+  ctx->cov_stats.lag_sum += lag;
+  ctx->cov_stats.lag_min  = fd_ulong_min( ctx->cov_stats.lag_min, lag );
+  ctx->cov_stats.lag_max  = fd_ulong_max( ctx->cov_stats.lag_max, lag );
+}
+
+static int
+worker_process_account_batch( fd_snapin_tile_t *            ctx,
+                              fd_ssparse_advance_result_t * result ) {
+  uchar const * const * entries    = result->account_batch.batch;
+  ulong                 cnt        = result->account_batch.batch_cnt;
+  ulong                 batch_slot = result->account_batch.slot;
+
+  uchar const * pubkeys     [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  ulong         lamports    [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  ulong         data_lens   [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  int           executables [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  ulong         file_offsets[ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    uchar const * e = entries[ i ];
+    pubkeys[ i ]     = e + 16UL;
+    lamports[ i ]    = fd_ulong_load_8_fast( e+48UL );
+    data_lens[ i ]   = fd_ulong_load_8_fast( e+8UL );
+    executables[ i ] = e[ 96UL ];
+
+    /* Snoops (unconditional in stream order, matching the sequential
+       loader's batch path). */
+    ulong rec = ctx->rec_idx + i;
+    if( FD_UNLIKELY( !memcmp( pubkeys[ i ], fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
+      worker_snoop_slot_history_contig( ctx, batch_slot, rec, lamports[ i ], data_lens[ i ], e+64UL, executables[ i ], e+136UL );
+    }
+    worker_snoop_feature( ctx, pubkeys[ i ], lamports[ i ], e+64UL, e+136UL, data_lens[ i ], ctx->cur_av.appendvec_idx, rec );
+    if( FD_UNLIKELY( lamports[ i ] &&
+                     !memcmp( e+64UL, &fd_solana_stake_program_id, sizeof(fd_pubkey_t) ) ) ) {
+      worker_snoop_stake( ctx, pubkeys[ i ], lamports[ i ], data_lens[ i ], e+136UL, data_lens[ i ],
+                          ctx->cur_av.appendvec_idx, rec );
     }
   }
-}
-
-/* worker_resolve_ref validates a (lane,seq,chunk,off,sz) frag reference
-   and returns its local address, or NULL on a protocol violation.  The
-   ref must be newer than everything this worker has released: the
-   deferred fseq on that lane is what keeps the producer from recycling
-   the bytes. */
-
-static uchar const *
-worker_resolve_ref( fd_snapin_tile_t *         ctx,
-                    fd_snapin_io_job_t const * job,
-                    ulong                      off,
-                    ulong                      sz ) {
-  ulong lane = job->lane;
-  if( FD_UNLIKELY( lane>=ctx->lane_cnt ) ) return NULL;
-  if( FD_UNLIKELY( job->chunk<ctx->in[ lane ].chunk0 || job->chunk>ctx->in[ lane ].wmark ) ) return NULL;
-  if( FD_UNLIKELY( off>ctx->in[ lane ].mtu || sz>ctx->in[ lane ].mtu-off ) ) return NULL;
-  if( FD_UNLIKELY( !fd_seq_gt( job->seq, ctx->release[ lane ] ) ) ) return NULL;
-  return (uchar const *)fd_chunk_to_laddr_const( ctx->in[ lane ].wksp, job->chunk )+off;
-}
-
-static void
-worker_handle_batch( fd_snapin_tile_t *         ctx,
-                     fd_snapin_io_job_t const * job,
-                     fd_stem_context_t *        stem ) {
-  if( FD_UNLIKELY( job->generation!=ctx->generation ||
-                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
-                   !job->cnt || job->cnt>8UL || job->fork_id!=USHORT_MAX ||
-                   (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
-
-  uchar const * entries   [ 8 ];
-  uchar const * pubkeys   [ 8 ];
-  ulong         chain_idxs[ 8 ];
-  ulong         lamports  [ 8 ];
-  ulong         data_lens [ 8 ];
-  int           executables[ 8 ];
-  for( ulong i=0UL; i<job->cnt; i++ ) {
-    ulong data_len = (ulong)job->data_len[ i ];
-    uchar const * e = worker_resolve_ref( ctx, job, (ulong)job->ent_off[ i ], FD_SNAPIN_IO_ENT_DATA_OFF+data_len );
-    if( FD_UNLIKELY( !e ) ) {
-      worker_fail( ctx, stem, job->generation, EPROTO );
-      return;
-    }
-    entries    [ i ] = e;
-    pubkeys    [ i ] = e+FD_SNAPIN_IO_ENT_PUBKEY_OFF;
-    chain_idxs [ i ] = fd_snapin_io_job_chain_idx( job, i );
-    lamports   [ i ] = fd_ulong_load_8_fast( e+FD_SNAPIN_IO_ENT_LAMPORTS_OFF );
-    data_lens  [ i ] = data_len;
-    executables[ i ] = e[ FD_SNAPIN_IO_ENT_EXEC_OFF ];
-  }
-  /* Re-issue the chain-head prefetch at insertion even though the
-     coordinator precomputed the indices (worker-local latency hiding). */
-  fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, job->cnt, chain_idxs );
+  ctx->rec_idx += cnt;
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  ulong file_offsets[ 8 ];
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, job->cnt, pubkeys, chain_idxs, job->slot,
-                                                            lamports, data_lens, executables, &ctx->whead, file_offsets,
-                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
-                                                            &replaced_lamports, &ignored_lamports ) ) ) {
-    worker_fail( ctx, stem, job->generation, EINVAL );
-    return;
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, cnt, pubkeys, batch_slot, lamports,
+                                                                data_lens, executables, &ctx->whead,
+                                                                ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
+                                                                file_offsets, &accounts_ignored, &accounts_replaced,
+                                                                &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
+    return -1;
   }
 
-  for( ulong i=0UL; i<job->cnt; i++ ) {
-    if( FD_UNLIKELY( file_offsets[ i ]==ULONG_MAX ) ) continue; /* ignored dup burns no space */
-    worker_stage_meta( ctx, file_offsets[ i ], pubkeys[ i ], entries[ i ]+FD_SNAPIN_IO_ENT_OWNER_OFF, data_lens[ i ] );
+  /* Stage the accepted disk records (72 byte header + data, packed at
+     the allocated explicit offsets; ignored dups burn no space). */
+  for( ulong i=0UL; i<cnt; i++ ) {
+    if( FD_UNLIKELY( file_offsets[ i ]==ULONG_MAX ) ) continue;
+    worker_stage_meta( ctx, file_offsets[ i ], pubkeys[ i ], entries[ i ]+64UL, data_lens[ i ] );
     if( FD_LIKELY( data_lens[ i ] ) ) {
-      worker_buffer_write( ctx, file_offsets[ i ]+sizeof(fd_accdb_disk_meta_t),
-                           entries[ i ]+FD_SNAPIN_IO_ENT_DATA_OFF, data_lens[ i ] );
+      worker_buffer_write( ctx, file_offsets[ i ]+sizeof(fd_accdb_disk_meta_t), entries[ i ]+136UL, data_lens[ i ] );
     }
   }
 
   ctx->metrics.accounts_ignored  += accounts_ignored;
   ctx->metrics.accounts_replaced += accounts_replaced;
   ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->metrics.total_accounts_processed += job->cnt;
+  ctx->metrics.total_accounts_processed += cnt;
   ctx->metrics.total_account_batches_processed++;
-  for( ulong i=0UL; i<job->cnt; i++ ) {
-    ctx->worker.input_lamports = fd_ulong_sat_add( ctx->worker.input_lamports, lamports[ i ] );
-  }
+  for( ulong i=0UL; i<cnt; i++ ) ctx->worker.input_lamports = fd_ulong_sat_add( ctx->worker.input_lamports, lamports[ i ] );
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
+
+  return 0;
 }
 
-static void
-worker_handle_header( fd_snapin_tile_t *         ctx,
-                      fd_snapin_io_job_t const * job,
-                      fd_stem_context_t *        stem ) {
-  if( FD_UNLIKELY( job->generation!=ctx->generation ||
-                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
-                   job->fork_id!=USHORT_MAX ||
-                   (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
+static int
+worker_process_account_header( fd_snapin_tile_t *            ctx,
+                               fd_ssparse_advance_result_t * result ) {
+  ulong slot     = result->account_header.slot;
+  ulong lamports = result->account_header.lamports;
+  ulong data_len = result->account_header.data_len;
+  ulong rec      = ctx->rec_idx++;
 
-  uchar const * pubkeys   [ 1 ] = { job->hdr.pubkey     };
-  ulong         chain_idxs[ 1 ] = { job->hdr.chain_idx  };
-  ulong         lamports  [ 1 ] = { job->hdr.lamports   };
-  ulong         data_lens [ 1 ] = { job->hdr.data_len   };
-  int           executables[ 1 ] = { job->hdr.executable };
-  fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, 1UL, chain_idxs );
-
+  uchar const * pubkeys     [ 1 ] = { result->account_header.pubkey };
+  ulong         lamports_a  [ 1 ] = { lamports };
+  ulong         data_lens   [ 1 ] = { data_len };
+  int           executables [ 1 ] = { result->account_header.executable };
+  ulong         file_offsets[ 1 ];
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  ulong file_offsets[ 1 ];
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, 1UL, pubkeys, chain_idxs, job->slot,
-                                                            lamports, data_lens, executables, &ctx->whead, file_offsets,
-                                                            &accounts_ignored, &accounts_replaced, &accounts_loaded,
-                                                            &replaced_lamports, &ignored_lamports ) ) ) {
-    worker_fail( ctx, stem, job->generation, EINVAL );
-    return;
+  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_par_worker( ctx->accdb, 1UL, pubkeys, slot, lamports_a,
+                                                                data_lens, executables, &ctx->whead,
+                                                                ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->par_metrics,
+                                                                file_offsets, &accounts_ignored, &accounts_replaced,
+                                                                &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) {
+    return -1;
   }
+  int ignored = file_offsets[ 0 ]==ULONG_MAX;
 
-  ctx->open_acc.active   = 1;
-  ctx->open_acc.accepted = file_offsets[ 0 ]!=ULONG_MAX;
-  ctx->open_acc.data_len = job->hdr.data_len;
+  ctx->open_acc.accepted = !ignored;
   ctx->open_acc.received = 0UL;
   ctx->open_acc.file_off = file_offsets[ 0 ];
-  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
-    worker_stage_meta( ctx, file_offsets[ 0 ], job->hdr.pubkey, job->hdr.owner, job->hdr.data_len );
+  if( FD_LIKELY( !ignored ) ) {
+    worker_stage_meta( ctx, file_offsets[ 0 ], result->account_header.pubkey, result->account_header.owner, data_len );
   }
-  if( FD_UNLIKELY( !job->hdr.data_len ) ) ctx->open_acc.active = 0;
 
   ctx->metrics.accounts_ignored  += accounts_ignored;
   ctx->metrics.accounts_replaced += accounts_replaced;
   ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->metrics.total_accounts_processed += 1UL;
+  ctx->metrics.total_accounts_processed++;
   ctx->metrics.total_account_batches_processed++;
-  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    job->hdr.lamports );
+  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    lamports );
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
-}
 
-static void
-worker_handle_data( fd_snapin_tile_t *         ctx,
-                    fd_snapin_io_job_t const * job,
-                    fd_stem_context_t *        stem ) {
-  ulong sz = (ulong)job->sz;
-  if( FD_UNLIKELY( job->generation!=ctx->generation ||
-                   ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
-                   !ctx->open_acc.active ||
-                   sz>ctx->open_acc.data_len-ctx->open_acc.received ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
+  /* Streaming-path snoop arming (fragmented account bodies).  Same
+     gating as the sequential loader's process_account_header. */
+  ctx->reasm_av_idx  = ctx->cur_av.appendvec_idx;
+  ctx->reasm_rec_idx = rec;
 
-  uchar const * data = worker_resolve_ref( ctx, job, (ulong)job->off, sz );
-  if( FD_UNLIKELY( !data ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
-
-  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
-    worker_buffer_write( ctx, ctx->open_acc.file_off+sizeof(fd_accdb_disk_meta_t)+ctx->open_acc.received, data, sz );
-  }
-  ctx->open_acc.received += sz;
-  if( FD_LIKELY( ctx->open_acc.received==ctx->open_acc.data_len ) ) ctx->open_acc.active = 0;
-}
-
-static void
-worker_handle_control( fd_snapin_tile_t *       ctx,
-                       fd_snapin_io_job_t const * job,
-                       fd_stem_context_t *      stem ) {
-  ulong control = job->control;
-
-  /* Controls carry the frontier: apply it first so the lanes' frags
-     preceding this control are releasable regardless of what the
-     control itself does. */
-  worker_apply_frontier( ctx, job );
-
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) {
-    /* Explicit-offset workers cannot support incremental recovery; the
-       coordinator hard-errors before publishing this. */
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
-
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_INIT_FULL ) ) {
-    if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_IDLE ) ) {
-      worker_fail( ctx, stem, job->generation, EPROTO );
-      return;
+  ctx->sh_reasm.capturing = 0;
+  if( FD_UNLIKELY( !memcmp( result->account_header.pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) &&
+      data_len<=FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ &&
+      worker_sh_wins( ctx->my_snoop, slot, ctx->cur_av.appendvec_idx, rec ) ) {
+    fd_snapio_worker_snoop_t * ws = ctx->my_snoop;
+    ws->slot_history.slot          = slot;
+    ws->slot_history.appendvec_idx = ctx->cur_av.appendvec_idx;
+    ws->slot_history.record_idx    = rec;
+    ws->slot_history.lamports      = lamports;
+    ws->slot_history.data_len      = data_len;
+    ws->slot_history.executable    = result->account_header.executable;
+    fd_memcpy( ws->slot_history.owner, result->account_header.owner, 32UL );
+    ws->slot_history.captured      = 0; /* committed when the capture completes */
+    ctx->sh_reasm.capturing = 1;
+    ctx->sh_reasm.write_pos = 0UL;
+    ctx->sh_reasm.data_len  = data_len;
+    if( FD_UNLIKELY( !data_len ) ) {
+      ws->slot_history.captured = 1;
+      ctx->sh_reasm.capturing   = 0;
     }
-    ctx->generation = job->generation;
-    ctx->state      = FD_SNAPSHOT_STATE_PROCESSING;
-    fd_accdb_snapshot_writer_begin( ctx->accdb );
-    worker_reset_attempt( ctx );
-    worker_reset_write_engine( ctx );
-    worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
-    return;
   }
 
-  if( FD_UNLIKELY( job->generation!=ctx->generation ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
+  ctx->feature_reasm.capturing = 0;
+  if( FD_UNLIKELY( !memcmp( result->account_header.owner, fd_solana_feature_program_id.uc, 32UL ) &&
+                   lamports ) ) {
+    memcpy( ctx->feature_reasm.pubkey.uc, result->account_header.pubkey, 32UL );
+    memcpy( ctx->feature_reasm.owner,     result->account_header.owner,  32UL );
+    ctx->feature_reasm.lamports  = lamports;
+    ctx->feature_reasm.need      = fd_ulong_min( data_len, sizeof(ctx->feature_reasm.buf) );
+    ctx->feature_reasm.write_pos = 0UL;
+    ctx->feature_reasm.capturing = 1;
+    if( FD_UNLIKELY( !ctx->feature_reasm.need ) ) {
+      worker_snoop_feature( ctx, ctx->feature_reasm.pubkey.uc, lamports, ctx->feature_reasm.owner,
+                            ctx->feature_reasm.buf, 0UL, ctx->reasm_av_idx, ctx->reasm_rec_idx );
+      ctx->feature_reasm.capturing = 0;
+    }
   }
 
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) {
-    /* Drop staged bytes and forget the private write head: the
-       partitions themselves are released by the coordinator's
-       fd_accdb_reset, which it only runs after every worker acked. */
-    worker_reset_write_engine( ctx );
-    fd_accdb_snapshot_writer_end( ctx->accdb );
-    ctx->state = FD_SNAPSHOT_STATE_IDLE;
-    worker_reset_attempt( ctx );
-    worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
-    return;
+  ctx->stake_reasm.capturing = 0;
+  if( FD_UNLIKELY( !ignored &&
+                   lamports &&
+                   data_len>=sizeof(fd_stake_state_t) &&
+                   !memcmp( result->account_header.owner, &fd_solana_stake_program_id, sizeof(fd_pubkey_t) ) ) ) {
+    memcpy( ctx->stake_reasm.pubkey.uc, result->account_header.pubkey, sizeof(fd_pubkey_t) );
+    ctx->stake_reasm.lamports  = lamports;
+    ctx->stake_reasm.data_len  = data_len;
+    ctx->stake_reasm.write_pos = 0UL;
+    ctx->stake_reasm.capturing = 1;
   }
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return;
 
-  switch( control ) {
-    case FD_SNAPSHOT_MSG_CTRL_FINI:
-      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ||
-                       (ctx->open_acc.active && ctx->open_acc.received<ctx->open_acc.data_len) ) ) {
-        worker_fail( ctx, stem, job->generation, EPROTO );
-        return;
-      }
-      /* Make every staged byte durable and hand off the final
-         partition (stamps write_offset, books the tail slack) before
-         acking: the coordinator's DONE-side readback and load_end run
-         only after all FINI acks. */
-      worker_buffer_flush( ctx );
-      fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
-      fd_accdb_snapshot_writer_end( ctx->accdb );
-      ctx->state = FD_SNAPSHOT_STATE_FINISHING;
-      break;
-    case FD_SNAPSHOT_MSG_CTRL_NEXT:
-    case FD_SNAPSHOT_MSG_CTRL_DONE:
-      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_FINISHING ) ) {
-        worker_fail( ctx, stem, job->generation, EPROTO );
-        return;
-      }
-      ctx->state = FD_SNAPSHOT_STATE_IDLE;
-      break;
-    case FD_SNAPSHOT_MSG_CTRL_SHUTDOWN:
-      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_IDLE ) ) {
-        worker_fail( ctx, stem, job->generation, EPROTO );
-        return;
-      }
-      ctx->state = FD_SNAPSHOT_STATE_SHUTDOWN;
-      break;
-    default:
-      worker_fail( ctx, stem, job->generation, EPROTO );
-      return;
-  }
-  worker_publish_ack( ctx, stem, ctx->generation, control, 0 );
+  return 0;
 }
 
 static void
-worker_handle_frag( fd_snapin_tile_t *  ctx,
-                    ulong               chunk,
-                    ulong               sz,
-                    fd_stem_context_t * stem ) {
-  if( FD_UNLIKELY( chunk<ctx->io_in[ 0 ].chunk0 || chunk>ctx->io_in[ 0 ].wmark || sz!=sizeof(fd_snapin_io_job_t) ) ) {
-    worker_fail( ctx, stem, ctx->generation, EPROTO );
-    return;
+worker_process_account_data( fd_snapin_tile_t *            ctx,
+                             fd_ssparse_advance_result_t * result ) {
+  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
+    worker_buffer_write( ctx, ctx->open_acc.file_off+sizeof(fd_accdb_disk_meta_t)+ctx->open_acc.received,
+                         result->account_data.data, result->account_data.data_sz );
+  }
+  ctx->open_acc.received += result->account_data.data_sz;
+
+  if( FD_UNLIKELY( ctx->sh_reasm.capturing ) ) {
+    fd_snapio_worker_snoop_t * ws = ctx->my_snoop;
+    ulong remaining = ctx->sh_reasm.data_len - ctx->sh_reasm.write_pos;
+    ulong copy_sz   = fd_ulong_min( result->account_data.data_sz, remaining );
+    fd_memcpy( ws->slot_history.buf + ctx->sh_reasm.write_pos, result->account_data.data, copy_sz );
+    ctx->sh_reasm.write_pos += copy_sz;
+    if( ctx->sh_reasm.write_pos==ctx->sh_reasm.data_len ) {
+      ws->slot_history.captured = 1;
+      ctx->sh_reasm.capturing   = 0;
+    }
   }
 
+  if( FD_UNLIKELY( ctx->feature_reasm.capturing ) ) {
+    ulong remaining = ctx->feature_reasm.need - ctx->feature_reasm.write_pos;
+    ulong copy_sz   = fd_ulong_min( result->account_data.data_sz, remaining );
+    fd_memcpy( ctx->feature_reasm.buf + ctx->feature_reasm.write_pos, result->account_data.data, copy_sz );
+    ctx->feature_reasm.write_pos += copy_sz;
+    if( ctx->feature_reasm.write_pos==ctx->feature_reasm.need ) {
+      worker_snoop_feature( ctx, ctx->feature_reasm.pubkey.uc, ctx->feature_reasm.lamports,
+                            ctx->feature_reasm.owner, ctx->feature_reasm.buf, ctx->feature_reasm.need,
+                            ctx->reasm_av_idx, ctx->reasm_rec_idx );
+      ctx->feature_reasm.capturing = 0;
+    }
+  }
+
+  if( FD_UNLIKELY( ctx->stake_reasm.capturing ) ) {
+    ulong remaining = sizeof(ctx->stake_reasm.buf) - ctx->stake_reasm.write_pos;
+    ulong copy_sz   = fd_ulong_min( result->account_data.data_sz, remaining );
+    fd_memcpy( ctx->stake_reasm.buf + ctx->stake_reasm.write_pos, result->account_data.data, copy_sz );
+    ctx->stake_reasm.write_pos += copy_sz;
+    if( ctx->stake_reasm.write_pos==sizeof(ctx->stake_reasm.buf) ) {
+      worker_snoop_stake( ctx, ctx->stake_reasm.pubkey.uc, ctx->stake_reasm.lamports,
+                          ctx->stake_reasm.data_len, ctx->stake_reasm.buf, sizeof(ctx->stake_reasm.buf),
+                          ctx->reasm_av_idx, ctx->reasm_rec_idx );
+      ctx->stake_reasm.capturing = 0;
+    }
+  }
+}
+
+/* Consume one lane data frag, gated on byte coverage.  Returns 1 if the
+   frag must be held (reprocessed later, in[].pos preserved). */
+
+static int
+worker_handle_data_frag( fd_snapin_tile_t *  ctx,
+                         ulong               lane,
+                         ulong               chunk,
+                         ulong               sz,
+                         fd_stem_context_t * stem ) {
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return 0; /* drain */
+  if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
+    FD_LOG_WARNING(( "worker received data frag during invalid state %s (%lu)",
+                     fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state ));
+    worker_enter_error( ctx, stem, EPROTO, 0 );
+    return 0;
+  }
+
+  if( FD_UNLIKELY( chunk<ctx->in[ lane ].chunk0 || chunk>ctx->in[ lane ].wmark || sz>ctx->in[ lane ].mtu ) ) {
+    FD_LOG_ERR(( "invalid data frag bounds (chunk=%lu chunk0=%lu wmark=%lu sz=%lu mtu=%lu)", chunk, ctx->in[ lane ].chunk0, ctx->in[ lane ].wmark, sz, ctx->in[ lane ].mtu ));
+  }
+
+  for(;;) {
+    ulong rem = sz - ctx->in[ lane ].pos;
+    if( FD_UNLIKELY( !rem ) ) break;
+
+    ulong limit = ctx->eos_seen ? ULONG_MAX : ctx->covered_until;
+    if( FD_UNLIKELY( ctx->cursor>=limit ) ) {
+      ctx->cov_stats.hold_reprocess++;
+      return 1; /* hold until coverage extends */
+    }
+    ulong avail = fd_ulong_min( rem, limit-ctx->cursor );
+
+    uchar const * data = (uchar const *)fd_chunk_to_laddr_const( ctx->in[ lane ].wksp, chunk ) + ctx->in[ lane ].pos;
+
+    if( FD_UNLIKELY( !ctx->av_active ) ) {
+      if( FD_LIKELY( ctx->fifo_head==ctx->fifo_tail ) ) {
+        /* No owned appendvec pending inside the covered region: skip */
+        ctx->in[ lane ].pos += avail;
+        ctx->cursor         += avail;
+        continue;
+      }
+      fd_snapin_extent_t const * next = &ctx->fifo[ ctx->fifo_head & (FD_SNAPIN_FIFO_CNT-1UL) ];
+      if( FD_LIKELY( ctx->cursor<next->body_off ) ) {
+        ulong skip = fd_ulong_min( avail, next->body_off-ctx->cursor );
+        ctx->in[ lane ].pos += skip;
+        ctx->cursor         += skip;
+        continue;
+      }
+      /* cursor at the start of an owned appendvec body: activate */
+      FD_TEST( ctx->cursor==next->body_off );
+      ctx->cur_av = *next;
+      ctx->fifo_head++;
+      ctx->av_active   = 1;
+      ctx->av_consumed = 0UL;
+      ctx->rec_idx     = 0UL;
+      fd_ssparse_accv_init( ctx->ssparse, ctx->cur_av.slot, ctx->cur_av.body_sz );
+      continue;
+    }
+
+    /* Active appendvec: feed the parser */
+    ulong feed = fd_ulong_min( avail, ctx->cur_av.body_sz-ctx->av_consumed );
+    fd_ssparse_advance_result_t result[1];
+    int res = fd_ssparse_advance( ctx->ssparse, data, feed, result );
+    int fail = 0;
+    switch( res ) {
+      case FD_SSPARSE_ADVANCE_ERROR:
+        FD_LOG_WARNING(( "worker %lu: error while parsing appendvec (slot %lu)", ctx->worker_idx, ctx->cur_av.slot ));
+        fail = 1;
+        break;
+      case FD_SSPARSE_ADVANCE_AGAIN:
+        break;
+      case FD_SSPARSE_ADVANCE_ACCOUNT_HEADER:
+        fail = worker_process_account_header( ctx, result )<0;
+        break;
+      case FD_SSPARSE_ADVANCE_ACCOUNT_DATA:
+        worker_process_account_data( ctx, result );
+        break;
+      case FD_SSPARSE_ADVANCE_ACCOUNT_BATCH:
+        fail = worker_process_account_batch( ctx, result )<0;
+        break;
+      default:
+        FD_LOG_WARNING(( "worker %lu: unexpected fd_ssparse_advance result %d", ctx->worker_idx, res ));
+        fail = 1;
+        break;
+    }
+    if( FD_UNLIKELY( fail ) ) {
+      worker_enter_error( ctx, stem, EPROTO, 0 );
+      return 0;
+    }
+
+    ctx->in[ lane ].pos += result->bytes_consumed;
+    ctx->cursor         += result->bytes_consumed;
+    ctx->av_consumed    += result->bytes_consumed;
+    if( FD_UNLIKELY( ctx->av_consumed==ctx->cur_av.body_sz ) ) ctx->av_active = 0;
+  }
+
+  ctx->in[ lane ].pos = 0UL;
+  return 0;
+}
+
+static inline int
+worker_work_complete( fd_snapin_tile_t const * ctx ) {
+  return ctx->eos_seen && !ctx->av_active && ctx->fifo_head==ctx->fifo_tail;
+}
+
+/* Complete a deferred FINI once EOS has been consumed from the job ring
+   and all owned appendvecs drained. */
+
+static void
+worker_try_complete_fini( fd_snapin_tile_t *  ctx,
+                          fd_stem_context_t * stem ) {
+  if( FD_LIKELY( !ctx->pending_fini ) ) return;
+  if( FD_UNLIKELY( !worker_work_complete( ctx ) ) ) return;
+
+  /* Make every staged byte durable and hand off the final partition
+     (stamps write_offset, books the tail slack) before acking: the
+     coordinator's DONE-side readback and load_end run only after all
+     FINI acks. */
+  worker_buffer_flush( ctx );
+  fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
+  fd_accdb_snapshot_writer_end( ctx->accdb );
+  fd_accdb_snapshot_flush_par_metrics( ctx->accdb, ctx->par_metrics );
+  ctx->pending_fini = 0;
+  ctx->state        = FD_SNAPSHOT_STATE_FINISHING;
+
+  /* Day-1 throttling instrumentation (D4-ghost watch) */
+  double lag_avg = ctx->cov_stats.lag_samples ? (double)ctx->cov_stats.lag_sum/(double)ctx->cov_stats.lag_samples : 0.0;
+  FD_LOG_NOTICE(( "worker %lu: coverage holds=%lu, coverage lag min/avg/max=%lu/%.0f/%lu bytes (%lu samples), bytes_written=%lu",
+                  ctx->worker_idx, ctx->cov_stats.hold_reprocess,
+                  ctx->cov_stats.lag_min==ULONG_MAX ? 0UL : ctx->cov_stats.lag_min, lag_avg, ctx->cov_stats.lag_max,
+                  ctx->cov_stats.lag_samples, ctx->bytes_written ));
+
+  FD_COMPILER_MFENCE(); /* snoop staging visible before the ack */
+  worker_publish_ack( ctx, stem, FD_SNAPSHOT_MSG_CTRL_FINI, 0 );
+}
+
+/* Process one job from this worker's ring.  Returns 1 to hold
+   (reprocess later). */
+
+static int
+worker_handle_job( fd_snapin_tile_t *  ctx,
+                   fd_stem_context_t * stem,
+                   ulong               chunk,
+                   ulong               sz ) {
+  if( FD_UNLIKELY( chunk<ctx->io_in[ 0 ].chunk0 || chunk>ctx->io_in[ 0 ].wmark || sz!=sizeof(fd_snapin_io_job_t) ) ) {
+    FD_LOG_ERR(( "invalid job frag bounds (chunk=%lu sz=%lu)", chunk, sz ));
+  }
   fd_snapin_io_job_t const * job = fd_chunk_to_laddr_const( ctx->io_in[ 0 ].wksp, chunk );
-  if( FD_UNLIKELY( job->worker_idx!=ctx->worker_idx ) ) {
-    worker_fail( ctx, stem, job->generation, EPROTO );
-    return;
-  }
+
+  /* Generation discipline across retries: jobs from a future attempt
+     are held until this worker's own INIT barrier catches up; stale
+     jobs from an aborted attempt are drained. */
+  if( FD_UNLIKELY( job->generation>ctx->generation ) ) return 1;
+  if( FD_UNLIKELY( job->generation<ctx->generation ) ) return 0;
+
   switch( job->kind ) {
-    case FD_SNAPIN_IO_KIND_BATCH:    worker_handle_batch( ctx, job, stem );   break;
-    case FD_SNAPIN_IO_KIND_HEADER:   worker_handle_header( ctx, job, stem );  break;
-    case FD_SNAPIN_IO_KIND_DATA:     worker_handle_data( ctx, job, stem );    break;
-    case FD_SNAPIN_IO_KIND_FRONTIER: worker_apply_frontier( ctx, job );       break;
-    case FD_SNAPIN_IO_KIND_CTRL:     worker_handle_control( ctx, job, stem ); break;
-    default:                         worker_fail( ctx, stem, job->generation, EPROTO ); break;
+    case FD_SNAPIN_IO_KIND_ABORT: {
+      if( FD_LIKELY( ctx->state==FD_SNAPSHOT_STATE_PROCESSING ) ) worker_enter_error( ctx, stem, ECANCELED, 1 /* coordinator already knows */ );
+      ctx->pending_fini = 0;
+      return 0;
+    }
+    case FD_SNAPIN_IO_KIND_ASSIGN: {
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) return 0; /* stale (post-FAIL) */
+      if( FD_UNLIKELY( ctx->fifo_tail-ctx->fifo_head>=FD_SNAPIN_FIFO_CNT ) ) return 1; /* hold until drained */
+      fd_snapin_extent_t * ext = &ctx->fifo[ ctx->fifo_tail & (FD_SNAPIN_FIFO_CNT-1UL) ];
+      ext->body_off      = job->body_off;
+      ext->body_sz       = job->body_sz;
+      ext->slot          = job->slot;
+      ext->appendvec_idx = job->appendvec_idx;
+      ctx->fifo_tail++;
+      ulong end = job->body_off + fd_ulong_align_up( job->body_sz, 512UL );
+      worker_cov_advance( ctx, fd_ulong_max( end, job->covered_until ) );
+      return 0;
+    }
+    case FD_SNAPIN_IO_KIND_WATERMARK: {
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) return 0;
+      worker_cov_advance( ctx, job->covered_until );
+      return 0;
+    }
+    case FD_SNAPIN_IO_KIND_EOS: {
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) return 0;
+      ctx->eos_seen = 1;
+      return 0;
+    }
+    default:
+      FD_LOG_ERR(( "unexpected job kind %lu", job->kind ));
   }
+  return 0;
+}
+
+static void
+worker_handle_control_frag( fd_snapin_tile_t *  ctx,
+                            fd_stem_context_t * stem,
+                            ulong               sig ) {
+  if( ctx->state==FD_SNAPSHOT_STATE_ERROR && sig!=FD_SNAPSHOT_MSG_CTRL_FAIL ) return;
+
+  switch( sig ) {
+    case FD_SNAPSHOT_MSG_CTRL_INIT_FULL: {
+      FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+      /* generation was already bumped at the first INIT frag (see
+         handle_control_barrier) */
+      ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
+      ctx->full  = 1;
+      worker_reset_attempt( ctx );
+      fd_accdb_snapshot_writer_begin( ctx->accdb );
+      worker_publish_ack( ctx, stem, sig, 0 );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
+      /* Explicit-offset workers cannot support incremental recovery;
+         the coordinator flags the snapshot malformed on its own copy of
+         this barrier.  Enter error so the FAIL flows cleanly. */
+      worker_enter_error( ctx, stem, EPROTO, 0 );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_META: {
+      /* No action, no ack (the coordinator does not gate on META). */
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_FINI: {
+      if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
+        worker_enter_error( ctx, stem, EPROTO, 0 );
+        break;
+      }
+      /* All lane data precedes FINI, so owned appendvecs are complete;
+         only the EOS job may still be in flight on the ring.  Defer the
+         ack (do NOT hold the lane: a FAIL may be queued behind this
+         frag). */
+      ctx->pending_fini = 1;
+      worker_try_complete_fini( ctx, stem );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_NEXT:
+    case FD_SNAPSHOT_MSG_CTRL_DONE: {
+      FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
+      ctx->state = FD_SNAPSHOT_STATE_IDLE;
+      worker_publish_ack( ctx, stem, sig, 0 );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_ERROR: {
+      FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
+      /* Not silent: the coordinator may be waiting on this worker's ack
+         of an in-flight control that will now never come; the ERROR ack
+         makes it abandon that wait. */
+      worker_enter_error( ctx, stem, EPIPE, 0 );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_FAIL: {
+      FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
+      ctx->state = FD_SNAPSHOT_STATE_IDLE;
+      /* Drop staging and forget the private write head: the partitions
+         themselves are released by the coordinator's fd_accdb_reset,
+         which it only runs after every worker acked. */
+      worker_reset_attempt( ctx );
+      fd_accdb_snapshot_writer_end( ctx->accdb );
+      worker_publish_ack( ctx, stem, sig, 0 );
+      break;
+    }
+    case FD_SNAPSHOT_MSG_CTRL_SHUTDOWN: {
+      FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
+      ctx->state = FD_SNAPSHOT_STATE_SHUTDOWN;
+      worker_publish_ack( ctx, stem, sig, 0 );
+      break;
+    }
+    default: {
+      FD_LOG_ERR(( "unexpected control frag %s (%lu) in state %s (%lu)",
+                   fd_ssctrl_msg_ctrl_str( sig ), sig,
+                   fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state ));
+      break;
+    }
+  }
+}
+
+/* Coordinator role ***************************************************/
+
+/* Coordinator: merge the workers' snoop staging (valid only after all
+   FINI acks).  Reproduces the sequential loader's stream-order
+   semantics: slot history by (slot, appendvec_idx, record_idx)
+   precedence, features by per-id stream position, stakes by a k-way
+   stream-order merge of the per-worker logs (each already stream
+   sorted). */
+
+static void
+walker_merge_snoops( fd_snapin_tile_t * ctx ) {
+  if( FD_LIKELY( !ctx->io_enabled ) ) return;
+  if( FD_UNLIKELY( ctx->snoop_merged ) ) return;
+  ctx->snoop_merged = 1;
+
+  /* Slot history */
+  ulong best = ULONG_MAX;
+  for( ulong w=0UL; w<ctx->worker_cnt; w++ ) {
+    fd_snapio_worker_snoop_t const * ws = ctx->snoops[ w ];
+    if( !ws->slot_history.captured ) continue;
+    if( best==ULONG_MAX ) { best = w; continue; }
+    fd_snapio_worker_snoop_t const * bs = ctx->snoops[ best ];
+    ulong  a[3] = { ws->slot_history.slot, ws->slot_history.appendvec_idx, ws->slot_history.record_idx };
+    ulong  b[3] = { bs->slot_history.slot, bs->slot_history.appendvec_idx, bs->slot_history.record_idx };
+    int wins = a[0]!=b[0] ? a[0]>b[0] : ( a[1]!=b[1] ? a[1]>b[1] : a[2]>b[2] );
+    if( wins ) best = w;
+  }
+  if( FD_LIKELY( best!=ULONG_MAX ) ) {
+    fd_snapio_worker_snoop_t const * ws = ctx->snoops[ best ];
+    ctx->slot_history.captured   = 1;
+    ctx->slot_history.capturing  = 0;
+    ctx->slot_history.slot       = ws->slot_history.slot;
+    ctx->slot_history.lamports   = ws->slot_history.lamports;
+    ctx->slot_history.data_len   = ws->slot_history.data_len;
+    ctx->slot_history.executable = ws->slot_history.executable;
+    fd_memcpy( ctx->slot_history.owner, ws->slot_history.owner, 32UL );
+    fd_memcpy( ctx->slot_history.buf, ws->slot_history.buf, ws->slot_history.data_len );
+  }
+
+  /* Features */
+  for( ulong id=0UL; id<FD_FEATURE_SNOOP_CNT; id++ ) {
+    ulong fbest = ULONG_MAX;
+    for( ulong w=0UL; w<ctx->worker_cnt; w++ ) {
+      fd_snapio_worker_snoop_t const * ws = ctx->snoops[ w ];
+      if( !ws->feature_snoop.present[ id ] ) continue;
+      if( fbest==ULONG_MAX ) { fbest = w; continue; }
+      fd_snapio_worker_snoop_t const * bs = ctx->snoops[ fbest ];
+      int wins = ws->feature_av[ id ]!=bs->feature_av[ id ]
+               ? ws->feature_av[ id ]>bs->feature_av[ id ]
+               : ws->feature_rec[ id ]>bs->feature_rec[ id ];
+      if( wins ) fbest = w;
+    }
+    if( fbest!=ULONG_MAX ) {
+      fd_snapio_worker_snoop_t const * ws = ctx->snoops[ fbest ];
+      ctx->feature_snoop->present        [ id ] = 1;
+      ctx->feature_snoop->is_active      [ id ] = ws->feature_snoop.is_active[ id ];
+      ctx->feature_snoop->activation_slot[ id ] = ws->feature_snoop.activation_slot[ id ];
+    }
+  }
+
+  /* Stakes: k-way merge in stream order */
+  fd_stake_delegations_t * sd = fd_banks_stake_delegations_root_query( ctx->banks );
+  ulong idx[ FD_SNAPIO_WORKER_MAX ] = {0};
+  ulong merged = 0UL;
+  for(;;) {
+    ulong sbest = ULONG_MAX;
+    fd_snapio_stake_ent_t const * best_ent = NULL;
+    for( ulong w=0UL; w<ctx->worker_cnt; w++ ) {
+      fd_snapio_worker_snoop_t * ws = ctx->snoops[ w ];
+      if( idx[ w ]>=ws->stake_cnt ) continue;
+      fd_snapio_stake_ent_t const * ent = &fd_snapio_worker_stake_log( ws )[ idx[ w ] ];
+      if( !best_ent ||
+          ent->appendvec_idx<best_ent->appendvec_idx ||
+          ( ent->appendvec_idx==best_ent->appendvec_idx && ent->record_idx<best_ent->record_idx ) ) {
+        sbest = w; best_ent = ent;
+      }
+    }
+    if( sbest==ULONG_MAX ) break;
+    fd_stake_delegations_root_update(
+        sd,
+        (fd_pubkey_t const *)best_ent->pubkey,
+        (fd_pubkey_t const *)best_ent->voter,
+        best_ent->stake,
+        best_ent->activation_epoch,
+        best_ent->deactivation_epoch,
+        best_ent->credits_observed,
+        best_ent->lamports,
+        best_ent->data_len,
+        FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
+    idx[ sbest ]++;
+    merged++;
+  }
+  FD_LOG_INFO(( "merged snoop staging: %lu stake delegation updates", merged ));
+}
+
+/* Diagnostics for the verification gates: order-independent checksums
+   of the merged snoop state (compare against a D5/sequential run of the
+   same snapshot), and the equal-slot duplicate instrumentation. */
+
+static void
+log_snoop_checksums( fd_snapin_tile_t * ctx ) {
+  fd_stake_delegations_t * sd = fd_banks_stake_delegations_root_query( ctx->banks );
+  fd_stake_delegation_t const * root_pool  = fd_type_pun_const( (uchar const *)sd + sd->pool_offset_ );
+  fd_stake_delegation_t const * delta_pool = fd_type_pun_const( (uchar const *)sd + sd->delta_pool_offset_ );
+  ulong stake_cs  = 0UL;
+  ulong stake_cnt = 0UL;
+  for( ulong i=0UL; i<sd->pool_idx_wmk_; i++ ) {
+    fd_stake_delegation_t const * d = &root_pool[ i ];
+    if( !d->in_use ) continue;
+    if( d->delta_idx!=UINT_MAX ) d = &delta_pool[ d->delta_idx ];
+    if( d->is_tombstone ) continue;
+    ulong h = fd_hash( 0x57A4EUL, d->stake_account.uc, 32UL );
+    h = fd_hash( h, d->vote_account.uc, 32UL );
+    ulong nums[ 6 ] = { d->stake, d->lamports, d->credits_observed,
+                        (ulong)d->activation_epoch, (ulong)d->deactivation_epoch, (ulong)d->acc_dlen };
+    h = fd_hash( h, nums, sizeof(nums) );
+    stake_cs += h; /* commutative: iteration order independent */
+    stake_cnt++;
+  }
+  ulong feature_cs = fd_hash( 0xFEA7UL, ctx->feature_snoop, sizeof(fd_feature_snoop_t) );
+  ulong sh_cs      = ctx->slot_history.captured ? fd_hash( 0x5107UL, ctx->slot_history.buf, ctx->slot_history.data_len ) : 0UL;
+  FD_LOG_NOTICE(( "snoop A/B: stake_cnt=%lu stake_cs=%016lx feature_cs=%016lx slot_history_slot=%lu slot_history_cs=%016lx",
+                  stake_cnt, stake_cs, feature_cs, ctx->slot_history.captured ? ctx->slot_history.slot : 0UL, sh_cs ));
+}
+
+/* Step-0 measurement: appendvec count + size distribution, feeds the
+   giant-appendvec serialization kill-criterion. */
+
+static void
+log_appendvec_stats( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( !ctx->av_stats.cnt ) ) return;
+
+  /* Approximate percentiles from the log2 histogram (upper bucket
+     bound). */
+  ulong p50 = 0UL, p90 = 0UL;
+  ulong seen = 0UL;
+  for( ulong b=0UL; b<48UL; b++ ) {
+    seen += ctx->av_stats.log2_hist[ b ];
+    if( !p50 && seen*2UL >=      ctx->av_stats.cnt ) p50 = 2UL<<b;
+    if( !p90 && seen*10UL>= 9UL*ctx->av_stats.cnt  ) p90 = 2UL<<b;
+  }
+  FD_LOG_NOTICE(( "appendvecs: cnt=%lu total=%.1f GiB avg=%.1f MiB p50<=%lu p90<=%lu max=%lu, >64MiB cnt=%lu, >256MiB bytes=%.1f GiB",
+                  ctx->av_stats.cnt,
+                  (double)ctx->av_stats.bytes/(double)(1UL<<30),
+                  (double)ctx->av_stats.bytes/(double)ctx->av_stats.cnt/(double)(1UL<<20),
+                  p50, p90, ctx->av_stats.max_sz,
+                  ctx->av_stats.over_64m_cnt,
+                  (double)ctx->av_stats.over_256m_bytes/(double)(1UL<<30) ));
 }
 
 /* Finish reverting a failed attempt only after every accdb worker has
@@ -2159,52 +2545,72 @@ coordinator_handle_ack( fd_snapin_tile_t *  ctx,
   if( FD_UNLIKELY( worker_idx>=ctx->worker_cnt ||
                    chunk<ctx->io_in[ worker_idx ].chunk0 || chunk>ctx->io_in[ worker_idx ].wmark ||
                    sz!=sizeof(fd_snapin_io_ack_t) ) ) {
-    transition_malformed( ctx, stem );
-    return;
+    FD_LOG_ERR(( "malformed worker ack (worker=%lu chunk=%lu sz=%lu)", worker_idx, chunk, sz ));
   }
   fd_snapin_io_ack_t const * ack = fd_chunk_to_laddr_const( ctx->io_in[ worker_idx ].wksp, chunk );
   ulong generation = fd_snapin_io_ack_generation( sig );
   ulong control    = fd_snapin_io_ack_control( sig );
-  if( FD_UNLIKELY( ack->worker_idx!=worker_idx || generation!=ack->generation ||
-                   control!=ack->control || generation!=ctx->generation ) ) {
-    transition_malformed( ctx, stem );
-    return;
+  if( FD_UNLIKELY( ack->worker_idx!=worker_idx || generation!=ack->generation || control!=ack->control ) ) {
+    FD_LOG_ERR(( "inconsistent worker ack (worker=%lu sig=%lx)", worker_idx, sig ));
   }
+
   if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
-    FD_LOG_WARNING(( "snapshot accdb worker reported error (%d-%s)", ack->err, fd_io_strerror( ack->err ) ));
-    ctx->pending_worker_control = ULONG_MAX;
-    ctx->pending_worker_ack_mask = 0UL;
-    transition_malformed( ctx, stem );
+    if( generation==ctx->generation ) {
+      FD_LOG_WARNING(( "snapshot accdb worker %lu reported error (%d-%s)", worker_idx, ack->err, fd_io_strerror( ack->err ) ));
+      /* Abandon any in-flight ack wait (except FAIL, which every worker
+         still acks) even if we already transitioned to ERROR. */
+      if( ctx->pending_worker_control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) {
+        ctx->pending_worker_control  = ULONG_MAX;
+        ctx->pending_worker_ack_mask = 0UL;
+      }
+      transition_malformed( ctx, stem );
+    }
     return;
   }
-  if( FD_UNLIKELY( ctx->pending_worker_control==ULONG_MAX || control!=ctx->pending_worker_control ) ) {
-    transition_malformed( ctx, stem );
-    return;
-  }
+
+  /* Drop stale acks: wrong generation, or acks for a control the
+     coordinator abandoned after an error. */
+  if( FD_UNLIKELY( generation!=ctx->generation ) ) return;
+  if( FD_UNLIKELY( ctx->pending_worker_control==ULONG_MAX || control!=ctx->pending_worker_control ) ) return;
 
   ulong worker_bit = 1UL<<worker_idx;
   if( FD_UNLIKELY( ctx->pending_worker_ack_mask & worker_bit ) ) {
-    transition_malformed( ctx, stem );
-    return;
+    FD_LOG_ERR(( "duplicate worker ack (worker=%lu control=%lu)", worker_idx, control ));
   }
 
   if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FINI ) ) {
+    /* Fold the worker's end-of-load counters */
     ctx->metrics.accounts_ignored  += ack->accounts_ignored;
     ctx->metrics.accounts_replaced += ack->accounts_replaced;
     ctx->metrics.accounts_loaded   += ack->accounts_loaded;
     ctx->capitalization     = fd_ulong_sat_add( ctx->capitalization, ack->input_lamports );
     ctx->capitalization     = fd_ulong_sat_sub( ctx->capitalization, ack->ignored_lamports );
     ctx->dup_capitalization = fd_ulong_sat_add( ctx->dup_capitalization, ack->replaced_lamports );
+    ctx->worker_fold.eq_slot_dups          += ack->eq_slot_dups;
+    ctx->worker_fold.eq_slot_lamports_diff += ack->eq_slot_lamports_diff;
+    ctx->worker_fold.bytes_written         += ack->bytes_written;
   }
 
   ctx->pending_worker_ack_mask |= worker_bit;
   ulong all_worker_mask = (1UL<<ctx->worker_cnt)-1UL;
   if( FD_LIKELY( ctx->pending_worker_ack_mask!=all_worker_mask ) ) return;
 
+  ulong completed = ctx->pending_worker_control;
   ctx->pending_worker_control  = ULONG_MAX;
   ctx->pending_worker_ack_mask = 0UL;
-  if( FD_UNLIKELY( control==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) coordinator_finish_failed_attempt( ctx );
-  fd_stem_publish( stem, ctx->ct_out.idx, control, 0UL, 0UL, 0UL, 0UL, 0UL );
+
+  if( FD_UNLIKELY( completed==FD_SNAPSHOT_MSG_CTRL_FINI && ctx->worker_fold.eq_slot_dups ) ) {
+    /* Equal-slot cross-appendvec duplicates were ignored without a
+       stream-order tiebreak; the load result would be
+       schedule-dependent, so hard-fail the snapshot. */
+    FD_LOG_WARNING(( "parallel loader: %lu equal-slot cross-appendvec duplicates (lamports-diff=%lu) cannot be tiebroken; flagging snapshot malformed",
+                     ctx->worker_fold.eq_slot_dups, ctx->worker_fold.eq_slot_lamports_diff ));
+    transition_malformed( ctx, stem );
+    return;
+  }
+
+  if( FD_UNLIKELY( completed==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) coordinator_finish_failed_attempt( ctx );
+  fd_stem_publish( stem, ctx->ct_out.idx, completed, 0UL, 0UL, 0UL, 0UL, 0UL );
 }
 
 static void
@@ -2237,10 +2643,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         forward_msg = 0;
         break;
       }
-      if( FD_UNLIKELY( ctx->io_enabled ) ) ctx->generation++;
-      discard_all_pending_jobs( ctx );
-      ctx->slow.worker_idx = 0UL;
-      ctx->slow.remaining  = 0UL;
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->expected_frame = 0UL;
@@ -2252,9 +2654,25 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       ctx->txncache_slots_len = 0UL;
 
+      if( FD_UNLIKELY( ctx->io_enabled ) ) {
+        /* generation was already bumped at the first INIT frag (see
+           handle_control_barrier) */
+        ctx->stream_cursor            = 0UL;
+        ctx->appendvec_seq            = 0UL;
+        ctx->covered_until            = 0UL;
+        ctx->io_watermark_dirty       = 0;
+        ctx->io_frags_since_watermark = 0UL;
+        ctx->abort_published          = 0;
+        ctx->snoop_merged             = 0;
+        fd_memset( ctx->worker_assigned_bytes, 0, sizeof(ctx->worker_assigned_bytes) );
+        fd_memset( &ctx->worker_fold, 0, sizeof(ctx->worker_fold) );
+        fd_memset( &ctx->av_stats, 0, sizeof(ctx->av_stats) );
+      }
+
       fd_txncache_reset( ctx->txncache );
       fd_ssparse_init( ctx->ssparse );
       fd_ssparse_batch_enable( ctx->ssparse, 1 );
+      fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, ctx->io_enabled );
       fd_ssmanifest_parser_init( ctx->manifest_parser, fd_chunk_to_laddr( ctx->manifest_out.mem, ctx->manifest_out.chunk ) );
       fd_slot_delta_parser_init( ctx->slot_delta_parser );
       fd_memset( &ctx->flags,    0, sizeof(ctx->flags)    );
@@ -2345,12 +2763,18 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         forward_msg = 0;
         break;
       }
+      if( FD_UNLIKELY( ctx->io_enabled ) ) log_appendvec_stats( ctx );
       break;
     }
 
     case FD_SNAPSHOT_MSG_CTRL_NEXT: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
       ctx->state = FD_SNAPSHOT_STATE_IDLE;
+
+      /* Workers have all acked FINI by the time NEXT arrives (the
+         coordinator only forwarded FINI to snapct after the ack mask
+         completed), so their snoop staging is complete and quiescent. */
+      walker_merge_snoops( ctx );
 
       if( FD_UNLIKELY( verify_slot_deltas_with_slot_history( ctx ) ) ) {
         FD_LOG_WARNING(( "slot deltas verification failed for full snapshot" ));
@@ -2383,6 +2807,8 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_DONE: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_FINISHING );
       ctx->state = FD_SNAPSHOT_STATE_IDLE;
+
+      walker_merge_snoops( ctx );
 
       if( FD_UNLIKELY( verify_slot_deltas_with_slot_history( ctx ) ) ) {
         if( ctx->full ) FD_LOG_WARNING(( "slot deltas verification failed for full snapshot" ));
@@ -2417,6 +2843,13 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       fd_feature_snoop_finalize( &ctx->bank->f.features, ctx->bank_slot, &ctx->epoch_schedule, ctx->feature_snoop );
 
+      if( FD_UNLIKELY( ctx->io_enabled ) ) {
+        FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu (lamports-diff=%lu), worker bytes written=%lu",
+                        ctx->worker_fold.eq_slot_dups, ctx->worker_fold.eq_slot_lamports_diff,
+                        ctx->worker_fold.bytes_written ));
+      }
+      log_snoop_checksums( ctx );
+
       /* Notify replay when snapshot is fully loaded and verified. */
       fd_stem_publish( stem, ctx->manifest_out.idx, fd_ssmsg_sig( FD_SSMSG_DONE ), 0UL, 0UL, 0UL, 0UL, 0UL );
       ctx->init_completed = 0;
@@ -2426,6 +2859,13 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_ERROR: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
       ctx->state = FD_SNAPSHOT_STATE_ERROR;
+      /* Unblock workers holding on byte coverage so the upcoming FAIL
+         can flow through the lanes. */
+      publish_abort( ctx, stem );
+      if( ctx->io_enabled && ctx->pending_worker_control!=FD_SNAPSHOT_MSG_CTRL_FAIL ) {
+        ctx->pending_worker_control  = ULONG_MAX;
+        ctx->pending_worker_ack_mask = 0UL;
+      }
       break;
     }
 
@@ -2450,10 +2890,19 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     }
   }
 
-  /* Forward the control message down the pipeline */
+  /* Forward the control message down the pipeline.  With workers
+     attached, every barriered control (except ERROR, which propagates
+     immediately) is only forwarded to snapct once all workers have
+     acknowledged it on their own lane barriers; lane consumption is
+     held (before_frag) until then. */
   if( FD_LIKELY( forward_msg ) ) {
-    if( FD_UNLIKELY( ctx->io_enabled && sig!=FD_SNAPSHOT_MSG_CTRL_ERROR ) ) publish_worker_control( ctx, stem, sig );
-    else fd_stem_publish( stem, ctx->ct_out.idx, sig, 0UL, 0UL, 0UL, 0UL, 0UL );
+    if( FD_UNLIKELY( ctx->io_enabled && sig!=FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
+      FD_TEST( ctx->pending_worker_control==ULONG_MAX );
+      ctx->pending_worker_control  = sig;
+      ctx->pending_worker_ack_mask = 0UL;
+    } else {
+      fd_stem_publish( stem, ctx->ct_out.idx, sig, 0UL, 0UL, 0UL, 0UL, 0UL );
+    }
   }
 }
 
@@ -2475,52 +2924,44 @@ ack_worker_idx( fd_snapin_tile_t const * ctx,
   return ULONG_MAX;
 }
 
-/* coordinator_mark_lane_consumed: a lane frag is done (fully consumed
-   or dropped) — it may enter the released frontier.  Only ever called
-   at frag boundaries; pending jobs pinned to the frag were flushed
-   before this. */
-
-static inline void
-coordinator_mark_lane_consumed( fd_snapin_tile_t * ctx,
-                                ulong              lane,
-                                ulong              seq ) {
-  ctx->lane_consumed_seq[ lane ] = seq;
-  ctx->io_frontier_dirty = 1;
-  ctx->io_frags_since_frontier++;
-}
-
 static inline int
 before_frag( fd_snapin_tile_t * ctx,
              ulong              in_idx,
-             ulong              seq,
+             ulong              seq    FD_PARAM_UNUSED,
              ulong              sig ) {
   if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
-    /* Jobs are always processed.  Lane frags are consumed (without
-       touching the bytes) once released by the coordinator's frontier,
-       and deferred otherwise: the deferred fseq is what holds the
-       producer off any bytes still referenced by in-flight jobs. */
+    /* Ring jobs are always processed (worker_handle_job may hold them).
+       Lane frags share the coordinator's barrier/rotation discipline;
+       coverage holds happen in returnable_frag so the scan position is
+       preserved. */
     if( FD_LIKELY( in_idx==ctx->job_in_idx ) ) return 0;
     ulong lane = ctx->in_lane[ in_idx ];
-    return fd_seq_gt( seq, ctx->release[ lane ] ) ? -1 : 1;
+    if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
+      return sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
+    }
+    if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) return 0;
+    if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ lane ] ) ) {
+      FD_TEST( sig!=ctx->pending_control );
+      return -1;
+    }
+    if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA && lane!=ctx->expected_frame%ctx->lane_cnt ) ) {
+      return -1;
+    }
+    return 0;
   }
 
   if( FD_UNLIKELY( ctx->io_enabled && ack_worker_idx( ctx, in_idx )!=ULONG_MAX ) ) return 0;
 
-  /* Do not let the next stream phase start until the worker has drained
-     all jobs preceding the current control and acknowledged it. */
+  /* Do not let the next stream phase start until every worker has
+     acknowledged the in-flight control (acks arrive on the ack links,
+     which stay polled). */
   if( FD_UNLIKELY( ctx->io_enabled && ctx->pending_worker_control!=ULONG_MAX ) ) return -1;
 
   /* If we're currently in ERROR state we should only process FAIL
-     control frags */
+     control frags.  Workers were flipped to ERROR-drain by the ABORT
+     ring job, so dropping lane frags here cannot wedge them. */
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
-    int drop = sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
-    /* Dropped lane frags still advance the frontier (no job will ever
-       reference them) so idle workers keep returning lane credits and
-       the FAIL control can reach us. */
-    if( FD_UNLIKELY( drop && ctx->io_enabled && in_idx<ctx->lane_cnt ) ) {
-      coordinator_mark_lane_consumed( ctx, in_idx, seq );
-    }
-    return drop;
+    return sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
   }
 
   if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
@@ -2545,26 +2986,28 @@ before_frag( fd_snapin_tile_t * ctx,
 static inline int
 handle_lane_data_frag( fd_snapin_tile_t *  ctx,
                        fd_stem_context_t * stem,
-                       ulong               in_idx,
-                       ulong               seq,
+                       ulong               lane,
                        ulong               chunk,
                        ulong               sz,
                        ulong               ctl ) {
-  /* Pin the frag for job refs.  Valid across partial-consumption
-     reprocessing: the same frag re-enters with the same identity. */
-  ctx->cur_frag.lane  = in_idx;
-  ctx->cur_frag.seq   = seq;
-  ctx->cur_frag.chunk = chunk;
-  ctx->cur_frag.base  = (uchar const *)fd_chunk_to_laddr_const( ctx->in[ in_idx ].wksp, chunk );
-
   /* EOM marks the end of a frame */
   int eom = !!fd_frag_meta_ctl_eom( ctl );
+
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    /* Zero-size frags (e.g. the trailing EOM after tar EOF) carry no
+       payload; the scan loop is a no-op for them. */
+    if( FD_UNLIKELY( sz && worker_handle_data_frag( ctx, lane, chunk, sz, stem ) ) ) {
+      return 1;
+    }
+    if( FD_UNLIKELY( eom ) ) ctx->expected_frame++;
+    return 0;
+  }
 
   /* The tar parser can reach EOF before snapdc reports the end of the
      zstd frame.  Only the empty EOM is valid (any payload after EOF is
      malformed). */
   int trailing_eom = ctx->state==FD_SNAPSHOT_STATE_FINISHING && eom && !sz;
-  if( FD_UNLIKELY( !trailing_eom && handle_data_frag( ctx, in_idx, chunk, sz, stem ) ) ) {
+  if( FD_UNLIKELY( !trailing_eom && handle_data_frag( ctx, lane, chunk, sz, stem ) ) ) {
     return 1;
   }
 
@@ -2578,39 +3021,60 @@ handle_lane_data_frag( fd_snapin_tile_t *  ctx,
 static inline void
 handle_control_barrier( fd_snapin_tile_t *  ctx,
                         fd_stem_context_t * stem,
-                        ulong               in_idx,
+                        ulong               lane,
                         ulong               sig,
                         ulong               chunk,
                         ulong               sz ) {
   /* Error control frags must be immediately handled. */
   if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) {
-    handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
+    if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) worker_handle_control_frag( ctx, stem, sig );
+    else                                        handle_control_frag( ctx, stem, lane, sig, chunk, sz );
     return;
   }
+
+  /* Coordinator: at the first sight of FAIL on any lane, unblock
+     workers that may be holding lane frags on byte coverage, so FAIL
+     can flow through their lanes too. */
+  if( FD_UNLIKELY( !is_accdb_worker( ctx ) && sig==FD_SNAPSHOT_MSG_CTRL_FAIL ) ) publish_abort( ctx, stem );
 
   if( FD_UNLIKELY( sig!=ctx->pending_control ) ) {
     FD_TEST( ctx->pending_control==ULONG_MAX || sig==FD_SNAPSHOT_MSG_CTRL_FAIL );
     clear_control_barrier( ctx );
     ctx->pending_control = sig;
+
+    /* Bump the attempt generation at the FIRST INIT frag (barrier
+       start), not at barrier completion: an ERROR processed while the
+       INIT barrier is partially complete aborts the barrier (the
+       remaining INIT frags are drained by the ERROR-state filter), but
+       every tile is guaranteed to observe at least one INIT frag per
+       attempt (INIT is only ever sent after the previous FAIL fully
+       flushed, and the aborting ERROR is itself queued behind INIT on
+       its own lane).  Bumping here keeps the coordinator's and workers'
+       generations in lockstep even across aborted barriers. */
+    if( FD_UNLIKELY( ( is_accdb_worker( ctx ) || ctx->io_enabled ) &&
+                     ( sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL || sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) ) {
+      ctx->generation++;
+    }
   }
 
   /* Only process the control frag when all upstream tiles have sent
      the same control message. */
-  FD_TEST( !ctx->control_seen[ in_idx ] );
-  ctx->control_seen[ in_idx ] = 1U;
+  FD_TEST( !ctx->control_seen[ lane ] );
+  ctx->control_seen[ lane ] = 1U;
   if( FD_LIKELY( !all_controls_seen( ctx ) ) ) {
     return;
   }
 
   /* All controls received, process the control frag. */
   clear_control_barrier( ctx );
-  handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) worker_handle_control_frag( ctx, stem, sig );
+  else                                        handle_control_frag( ctx, stem, lane, sig, chunk, sz );
 }
 
 static inline int
 returnable_frag( fd_snapin_tile_t *  ctx,
                  ulong               in_idx,
-                 ulong               seq,
+                 ulong               seq    FD_PARAM_UNUSED,
                  ulong               sig,
                  ulong               chunk,
                  ulong               sz,
@@ -2620,8 +3084,12 @@ returnable_frag( fd_snapin_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
     FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
-    FD_TEST( in_idx==ctx->job_in_idx );
-    worker_handle_frag( ctx, chunk, sz, stem );
+    if( FD_UNLIKELY( in_idx==ctx->job_in_idx ) ) {
+      return worker_handle_job( ctx, stem, chunk, sz );
+    }
+    ulong lane = ctx->in_lane[ in_idx ];
+    if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_lane_data_frag( ctx, stem, lane, chunk, sz, ctl );
+    handle_control_barrier( ctx, stem, lane, sig, chunk, sz );
     return 0;
   }
 
@@ -2634,19 +3102,19 @@ returnable_frag( fd_snapin_tile_t *  ctx,
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
 
   int reprocess = 0;
-  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) reprocess = handle_lane_data_frag( ctx, stem, in_idx, seq, chunk, sz, ctl );
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) reprocess = handle_lane_data_frag( ctx, stem, in_idx, chunk, sz, ctl );
   else                                           handle_control_barrier( ctx, stem, in_idx, sig, chunk, sz );
 
-  /* Frontier bookkeeping: any lane frag we are done with (data or
-     control copy; pending refs into it were flushed) may be released to
-     the workers.  Emit the frontier every
-     FD_SNAPIN_IO_FRONTIER_INTERVAL consumed frags; the idle
-     after_credit path covers job-less stretches (manifest, errors). */
-  if( FD_UNLIKELY( ctx->io_enabled && !reprocess && in_idx<ctx->lane_cnt ) ) {
-    coordinator_mark_lane_consumed( ctx, in_idx, seq );
-    if( FD_UNLIKELY( ctx->io_frags_since_frontier>=FD_SNAPIN_IO_FRONTIER_INTERVAL &&
+  /* Watermark cadence: broadcast the coverage watermark every
+     FD_SNAPIN_IO_WATERMARK_INTERVAL consumed lane frags; the idle
+     after_credit path covers assignment-less stretches. */
+  if( FD_UNLIKELY( ctx->io_enabled && !reprocess && in_idx<ctx->lane_cnt &&
+                   ctx->state==FD_SNAPSHOT_STATE_PROCESSING ) ) {
+    ctx->io_frags_since_watermark++;
+    if( FD_UNLIKELY( ctx->io_watermark_dirty &&
+                     ctx->io_frags_since_watermark>=FD_SNAPIN_IO_WATERMARK_INTERVAL &&
                      ctx->pending_worker_control==ULONG_MAX ) ) {
-      publish_frontier_jobs( ctx, stem );
+      publish_watermarks( ctx, stem );
     }
   }
 
@@ -2658,18 +3126,25 @@ after_credit( fd_snapin_tile_t *  ctx,
               fd_stem_context_t * stem,
               int *               opt_poll_in FD_PARAM_UNUSED,
               int *               charge_busy ) {
-  if( FD_LIKELY( is_accdb_worker( ctx ) || !ctx->io_enabled ) ) return;
+  if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
+    /* The EOS job may arrive on the ring after the FINI lane barrier
+       completed: finish the deferred FINI from here. */
+    if( FD_UNLIKELY( ctx->pending_fini ) ) worker_try_complete_fini( ctx, stem );
+    return;
+  }
+  if( FD_LIKELY( !ctx->io_enabled ) ) return;
 
   /* Idle-deadlock fix: when the coordinator consumed lane frags without
-     producing jobs (manifest / status cache / ERROR drops), the workers
-     never see a job carrying the advanced frontier, keep deferring the
-     lanes, and snapdc stalls on their fseqs.  Emit the frontier from
-     here whenever it advanced but no account job went out. */
+     publishing (manifest body / status cache stretches), the workers
+     never see the advanced watermark, keep holding their lane heads,
+     and snapdc stalls on their fseqs.  Broadcast the watermark from
+     here whenever it advanced but no ring publish went out. */
   int idle = !ctx->io_jobs_since_credit;
   ctx->io_jobs_since_credit = 0UL;
-  if( FD_UNLIKELY( ctx->io_frontier_dirty && idle &&
+  if( FD_UNLIKELY( ctx->io_watermark_dirty && idle &&
+                   ctx->state==FD_SNAPSHOT_STATE_PROCESSING &&
                    ctx->pending_worker_control==ULONG_MAX ) ) {
-    publish_frontier_jobs( ctx, stem );
+    publish_watermarks( ctx, stem );
     *charge_busy = 1;
   }
 }
@@ -2750,14 +3225,14 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->generation      = 0UL;
   ctx->pending_worker_control = ULONG_MAX;
   ctx->pending_worker_ack_mask = 0UL;
-  discard_all_pending_jobs( ctx );
   ctx->expected_frame  = 0UL;
   clear_control_barrier( ctx );
   fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
 
   if( FD_UNLIKELY( is_accdb_worker( ctx ) ) ) {
-    void * _accdb     = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(), fd_accdb_footprint( tile->snapin.max_live_slots ) );
-    void * _write_buf = FD_SCRATCH_ALLOC_APPEND( l, 4096UL,           FD_SNAPIN_WRITE_BUF_SZ                            );
+    void * _accdb     = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),            fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    ctx->fifo         = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_extent_t), FD_SNAPIN_FIFO_CNT*sizeof(fd_snapin_extent_t)     );
+    void * _write_buf = FD_SCRATCH_ALLOC_APPEND( l, 4096UL,                      FD_SNAPIN_WRITE_BUF_SZ                            );
     void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
     fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
     FD_TEST( accdb_shmem );
@@ -2765,10 +3240,16 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( ctx->accdb );
 
     ctx->write_buf = _write_buf;
-    worker_reset_write_engine( ctx );
 
-    /* One snapin_io job ring, plus every snapdc_in lane held (reliably)
-       for frag refs. */
+    fd_snapio_snoop_hdr_t * snoop_hdr = fd_snapio_snoop_join( fd_topo_obj_laddr( topo, tile->snapin.snoop_obj_id ) );
+    FD_TEST( snoop_hdr );
+    FD_TEST( ctx->worker_idx<snoop_hdr->worker_cnt );
+    ctx->stripe_locks  = fd_snapio_snoop_stripes( snoop_hdr );
+    ctx->my_snoop      = fd_snapio_snoop_worker( snoop_hdr, ctx->worker_idx );
+    ctx->stake_log_max = snoop_hdr->stake_log_max;
+
+    /* One snapin_io job ring, plus every snapdc_in lane (full reliable
+       consumer, coverage-gated scan). */
     ctx->job_in_idx = ULONG_MAX;
     for( ulong i=0UL; i<tile->in_cnt; i++ ) {
       fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
@@ -2801,13 +3282,15 @@ unprivileged_init( fd_topo_t const *      topo,
     }
     for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) {
       FD_TEST( ctx->in[ lane ].wksp );
-      ctx->release[ lane ] = ULONG_MAX; /* nothing released yet */
     }
 
     ctx->ack_out = out1( topo, tile, "snapio_ack", ctx->worker_idx );
     if( FD_UNLIKELY( ctx->ack_out.idx==ULONG_MAX || ctx->ack_out.mtu!=FD_SNAPIN_IO_ACK_SLOT_SZ ) ) {
       FD_LOG_ERR(( "tile `" NAME ":%lu` missing valid snapio_ack output", tile->kind_id ));
     }
+
+    worker_reset_attempt( ctx );
+    ctx->boot_timestamp = fd_log_wallclock();
     return;
   }
 
@@ -2859,12 +3342,19 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( ctx->worker_cnt ) ) {
     FD_TEST( fd_ulong_is_pow2( ctx->worker_cnt ) );
     ctx->io_enabled = 1;
+
+    fd_snapio_snoop_hdr_t * snoop_hdr = fd_snapio_snoop_join( fd_topo_obj_laddr( topo, tile->snapin.snoop_obj_id ) );
+    FD_TEST( snoop_hdr );
+    FD_TEST( snoop_hdr->worker_cnt==ctx->worker_cnt );
+    ctx->stripe_locks = fd_snapio_snoop_stripes( snoop_hdr );
+    for( ulong w=0UL; w<ctx->worker_cnt; w++ ) ctx->snoops[ w ] = fd_snapio_snoop_worker( snoop_hdr, w );
   }
 
   if( FD_UNLIKELY( ctx->ct_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_ct`" ));
   if( FD_UNLIKELY( ctx->manifest_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_manif`" ));
 
   fd_ssparse_init( ctx->ssparse );
+  fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, ctx->io_enabled );
   fd_ssmanifest_parser_init( ctx->manifest_parser, fd_chunk_to_laddr( ctx->manifest_out.mem, ctx->manifest_out.chunk ) );
   fd_slot_delta_parser_init( ctx->slot_delta_parser );
 
@@ -2905,12 +3395,17 @@ unprivileged_init( fd_topo_t const *      topo,
     FD_TEST( tile->in_cnt==ctx->lane_cnt );
   }
 
-  for( ulong lane=0UL; lane<FD_SNAPIN_IO_LANE_MAX; lane++ ) ctx->lane_consumed_seq[ lane ] = ULONG_MAX;
-  ctx->io_frontier_dirty       = 0;
-  ctx->io_frags_since_frontier = 0UL;
-  ctx->io_jobs_since_credit    = 0UL;
-  ctx->slow.worker_idx         = 0UL;
-  ctx->slow.remaining          = 0UL;
+  ctx->stream_cursor            = 0UL;
+  ctx->appendvec_seq            = 0UL;
+  ctx->covered_until            = 0UL;
+  ctx->io_watermark_dirty       = 0;
+  ctx->io_frags_since_watermark = 0UL;
+  ctx->io_jobs_since_credit     = 0UL;
+  ctx->abort_published          = 0;
+  ctx->snoop_merged             = 0;
+  fd_memset( ctx->worker_assigned_bytes, 0, sizeof(ctx->worker_assigned_bytes) );
+  fd_memset( &ctx->worker_fold, 0, sizeof(ctx->worker_fold) );
+  fd_memset( &ctx->av_stats,    0, sizeof(ctx->av_stats)    );
 
   ctx->gui_config_acct_sz  = 0UL;
   ctx->gui_config_acct_off = 0UL;

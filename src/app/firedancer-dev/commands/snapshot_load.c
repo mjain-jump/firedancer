@@ -174,6 +174,14 @@ snapshot_load_topo( config_t * config ) {
     tile->allow_shutdown = 1;
   }
 
+  /* Striped accdb chain locks + per-worker snoop staging for the
+     parallel snapshot loader. */
+  fd_topob_wksp( topo, "snapio_snoop" );
+  fd_topo_obj_t * snoop_obj = fd_topob_obj( topo, "snapio_snoop", "snapio_snoop" );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_worker_cnt,       "obj.%lu.worker_cnt",    snoop_obj->id ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, FD_SNAPIO_STAKE_LOG_MAX, "obj.%lu.stake_log_max", snoop_obj->id ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, snoop_obj->id, "snapio_snoop" ) );
+
   fd_topob_wksp( topo, "diag" );
   fd_topob_tile( topo, "diag", "diag", "metric_in", ULONG_MAX, 0, 0, 0 );
   fd_topo_tile_t * accdb_tile = fd_topob_tile( topo, "accdb", "accdb", "metric_in", ULONG_MAX, 0, 0, 0 );
@@ -233,9 +241,11 @@ snapshot_load_topo( config_t * config ) {
   FOR(snapin_tile_cnt) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     fd_topob_tile_uses( topo, tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topob_tile_uses( topo, tile, snoop_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     tile->snapin.accdb_obj_id    = accdb_obj->id;
     tile->snapin.txncache_obj_id = txncache_obj->id;
     tile->snapin.banks_obj_id    = banks_obj->id;
+    tile->snapin.snoop_obj_id    = snoop_obj->id;
     tile->snapin.max_live_slots  = config->firedancer.runtime.max_live_slots;
   }
   fd_topob_tile_uses( topo, accdb_tile,  accdb_obj,      FD_SHMEM_JOIN_MODE_READ_WRITE );

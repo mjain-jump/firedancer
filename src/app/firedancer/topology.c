@@ -1463,6 +1463,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->snapin.accdb_obj_id = fd_pod_query_ulong( config->topo.props, "accdb", ULONG_MAX );
     tile->snapin.txncache_obj_id = fd_pod_query_ulong( config->topo.props, "txncache", ULONG_MAX );
     tile->snapin.banks_obj_id = fd_pod_query_ulong( config->topo.props, "banks", ULONG_MAX );
+    tile->snapin.snoop_obj_id = fd_pod_query_ulong( config->topo.props, "snapio_snoop", ULONG_MAX );
     tile->snapin.alpenglow = config->firedancer.development.alpenglow;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "snapwr" ) ) ) {
