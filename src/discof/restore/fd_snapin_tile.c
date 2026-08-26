@@ -1004,15 +1004,27 @@ publish_pending_job( fd_snapin_tile_t *  ctx,
   ctx->io_jobs_since_credit++;
 }
 
+static void
+publish_all_pending_jobs( fd_snapin_tile_t *  ctx,
+                          fd_stem_context_t * stem ) {
+  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
+    publish_pending_job( ctx, worker_idx, stem );
+  }
+}
+
 /* publish_frontier_jobs sends the per-lane released-seq frontier to
-   every worker ring.  Must only be called when no unpublished pending
-   job references a frag covered by lane_consumed_seq — guaranteed
-   because pending jobs are pinned to the in-flight frag (whose seq is
-   not yet in lane_consumed_seq) and flushed when the frag completes. */
+   every worker ring.  Safe with respect to in-flight refs because
+   lane_consumed_seq only ever contains fully-consumed frags: pending
+   jobs are pinned to the in-flight frag (whose seq is not yet in the
+   frontier).  Pending jobs are flushed first anyway — they are staged
+   in-place in the ring slot this would otherwise clobber (reachable
+   from after_credit while a yielded data-frag callback still has jobs
+   staged). */
 
 static void
 publish_frontier_jobs( fd_snapin_tile_t *  ctx,
                        fd_stem_context_t * stem ) {
+  publish_all_pending_jobs( ctx, stem );
   for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
     fd_snapin_out_link_t * out = &ctx->io_out[ worker_idx ];
     fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
@@ -1028,14 +1040,6 @@ publish_frontier_jobs( fd_snapin_tile_t *  ctx,
   }
   ctx->io_frontier_dirty       = 0;
   ctx->io_frags_since_frontier = 0UL;
-}
-
-static void
-publish_all_pending_jobs( fd_snapin_tile_t *  ctx,
-                          fd_stem_context_t * stem ) {
-  for( ulong worker_idx=0UL; worker_idx<ctx->worker_cnt; worker_idx++ ) {
-    publish_pending_job( ctx, worker_idx, stem );
-  }
 }
 
 static inline void
@@ -1182,6 +1186,9 @@ dispatch_account_data( fd_snapin_tile_t *                  ctx,
                        fd_ssparse_advance_result_t const * result,
                        fd_stem_context_t *                 stem ) {
   FD_TEST( result->account_data.data_sz<=ctx->slow.remaining );
+  /* No batch job can be staged in this slot: the HEADER flushed it and
+     stream order admits no new account until this one's data ends. */
+  FD_TEST( !ctx->pending_job_cnt[ ctx->slow.worker_idx ] );
 
   fd_snapin_out_link_t * out = &ctx->io_out[ ctx->slow.worker_idx ];
   fd_snapin_io_job_t * job = fd_chunk_to_laddr( out->mem, out->chunk );
