@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* sync_file_range */
 #include "utils/fd_ssctrl.h"
 #include "utils/fd_ssload.h"
 #include "utils/fd_ssmsg.h"
@@ -27,6 +28,7 @@
 #include "generated/fd_snapin_tile_seccomp.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #define NAME "snapin"
@@ -38,6 +40,27 @@
 /* Per-worker staging buffer for buffered pwrites into the worker's own
    accdb partitions (same size as the deleted snapwr tile's buffer). */
 #define FD_SNAPIN_WRITE_BUF_SZ      (2UL<<20)
+
+/* Write-behind: workers kick async writeback of their flushed records
+   in large contiguous runs and bound their in-flight (kicked but not
+   yet completed) dirty bytes.  Without this, N workers writing ~9 GB/s
+   aggregate into the page cache outrun the array's sustained multi-
+   stream writeback rate; once the accumulated dirty pages cross the
+   kernel's balance_dirty_pages engagement point, every pwrite gets
+   throttled with coarse (up to ~100 ms) sleeps -- and a sleeping
+   worker freezes its lane fseqs (worker fseq == scan position), which
+   convoys the ENTIRE pipe (measured on the n9 bench: raw collapsed
+   from 9.3 GB/s to an oscillating 1.4-7 GB/s once ~100 GB of dirty
+   accumulated ~22 s in).  The write-behind backstop replaces those
+   coarse kernel sleeps with smooth 64 MiB-granular self-throttling to
+   the device, and starting writeback immediately maximizes the bytes
+   drained during the load.  The aggregate window stays below the
+   throttle engagement point ((dirty_background_ratio+dirty_ratio)/2 =
+   6.5% of RAM ~ 98 GB on the bench box) while preserving most of the
+   page-cache elasticity the 4-worker arm relies on. */
+#define FD_SNAPIN_WB_KICK_SZ      (64UL<<20) /* kick writeback per this many contiguous flushed bytes */
+#define FD_SNAPIN_WB_TOTAL_WINDOW (80UL<<30) /* aggregate kicked-not-waited budget across all workers */
+#define FD_SNAPIN_WB_RING_CNT     (4096UL)   /* max outstanding kicked ranges (pow2) */
 
 /* The snapin tile is a state machine that parses and loads a full
    and optionally an incremental snapshot.  It is currently responsible
@@ -348,6 +371,18 @@ struct fd_snapin_tile {
     ulong lag_min;
     ulong lag_max;
   } cov_stats;
+
+  /* Worker: write-behind (bounded in-flight dirty bytes). */
+  ulong wb_kick_sz;                                /* kick granularity (test override) */
+  ulong wb_window;                                 /* per-worker in-flight cap; 0 disables */
+  ulong wb_run_off;                                /* current un-kicked contiguous flushed run */
+  ulong wb_run_sz;
+  ulong wb_pending;                                /* kicked but not yet waited-on bytes */
+  ulong wb_head;                                   /* ring of kicked ranges */
+  ulong wb_tail;
+  ulong wb_kick_cnt;                               /* instrumentation */
+  ulong wb_wait_cnt;
+  struct { ulong off; ulong sz; } wb_ring[ FD_SNAPIN_WB_RING_CNT ];
 
   /* both roles */
   uint * stripe_locks;
@@ -1670,6 +1705,12 @@ worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
   ctx->whead.val           = 0UL;
   ctx->whead.has_partition = 0;
   fd_memset( &ctx->open_acc, 0, sizeof(ctx->open_acc) );
+  ctx->wb_run_sz  = 0UL;
+  ctx->wb_pending = 0UL;
+  ctx->wb_head    = 0UL;
+  ctx->wb_tail    = 0UL;
+  ctx->wb_kick_cnt = 0UL;
+  ctx->wb_wait_cnt = 0UL;
 }
 
 static void
@@ -1711,6 +1752,80 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
    with an explicit flush_off because per-worker offsets are only
    sequential within a partition). */
 
+/* Write-behind machinery.  worker_wb_disable turns it off for the rest
+   of the run (unsupported filesystem); worker_wb_kick starts async
+   writeback of the accumulated contiguous run; worker_wb_track records
+   a flushed range and applies the smooth self-throttle backstop. */
+
+static void
+worker_wb_disable( fd_snapin_tile_t * ctx ) {
+  FD_LOG_WARNING(( "sync_file_range failed (%d-%s); disabling worker write-behind", errno, fd_io_strerror( errno ) ));
+  ctx->wb_window  = 0UL;
+  ctx->wb_run_sz  = 0UL;
+  ctx->wb_pending = 0UL;
+  ctx->wb_head    = ctx->wb_tail;
+}
+
+static void
+worker_wb_kick( fd_snapin_tile_t * ctx ) {
+  if( FD_LIKELY( !ctx->wb_run_sz ) ) return;
+
+  /* Ring full: retire the oldest range first. */
+  if( FD_UNLIKELY( ctx->wb_tail-ctx->wb_head>=FD_SNAPIN_WB_RING_CNT ) ) {
+    ulong idx = ctx->wb_head & (FD_SNAPIN_WB_RING_CNT-1UL);
+    while( FD_UNLIKELY( -1==sync_file_range( FD_ACCDB_FD_RW, (long)ctx->wb_ring[ idx ].off, (long)ctx->wb_ring[ idx ].sz,
+                                             SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER ) ) ) {
+      if( FD_LIKELY( errno==EINTR ) ) continue;
+      worker_wb_disable( ctx );
+      return;
+    }
+    ctx->wb_pending -= ctx->wb_ring[ idx ].sz;
+    ctx->wb_head++;
+    ctx->wb_wait_cnt++;
+  }
+
+  while( FD_UNLIKELY( -1==sync_file_range( FD_ACCDB_FD_RW, (long)ctx->wb_run_off, (long)ctx->wb_run_sz, SYNC_FILE_RANGE_WRITE ) ) ) {
+    if( FD_LIKELY( errno==EINTR ) ) continue;
+    worker_wb_disable( ctx );
+    return;
+  }
+  ctx->wb_ring[ ctx->wb_tail & (FD_SNAPIN_WB_RING_CNT-1UL) ] = (__typeof__(ctx->wb_ring[0])){ .off = ctx->wb_run_off, .sz = ctx->wb_run_sz };
+  ctx->wb_tail++;
+  ctx->wb_pending += ctx->wb_run_sz;
+  ctx->wb_run_sz   = 0UL;
+  ctx->wb_kick_cnt++;
+}
+
+static void
+worker_wb_track( fd_snapin_tile_t * ctx,
+                 ulong              off,
+                 ulong              sz ) {
+  if( FD_LIKELY( !ctx->wb_window ) ) return;
+
+  if( FD_UNLIKELY( ctx->wb_run_sz && off!=ctx->wb_run_off+ctx->wb_run_sz ) ) worker_wb_kick( ctx ); /* partition rotation */
+  if( FD_UNLIKELY( !ctx->wb_run_sz ) ) ctx->wb_run_off = off;
+  ctx->wb_run_sz += sz;
+  if( FD_UNLIKELY( ctx->wb_run_sz>=ctx->wb_kick_sz ) ) worker_wb_kick( ctx );
+
+  /* Backstop: wait on the oldest kicked range whenever the in-flight
+     window is exceeded.  The range was kicked (window/kick ~ tens of
+     ranges) earlier, so the wait is short and 64 MiB granular: the
+     512 MiB lane runway rides through it where the kernel's coarse
+     dirty-throttle sleeps would stall the pipe. */
+  while( FD_UNLIKELY( ctx->wb_window && ctx->wb_pending>ctx->wb_window && ctx->wb_head!=ctx->wb_tail ) ) {
+    ulong idx = ctx->wb_head & (FD_SNAPIN_WB_RING_CNT-1UL);
+    while( FD_UNLIKELY( -1==sync_file_range( FD_ACCDB_FD_RW, (long)ctx->wb_ring[ idx ].off, (long)ctx->wb_ring[ idx ].sz,
+                                             SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER ) ) ) {
+      if( FD_LIKELY( errno==EINTR ) ) continue;
+      worker_wb_disable( ctx );
+      return;
+    }
+    ctx->wb_pending -= ctx->wb_ring[ idx ].sz;
+    ctx->wb_head++;
+    ctx->wb_wait_cnt++;
+  }
+}
+
 static void
 worker_buffer_flush( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( !ctx->write_buf_used ) ) return;
@@ -1729,6 +1844,8 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
   }
   ctx->flush_off      += sz;
   ctx->write_buf_used  = 0UL;
+
+  worker_wb_track( ctx, off, sz );
 }
 
 static void
@@ -2219,10 +2336,10 @@ worker_try_complete_fini( fd_snapin_tile_t *  ctx,
 
   /* Day-1 throttling instrumentation (D4-ghost watch) */
   double lag_avg = ctx->cov_stats.lag_samples ? (double)ctx->cov_stats.lag_sum/(double)ctx->cov_stats.lag_samples : 0.0;
-  FD_LOG_NOTICE(( "worker %lu: coverage holds=%lu, coverage lag min/avg/max=%lu/%.0f/%lu bytes (%lu samples), bytes_written=%lu",
+  FD_LOG_NOTICE(( "worker %lu: coverage holds=%lu, coverage lag min/avg/max=%lu/%.0f/%lu bytes (%lu samples), bytes_written=%lu, wb kicks=%lu waits=%lu",
                   ctx->worker_idx, ctx->cov_stats.hold_reprocess,
                   ctx->cov_stats.lag_min==ULONG_MAX ? 0UL : ctx->cov_stats.lag_min, lag_avg, ctx->cov_stats.lag_max,
-                  ctx->cov_stats.lag_samples, ctx->bytes_written ));
+                  ctx->cov_stats.lag_samples, ctx->bytes_written, ctx->wb_kick_cnt, ctx->wb_wait_cnt ));
 
   FD_COMPILER_MFENCE(); /* snoop staging visible before the ack */
   worker_publish_ack( ctx, stem, FD_SNAPSHOT_MSG_CTRL_FINI, 0 );
@@ -3273,6 +3390,9 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->stripe_locks  = fd_snapio_snoop_stripes( snoop_hdr );
     ctx->my_snoop      = fd_snapio_snoop_worker( snoop_hdr, ctx->worker_idx );
     ctx->stake_log_max = snoop_hdr->stake_log_max;
+
+    ctx->wb_kick_sz = FD_SNAPIN_WB_KICK_SZ;
+    ctx->wb_window  = FD_SNAPIN_WB_TOTAL_WINDOW/snoop_hdr->worker_cnt;
 
     /* One snapin_io job ring, plus every snapdc_in lane (full reliable
        consumer, coverage-gated scan). */

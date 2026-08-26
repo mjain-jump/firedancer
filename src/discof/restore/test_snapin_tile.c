@@ -1912,6 +1912,53 @@ test_coordinator_full_lifecycle_8_workers( void ) {
   free( banks_mem );
 }
 
+/* Worker write-behind: async writeback kicked per contiguous run,
+   partition-rotation discontinuities kick the partial run, and the
+   in-flight window applies the smooth wait backstop. */
+static void
+test_worker_write_behind( void ) {
+  static uchar data[ 4096UL ];
+  fd_memset( data, 0x66, sizeof(data) );
+
+  fd_snapin_tile_t ctx[1];
+  worker_ctx_init( ctx, 1UL );
+  ctx->wb_kick_sz = 4096UL;
+  ctx->wb_window  = 8192UL;
+
+  worker_buffer_write( ctx, 0UL, data, 4096UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( ctx->wb_kick_cnt==1UL && ctx->wb_pending==4096UL && ctx->wb_wait_cnt==0UL );
+
+  worker_buffer_write( ctx, 4096UL, data, 4096UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( ctx->wb_kick_cnt==2UL && ctx->wb_pending==8192UL && ctx->wb_wait_cnt==0UL );
+
+  /* Window exceeded: backstop waits on the oldest range. */
+  worker_buffer_write( ctx, 8192UL, data, 4096UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( ctx->wb_kick_cnt==3UL && ctx->wb_wait_cnt==1UL && ctx->wb_pending==8192UL );
+
+  /* Sub-kick run accumulates without kicking... */
+  worker_buffer_write( ctx, 1UL<<20, data, 100UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( ctx->wb_kick_cnt==3UL && ctx->wb_run_off==(1UL<<20) && ctx->wb_run_sz==100UL );
+
+  /* ...and a discontinuity (partition rotation) kicks the partial run. */
+  worker_buffer_write( ctx, 2UL<<20, data, 100UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( ctx->wb_kick_cnt==4UL && ctx->wb_run_off==(2UL<<20) && ctx->wb_run_sz==100UL );
+  FD_TEST( ctx->wb_pending<=ctx->wb_window );
+
+  worker_reset_write_engine( ctx );
+  FD_TEST( !ctx->wb_pending && ctx->wb_head==ctx->wb_tail && !ctx->wb_run_sz );
+
+  /* Disabled window: no tracking. */
+  ctx->wb_window = 0UL;
+  worker_buffer_write( ctx, 0UL, data, 4096UL );
+  worker_buffer_flush( ctx );
+  FD_TEST( !ctx->wb_kick_cnt && !ctx->wb_pending );
+}
+
 /* Coordinator passthrough: an appendvec tar header becomes an ASSIGN on
    the least-loaded worker's ring carrying the inline coverage; a region
    header broadcasts the watermark immediately; tar EOF broadcasts EOS. */
@@ -2176,6 +2223,7 @@ main( int     argc,
   test_coordinator_full_lifecycle_8_workers();
   test_coordinator_assign_flow();
   test_coordinator_watermark_protocol();
+  test_worker_write_behind();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
   return 0;
