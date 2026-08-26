@@ -1525,63 +1525,82 @@ test_deferred_write_stats_two_joiners( void ) {
 
 #define TEST_SNAPSHOT_WRITER_CNT (4UL)
 #define TEST_SNAPSHOT_ACCOUNT_CNT (32768UL)
+#define TEST_SNAPSHOT_DATA_LEN (1000UL)
 
 typedef struct {
-  fd_accdb_t *       accdb;
-  pthread_barrier_t * barrier;
-  uchar (*            pubkeys)[ 32UL ];
-  ulong const *       chain_idxs;
-  ulong const *       insert_offsets;
-  ulong const *       replace_offsets;
-  ulong               worker_idx;
-  ulong               loaded;
-  ulong               replaced;
+  fd_accdb_t *              accdb;
+  int                       fd;
+  pthread_barrier_t *       barrier;
+  uchar (*                  pubkeys)[ 32UL ];
+  ulong const *             chain_idxs;
+  ulong                     worker_idx;
+  fd_accdb_snapshot_whead_t whead;
+  ulong                     loaded;
+  ulong                     replaced;
+  ulong                     ignored;
+  ulong *                   alloc_offsets; /* every allocation this writer made */
+  ulong                     alloc_cnt;
 } test_snapshot_writer_ctx_t;
 
+/* Insert/replace every owned account at slot with lamports_mul, letting
+   the writer allocate its own explicit offsets.  expect_ignored drives
+   the third phase: a stale (lower-slot) rewrite must be ignored without
+   allocating.  Accepted entries get their 72-byte disk meta pwritten at
+   the allocated offset so the readback verifier can check the layout. */
 static void
 test_snapshot_writer_phase( test_snapshot_writer_ctx_t * ctx,
-                            ulong const *                 file_offsets,
-                            ulong                         slot,
-                            ulong                         lamports_mul ) {
+                            ulong                        slot,
+                            ulong                        lamports_mul,
+                            int                          expect_ignored ) {
   uchar const * pubkeys[ 8 ];
   ulong lamports   [ 8 ];
-  ulong data_lens  [ 8 ] = {0};
+  ulong data_lens  [ 8 ];
   int   executables[ 8 ] = {0};
   ulong offsets    [ 8 ];
   ulong chain_idxs [ 8 ];
   ulong cnt = 0UL;
 
-  for( ulong i=0UL; i<TEST_SNAPSHOT_ACCOUNT_CNT; i++ ) {
-    if( (ctx->chain_idxs[ i ] & (TEST_SNAPSHOT_WRITER_CNT-1UL))!=ctx->worker_idx ) continue;
-    pubkeys [ cnt ] = ctx->pubkeys[ i ];
-    chain_idxs[ cnt ] = ctx->chain_idxs[ i ];
-    lamports[ cnt ] = lamports_mul*(i+1UL);
-    offsets [ cnt ] = file_offsets[ i ];
-    cnt++;
-    if( cnt<8UL && i+1UL<TEST_SNAPSHOT_ACCOUNT_CNT ) continue;
+  for( ulong i=0UL; i<=TEST_SNAPSHOT_ACCOUNT_CNT; i++ ) {
+    if( FD_LIKELY( i<TEST_SNAPSHOT_ACCOUNT_CNT ) ) {
+      if( (ctx->chain_idxs[ i ] & (TEST_SNAPSHOT_WRITER_CNT-1UL))!=ctx->worker_idx ) continue;
+      pubkeys   [ cnt ] = ctx->pubkeys[ i ];
+      chain_idxs[ cnt ] = ctx->chain_idxs[ i ];
+      lamports  [ cnt ] = lamports_mul*(i+1UL);
+      data_lens [ cnt ] = TEST_SNAPSHOT_DATA_LEN;
+      cnt++;
+      if( cnt<8UL ) continue;
+    }
+    if( FD_UNLIKELY( !cnt ) ) break; /* trailing flush with nothing pending */
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
     fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, cnt, chain_idxs );
-    FD_TEST( !fd_accdb_snapshot_write_batch_preallocated_prehashed( ctx->accdb, SENTINEL, cnt, pubkeys, chain_idxs, slot,
-                                                                    lamports, data_lens, executables, offsets,
-                                                                    &ignored, &replaced, &loaded,
-                                                                    &replaced_lamports, &ignored_lamports ) );
-    FD_TEST( !ignored );
+    ulong whead_before = ctx->whead.val;
+    FD_TEST( !fd_accdb_snapshot_write_batch_worker( ctx->accdb, cnt, pubkeys, chain_idxs, slot,
+                                                    lamports, data_lens, executables,
+                                                    &ctx->whead, offsets,
+                                                    &ignored, &replaced, &loaded,
+                                                    &replaced_lamports, &ignored_lamports ) );
+    if( expect_ignored ) {
+      FD_TEST( ignored==cnt && !replaced && !loaded );
+      FD_TEST( ctx->whead.val==whead_before ); /* ignored dups burn no space */
+      for( ulong j=0UL; j<cnt; j++ ) FD_TEST( offsets[ j ]==ULONG_MAX );
+    } else {
+      FD_TEST( !ignored );
+      for( ulong j=0UL; j<cnt; j++ ) {
+        FD_TEST( offsets[ j ]!=ULONG_MAX );
+        ctx->alloc_offsets[ ctx->alloc_cnt++ ] = offsets[ j ];
+        fd_accdb_disk_meta_t meta;
+        fd_memcpy( meta.pubkey, pubkeys[ j ], 32UL );
+        meta.size       = (uint)TEST_SNAPSHOT_DATA_LEN;
+        meta.generation = 0U;
+        fd_memset( meta.owner, 0, 32UL );
+        FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)offsets[ j ] )==(long)sizeof(meta) );
+      }
+    }
     ctx->loaded   += loaded;
     ctx->replaced += replaced;
+    ctx->ignored  += ignored;
     cnt = 0UL;
-  }
-
-  if( cnt ) {
-    ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-    fd_accdb_snapshot_prefetch_chain_batch( ctx->accdb, cnt, chain_idxs );
-    FD_TEST( !fd_accdb_snapshot_write_batch_preallocated_prehashed( ctx->accdb, SENTINEL, cnt, pubkeys, chain_idxs, slot,
-                                                                    lamports, data_lens, executables, offsets,
-                                                                    &ignored, &replaced, &loaded,
-                                                                    &replaced_lamports, &ignored_lamports ) );
-    FD_TEST( !ignored );
-    ctx->loaded   += loaded;
-    ctx->replaced += replaced;
   }
 }
 
@@ -1591,21 +1610,33 @@ run_snapshot_writer( void * _ctx ) {
   fd_accdb_snapshot_writer_begin( ctx->accdb );
   int rc = pthread_barrier_wait( ctx->barrier );
   FD_TEST( rc==0 || rc==PTHREAD_BARRIER_SERIAL_THREAD );
-  test_snapshot_writer_phase( ctx, ctx->insert_offsets,  10UL, 1UL );
-  test_snapshot_writer_phase( ctx, ctx->replace_offsets, 11UL, 2UL );
+  test_snapshot_writer_phase( ctx, 10UL, 1UL, 0 ); /* insert */
+  test_snapshot_writer_phase( ctx, 11UL, 2UL, 0 ); /* replace (new allocation, old space freed) */
+  test_snapshot_writer_phase( ctx,  9UL, 3UL, 1 ); /* stale rewrite: ignored, burns nothing */
+  fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
+  FD_TEST( !ctx->whead.has_partition );
   fd_accdb_snapshot_writer_end( ctx->accdb );
   return NULL;
 }
 
-/* Exercise the same concurrency contract as multi-tile snapin: one
-   coordinator reserves disk offsets in stream order, then four writer
-   joiners mutate disjoint hash-chain ownership domains.  The second
-   phase replaces every account to cover concurrent bytes_freed and
-   shared metric updates as well as new acc_pool allocation. */
+static int
+test_offset_cmp( void const * a, void const * b ) {
+  ulong ua = *(ulong const *)a; ulong ub = *(ulong const *)b;
+  return ua<ub ? -1 : (ua>ub ? 1 : 0);
+}
+
+/* Exercise the same concurrency contract as multi-tile snapin under
+   explicit-offset workers: four writer joiners mutate disjoint
+   hash-chain ownership domains AND allocate their own disk offsets from
+   private write heads into exclusive partition sets.  Phase two
+   replaces every account (concurrent bytes_freed + shared metric
+   updates + new acc_pool allocation), phase three checks that stale
+   duplicates are ignored before allocation. */
 static void
 test_snapshot_parallel_writers( void ) {
   int fd;
-  fd_accdb_t * coordinator = test_setup_ex( &fd, 65536UL, 64UL, 8192UL, 1024UL, 11UL<<20UL,
+  ulong partition_sz = 11UL<<20UL;
+  fd_accdb_t * coordinator = test_setup_ex( &fd, 65536UL, 64UL, 8192UL, 1024UL, partition_sz,
                                             TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED,
                                             1UL+TEST_SNAPSHOT_WRITER_CNT );
   fd_accdb_t * writers[ TEST_SNAPSHOT_WRITER_CNT ];
@@ -1616,9 +1647,8 @@ test_snapshot_parallel_writers( void ) {
 
   uchar (* pubkeys)[ 32UL ] = aligned_alloc( alignof(ulong), TEST_SNAPSHOT_ACCOUNT_CNT*32UL );
   ulong * account_chain_idxs = aligned_alloc( alignof(ulong), TEST_SNAPSHOT_ACCOUNT_CNT*sizeof(ulong) );
-  ulong * insert_offsets    = aligned_alloc( alignof(ulong), TEST_SNAPSHOT_ACCOUNT_CNT*sizeof(ulong) );
-  ulong * replace_offsets   = aligned_alloc( alignof(ulong), TEST_SNAPSHOT_ACCOUNT_CNT*sizeof(ulong) );
-  FD_TEST( pubkeys && account_chain_idxs && insert_offsets && replace_offsets );
+  ulong * all_offsets        = aligned_alloc( alignof(ulong), 2UL*TEST_SNAPSHOT_ACCOUNT_CNT*sizeof(ulong) );
+  FD_TEST( pubkeys && account_chain_idxs && all_offsets );
 
   for( ulong i=0UL; i<TEST_SNAPSHOT_ACCOUNT_CNT; i++ ) {
     ulong x = i+1UL;
@@ -1642,30 +1672,21 @@ test_snapshot_parallel_writers( void ) {
     }
   }
 
-  ulong data_lens[ 8 ] = {0};
-  for( ulong base=0UL; base<TEST_SNAPSHOT_ACCOUNT_CNT; base+=8UL ) {
-    ulong cnt = fd_ulong_min( 8UL, TEST_SNAPSHOT_ACCOUNT_CNT-base );
-    fd_accdb_snapshot_reserve_batch( coordinator, cnt, data_lens, insert_offsets+base );
-  }
-  for( ulong base=0UL; base<TEST_SNAPSHOT_ACCOUNT_CNT; base+=8UL ) {
-    ulong cnt = fd_ulong_min( 8UL, TEST_SNAPSHOT_ACCOUNT_CNT-base );
-    fd_accdb_snapshot_reserve_batch( coordinator, cnt, data_lens, replace_offsets+base );
-  }
-
   pthread_barrier_t barrier;
   FD_TEST( !pthread_barrier_init( &barrier, NULL, (uint)TEST_SNAPSHOT_WRITER_CNT ) );
   test_snapshot_writer_ctx_t ctx[ TEST_SNAPSHOT_WRITER_CNT ];
   pthread_t threads[ TEST_SNAPSHOT_WRITER_CNT ];
   for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) {
     ctx[ i ] = (test_snapshot_writer_ctx_t){
-      .accdb           = writers[ i ],
-      .barrier         = &barrier,
-      .pubkeys         = pubkeys,
-      .chain_idxs      = account_chain_idxs,
-      .insert_offsets  = insert_offsets,
-      .replace_offsets = replace_offsets,
-      .worker_idx      = i,
+      .accdb         = writers[ i ],
+      .fd            = fd,
+      .barrier       = &barrier,
+      .pubkeys       = pubkeys,
+      .chain_idxs    = account_chain_idxs,
+      .worker_idx    = i,
+      .alloc_offsets = aligned_alloc( alignof(ulong), 2UL*TEST_SNAPSHOT_ACCOUNT_CNT*sizeof(ulong) ),
     };
+    FD_TEST( ctx[ i ].alloc_offsets );
     FD_TEST( !pthread_create( &threads[ i ], NULL, run_snapshot_writer, &ctx[ i ] ) );
   }
   for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) FD_TEST( !pthread_join( threads[ i ], NULL ) );
@@ -1673,25 +1694,58 @@ test_snapshot_parallel_writers( void ) {
 
   ulong loaded = 0UL;
   ulong replaced = 0UL;
+  ulong ignored = 0UL;
+  ulong all_cnt = 0UL;
   for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) {
     FD_TEST( ctx[ i ].loaded );
     loaded   += ctx[ i ].loaded;
     replaced += ctx[ i ].replaced;
+    ignored  += ctx[ i ].ignored;
+    fd_memcpy( all_offsets+all_cnt, ctx[ i ].alloc_offsets, ctx[ i ].alloc_cnt*sizeof(ulong) );
+    all_cnt  += ctx[ i ].alloc_cnt;
   }
-  FD_TEST( loaded==TEST_SNAPSHOT_ACCOUNT_CNT );
+  FD_TEST( loaded  ==TEST_SNAPSHOT_ACCOUNT_CNT );
   FD_TEST( replaced==TEST_SNAPSHOT_ACCOUNT_CNT );
+  FD_TEST( ignored ==TEST_SNAPSHOT_ACCOUNT_CNT );
+  FD_TEST( all_cnt ==2UL*TEST_SNAPSHOT_ACCOUNT_CNT );
+
+  /* Allocations never overlap and each partition is owned by exactly
+     one writer (accounts never straddle a partition boundary). */
+  ulong entry_sz = sizeof(fd_accdb_disk_meta_t)+TEST_SNAPSHOT_DATA_LEN;
+  qsort( all_offsets, all_cnt, sizeof(ulong), test_offset_cmp );
+  for( ulong i=1UL; i<all_cnt; i++ ) {
+    FD_TEST( all_offsets[ i ]>=all_offsets[ i-1UL ]+entry_sz );
+    FD_TEST( all_offsets[ i-1UL ]/partition_sz==(all_offsets[ i-1UL ]+entry_sz-1UL)/partition_sz );
+  }
+  ulong partition_owner[ 1024UL ];
+  for( ulong p=0UL; p<1024UL; p++ ) partition_owner[ p ] = ULONG_MAX;
+  ulong partitions_used = 0UL;
+  for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) {
+    for( ulong j=0UL; j<ctx[ i ].alloc_cnt; j++ ) {
+      ulong p = ctx[ i ].alloc_offsets[ j ]/partition_sz;
+      FD_TEST( p<1024UL );
+      if( partition_owner[ p ]==ULONG_MAX ) { partition_owner[ p ] = i; partitions_used++; }
+      else                                  FD_TEST( partition_owner[ p ]==i );
+    }
+    FD_TEST( ctx[ i ].alloc_cnt*entry_sz>partition_sz ); /* every writer rotated at least once */
+  }
+  FD_TEST( partitions_used>=2UL*TEST_SNAPSHOT_WRITER_CNT );
 
   fd_accdb_snapshot_load_end( coordinator );
-  ulong entry_sz = sizeof(fd_accdb_disk_meta_t);
   fd_accdb_shmem_metrics_t const * shmetrics = fd_accdb_shmetrics( coordinator );
   FD_TEST( shmetrics->accounts_total    ==TEST_SNAPSHOT_ACCOUNT_CNT );
   FD_TEST( shmetrics->disk_used_bytes   ==TEST_SNAPSHOT_ACCOUNT_CNT*entry_sz );
-  ulong reserved_bytes = 2UL*TEST_SNAPSHOT_ACCOUNT_CNT*entry_sz;
-  FD_TEST( shmetrics->disk_current_bytes>=reserved_bytes );
-  FD_TEST( shmetrics->disk_current_bytes< reserved_bytes+(11UL<<20UL) );
+  /* Every touched partition is fully accounted: allocated bytes plus
+     the tail slack booked on rotation / worker_close. */
+  FD_TEST( shmetrics->disk_current_bytes==partitions_used*partition_sz );
+  FD_TEST( shmetrics->disk_allocated_bytes>=shmetrics->disk_current_bytes );
   for( ulong i=0UL; i<TEST_SNAPSHOT_ACCOUNT_CNT; i++ ) {
     FD_TEST( fd_accdb_lamports( coordinator, root, pubkeys[ i ] )==2UL*(i+1UL) );
   }
+
+  /* The sampled index->file readback gate passes against the metas the
+     writers staged at their explicit offsets. */
+  fd_accdb_snapshot_verify_readback( coordinator, TEST_SNAPSHOT_ACCOUNT_CNT );
 
   /* Every unused block tail was returned: exactly max_accounts minus
      the live inserts remains available from the shared pool. */
@@ -1712,14 +1766,14 @@ test_snapshot_parallel_writers( void ) {
   while( acc_pool_acquire( pool_join ) ) free_cnt++;
   FD_TEST( free_cnt==65536UL-TEST_SNAPSHOT_ACCOUNT_CNT );
 
-  free( replace_offsets );
-  free( insert_offsets );
+  free( all_offsets );
   free( account_chain_idxs );
   free( pubkeys );
-  for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) free( writers[ i ] );
+  for( ulong i=0UL; i<TEST_SNAPSHOT_WRITER_CNT; i++ ) { free( ctx[ i ].alloc_offsets ); free( writers[ i ] ); }
   test_teardown( coordinator, fd );
 }
 
+#undef TEST_SNAPSHOT_DATA_LEN
 #undef TEST_SNAPSHOT_ACCOUNT_CNT
 #undef TEST_SNAPSHOT_WRITER_CNT
 
