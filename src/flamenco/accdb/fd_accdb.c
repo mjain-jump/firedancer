@@ -4801,7 +4801,6 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
          advance_root on T2) only run after all workers quiesced. */
       fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
       if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
-      txn->acc_map_idx  = hashes[ i ];
       txn->acc_pool_idx = acc_idx;
       uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
       for(;;) {
