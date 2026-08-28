@@ -1546,9 +1546,6 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->snapin.snoop_obj_id = fd_pod_query_ulong( config->topo.props, "snapio_snoop", ULONG_MAX );
     tile->snapin.alpenglow = config->firedancer.development.alpenglow;
 
-  } else if( FD_UNLIKELY( !strcmp( tile->name, "snapwr" ) ) ) {
-    tile->snapwr.partition_sz = config->development.accdb.partition_size_gib*(1UL<<30UL);
-
   } else if( FD_UNLIKELY( !strcmp( tile->name, "repair" ) ) ) {
     tile->repair.max_pending_shred_sets    = config->tiles.shred.max_pending_shred_sets;
     tile->repair.max_shreds_per_block      = config->limits.max_shreds_per_block;
