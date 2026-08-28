@@ -729,10 +729,6 @@ struct fd_topo_tile {
     } snapin;
 
     struct {
-      ulong partition_sz;
-    } snapwr;
-
-    struct {
 
       uint   bind_address;
       ushort bind_port;
