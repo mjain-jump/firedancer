@@ -530,7 +530,7 @@ snapshot_load_cmd_fn( args_t *   args,
   ulong volatile * const snapct_metrics = fd_metrics_tile( snapct_tile->metrics );
   ulong volatile * const snapld_metrics = fd_metrics_tile( snapld_tile->metrics );
   ulong volatile * const snapin_metrics = fd_metrics_tile( snapin_tile->metrics );
-  ulong volatile *       snapin_all_metrics[ FD_SNAPIN_TILE_MAX ];
+  ulong volatile *       snapin_all_metrics[ FD_TOPO_MAX_TILE_IN_LINKS ];
   for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     snapin_all_metrics[ i ] = fd_metrics_tile( tile->metrics );
@@ -545,7 +545,7 @@ snapshot_load_cmd_fn( args_t *   args,
   ulong decomp_off_old   = 0UL;
   ulong snapld_wait_old  = 0UL;
   ulong snapdc_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
-  ulong snapin_wait_old[ FD_SNAPIN_TILE_MAX ] = {0};
+  ulong snapin_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
   ulong acc_cnt_old      = 0UL;
 
   int color = fd_log_colorize() && isatty( STDOUT_FILENO );
@@ -599,7 +599,7 @@ snapshot_load_cmd_fn( args_t *   args,
     /* Waiting on either neighbor counts as not busy */
     ulong snapld_wait  = snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
                        + snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
-    ulong snapin_wait[ FD_SNAPIN_TILE_MAX ];
+    ulong snapin_wait[ FD_TOPO_MAX_TILE_IN_LINKS ];
     ulong acc_cnt     = 0UL;
     for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
       ulong volatile * metrics = snapin_all_metrics[ i ];
@@ -645,7 +645,7 @@ snapshot_load_cmd_fn( args_t *   args,
       }
       snapdc_busy_avg /= (double)snapdc_tile_cnt;
 
-      double snapin_busy[ FD_SNAPIN_TILE_MAX ];
+      double snapin_busy[ FD_TOPO_MAX_TILE_IN_LINKS ];
       double snapin_busy_avg = 0.0;
       for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
         snapin_busy[ i ] = clamp_pct( 100.0-( ( (double)( snapin_wait[ i ]-snapin_wait_old[ i ] )*ns_per_tick )/1e7 ) );

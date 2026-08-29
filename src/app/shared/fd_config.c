@@ -470,8 +470,13 @@ fd_config_validatef( fd_configf_t const * config ) {
   if( FD_UNLIKELY( !config->layout.snapdc_tile_count || config->layout.snapdc_tile_count>FD_SNAPIN_IO_LANE_MAX ) ) {
     FD_LOG_ERR(( "`layout.snapdc_tile_count` must be in [1,%lu] (each snapshot decompressor lane is tracked by every snapshot loader tile)", FD_SNAPIN_IO_LANE_MAX ));
   }
-  if( FD_UNLIKELY( !config->layout.snapin_tile_count || config->layout.snapin_tile_count>FD_SNAPIN_TILE_MAX ) ) {
-    FD_LOG_ERR(( "`layout.snapin_tile_count` must be in [1,%lu]", FD_SNAPIN_TILE_MAX ));
+  /* snapct reads one snapin_ct ack link per snapin tile, plus gossip_out
+     and snapld_dc, and a tile may have at most
+     FD_TOPO_MAX_TILE_IN_LINKS in-links. */
+  if( FD_UNLIKELY( !config->layout.snapin_tile_count || config->layout.snapin_tile_count>FD_TOPO_MAX_TILE_IN_LINKS-2UL ) ) {
+    FD_LOG_ERR(( "`layout.snapin_tile_count` must be in [1,%lu] (snapct reads one ack link per snapshot loader tile "
+                 "in addition to gossip_out and snapld_dc, and a tile is limited to FD_TOPO_MAX_TILE_IN_LINKS=%lu in-links)",
+                 FD_TOPO_MAX_TILE_IN_LINKS-2UL, FD_TOPO_MAX_TILE_IN_LINKS ));
   }
   if( FD_UNLIKELY( config->layout.sign_tile_count < 2 ) ) {
     FD_LOG_ERR(( "layout.sign_tile_count must be >= 2" ));

@@ -321,7 +321,7 @@ struct fd_snapin_tile {
   fd_snapio_snoop_hdr_t * snoop_hdr;
   int *                   stripe_locks;
   fd_snapio_worker_t *    my_snoop;                      /* this tile's fail-partition staging */
-  fd_snapio_worker_t *    snoops[ FD_SNAPIN_TILE_MAX ];   /* tile 0: all tiles' fail-partition staging */
+  fd_snapio_worker_t *    snoops[ FD_TOPO_MAX_TILE_IN_LINKS ]; /* tile 0: all tiles' fail-partition staging */
 
   /* Sharded parse state (per attempt). */
   ulong appendvec_seq;      /* stream sequence number of the next appendvec header */
@@ -2868,7 +2868,7 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _accdb          = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->snapin.max_live_slots ) );
 
   ctx->tile_idx = tile->kind_id;
-  if( FD_UNLIKELY( ctx->tile_idx>=FD_SNAPIN_TILE_MAX ) ) {
+  if( FD_UNLIKELY( ctx->tile_idx>=FD_TOPO_MAX_TILE_IN_LINKS ) ) {
     FD_LOG_ERR(( "tile `" NAME "` has unsupported kind id %lu", tile->kind_id ));
   }
   ctx->full            = 1;
