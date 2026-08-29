@@ -43,8 +43,16 @@ pwrite64: (eq (arg 0) accounts_fd)
 # accounts database: tile 0 samples records back from the
 # accounts file at load end to verify the index and file agree.
 #
+# The readback reads each sampled record whole (header plus compressed
+# payload) and decompresses it, so it goes through the shared
+# accdb_read_record helper, which issues preadv2(2) and not pread(2).
+# Any accdb entry point reachable from this tile must keep to the four
+# syscalls named in this policy; adding a read path that uses a
+# different one silently turns into SIGSYS under the full sandbox,
+# because only the unsandboxed snapshot-load harness exercises it.
+#
 # arg 0 is the file descriptor to read from.
-pread64: (eq (arg 0) accounts_fd)
+preadv2: (eq (arg 0) accounts_fd)
 
 # accounts database: start and bound asynchronous writeback
 #

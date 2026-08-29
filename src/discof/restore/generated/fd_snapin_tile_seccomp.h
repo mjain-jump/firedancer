@@ -51,8 +51,8 @@ static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct so
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_fallocate, /* check_fallocate */ 19, 0 ),
     /* check pwrite64 */
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_pwrite64, /* check_pwrite64 */ 24, 0 ),
-    /* check pread64 */
-    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_pread64, /* check_pread64 */ 27, 0 ),
+    /* check preadv2 */
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_preadv2, /* check_preadv2 */ 27, 0 ),
     /* check sync_file_range */
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_sync_file_range, /* check_sync_file_range */ 30, 0 ),
 //  RET_KILL_PROCESS:
@@ -109,13 +109,13 @@ static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct so
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS ),
 //  pwrite64_ALLOW:
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_ALLOW ),
-//  check_pread64:
+//  check_preadv2:
     /* arg 0 low 32 bits */
     BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(0)),
-    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(accounts_fd)), /* pread64_ALLOW */ 1, /* pread64_KILL */ 0 ),
-//  pread64_KILL:
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(accounts_fd)), /* preadv2_ALLOW */ 1, /* preadv2_KILL */ 0 ),
+//  preadv2_KILL:
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS ),
-//  pread64_ALLOW:
+//  preadv2_ALLOW:
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_ALLOW ),
 //  check_sync_file_range:
     /* arg 0 low 32 bits */
