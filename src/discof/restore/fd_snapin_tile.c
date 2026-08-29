@@ -125,7 +125,13 @@ FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SNAPSHOT_DATA_MTU + FD_SSPARSE_ACC_BAT
    aggregate pwrite intake cannot outrun the array's writeback and
    riding the page cache is measurably faster. */
 
-#define FD_SNAPIN_WB_MIN_WORKERS  (8UL)
+/* With fd_zle compression the full-snapshot write volume (~70 GB at the
+   measured ~6x ratio) sits well below the kernel dirty-throttle ceiling,
+   so the write-behind engine's premise no longer holds: benched at
+   N=8/16/24/32 it only adds stalls (54.8-87s with vs 53-54s without).
+   Effectively disabled; re-derive from projected compressed volume vs
+   vm.dirty limits if account data ever stops compressing. */
+#define FD_SNAPIN_WB_MIN_WORKERS  (ULONG_MAX)
 
 /* Rate limit for the attempt-slot gate diagnostic.  The gate holds the
    tile's data lanes (it does not spin inside a frag handler), so an
