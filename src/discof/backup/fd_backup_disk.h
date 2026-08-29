@@ -7,6 +7,7 @@
 #include "fd_backup.h"
 #include "fd_backup_accidx.h"
 #include "fd_backup_shmem.h"
+#include "../../flamenco/accdb/fd_zle.h"
 #include "../../tango/fd_tango_base.h"
 
 /* FD_SNAPMK_PF_LEAD is how far ahead of the record cursor the parser
@@ -33,7 +34,7 @@ struct fd_snapmk_accparse {
   uint  meta_sz;      /* header bytes buffered so far, if torn */
   int   acc_active;
   uint  acc_off;      /* account data bytes consumed so far */
-  uint  acc_sz;       /* account data byte count */
+  uint  acc_sz;       /* on-disk (fd_zle compressed) payload byte count */
   uint  acc_snap_sz;  /* account byte count in snapshot format */
   uint  acc_idx;      /* index entry, UINT_MAX if not in the snapshot */
   uint  acc_keep;
@@ -205,10 +206,19 @@ fd_snapmk_accparse_publish( fd_snapmk_accparse_t * parse,
 
       if( FD_UNLIKELY( parse->meta_sz < sizeof(fd_accdb_disk_meta_t) ) ) continue;
 
-      ulong data_sz = (ulong)FD_ACCDB_SIZE_DATA( parse->meta.size );
-      ulong snap_sz = sizeof(snap_acc_hdr_t) + fd_ulong_align_up( data_sz, 8UL );
+      /* data_sz is what the account occupies in snapshot format;
+         stored_sz is what its fd_zle compressed payload occupies on
+         disk, i.e. how many bytes of the record still have to be walked
+         and republished.  fd_zle only emits an empty blob for an empty
+         account, so stored_sz==0 iff data_sz==0. */
+      ulong data_sz   = (ulong)FD_ACCDB_SIZE_DATA( parse->meta.size );
+      ulong stored_sz = (ulong)parse->meta.stored_size;
+      ulong snap_sz   = sizeof(snap_acc_hdr_t) + fd_ulong_align_up( data_sz, 8UL );
       if( FD_UNLIKELY( data_sz>UINT_MAX ) ) {
         FD_LOG_CRIT(( "accdb disk account data too large (%lu bytes)", data_sz ));
+      }
+      if( FD_UNLIKELY( stored_sz>FD_ZLE_COMPRESS_BOUND( data_sz ) ) ) {
+        FD_LOG_CRIT(( "accdb disk account stored size %lu exceeds the compression bound of a %lu byte account", stored_sz, data_sz ));
       }
       if( FD_UNLIKELY( snap_sz>UINT_MAX ) ) {
         FD_LOG_CRIT(( "snapshot account record too large (%lu bytes)", snap_sz ));
@@ -216,7 +226,7 @@ fd_snapmk_accparse_publish( fd_snapmk_accparse_t * parse,
 
       parse->acc_active  = 1;
       parse->acc_off     = 0U;
-      parse->acc_sz      = (uint)data_sz;
+      parse->acc_sz      = (uint)stored_sz;
       parse->acc_snap_sz = (uint)snap_sz;
       parse->meta_sz     = 0U;
       parse->acc_keep    = (uint)fd_snapmk_accparse_keep( parse );
@@ -311,8 +321,8 @@ fd_snapmk_accparse_prestage( fd_snapmk_accparse_t * parse ) {
     parse->pf_cursor = pf_lim;
 
     fd_accdb_disk_meta_t const * dm = (fd_accdb_disk_meta_t const *)parse->data;
-    ulong data_len = (ulong)FD_ACCDB_SIZE_DATA( dm->size );
-    ulong rec      = meta_sz + data_len;
+    /* The record advance is the compressed payload length. */
+    ulong rec = meta_sz + (ulong)dm->stored_size;
     if( parse->data_sz < rec ) break;     /* account data straddles frag end */
 
     if( FD_LIKELY( dm->generation <= idx->root_generation ) ) {

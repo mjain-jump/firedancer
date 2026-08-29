@@ -104,6 +104,13 @@ fd_accdb_cache_min_reserved( int bundle_enabled ) {
   return bundle_enabled ? FD_ACCDB_CACHE_MIN_RESERVED_BUNDLE : FD_ACCDB_CACHE_MIN_RESERVED_TXN;
 }
 
+/* FD_ACCDB_DATA_SZ_MAX is the largest account data length accdb can
+   hold, i.e. the payload capacity of the largest cache class.  Equal to
+   FD_RUNTIME_ACC_SZ_MAX, restated here so that accdb does not have to
+   depend on the runtime headers. */
+
+#define FD_ACCDB_DATA_SZ_MAX (10485760UL) /* 10 MiB */
+
 static const ulong fd_accdb_cache_slot_sz[ FD_ACCDB_CACHE_CLASS_CNT ] = {
   128UL+FD_ACCDB_CACHE_META_SZ,      /* class 0: 0-128 B     */
   512UL+FD_ACCDB_CACHE_META_SZ,      /* class 1: 129-512 B   */
@@ -114,6 +121,8 @@ static const ulong fd_accdb_cache_slot_sz[ FD_ACCDB_CACHE_CLASS_CNT ] = {
   1048576UL+FD_ACCDB_CACHE_META_SZ,  /* class 6: 128K-1 MiB  */
   10485760UL+FD_ACCDB_CACHE_META_SZ, /* class 7: 1M-10 MiB   */
 };
+
+FD_STATIC_ASSERT( FD_ACCDB_DATA_SZ_MAX+FD_ACCDB_CACHE_META_SZ==10485760UL+FD_ACCDB_CACHE_META_SZ, data_sz_max );
 
 /* fd_accdb_cache_class_cnt computes the number of slots to allocate for
    each of the 8 size classes, given a total cache memory budget.

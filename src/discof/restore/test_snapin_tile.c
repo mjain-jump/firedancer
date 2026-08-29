@@ -189,9 +189,11 @@ mock_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         a
 
 void
 mock_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
-                                     ulong        sample_max ) {
+                                     ulong        sample_max,
+                                     void *       scratch ) {
   (void)accdb;
   (void)sample_max;
+  FD_TEST( scratch ); /* the tile must hand over its assembly buffer */
   test_accdb_readback_cnt++;
 }
 
@@ -274,6 +276,8 @@ typedef struct {
   ulong                   lane_cnt;
   uchar *                 in_mem;    /* tile_cnt*lane_cnt frag buffers */
   uchar *                 write_buf; /* tile_cnt staging buffers */
+  uchar *                 acc_buf;   /* tile_cnt streamed-account assembly buffers */
+  uchar *                 zbuf;      /* tile_cnt fd_zle compressed staging buffers */
   fd_stake_delegations_t * stake_delegations;
   fd_bank_t *              bank;
   fd_snapin_tile_t        ctx[ TEST_TILE_MAX ];
@@ -329,6 +333,15 @@ test_cluster_new( ulong tile_cnt,
   cl->write_buf = aligned_alloc( 4096UL, tile_cnt*TEST_FRAG_SZ );
   FD_TEST( cl->write_buf );
 
+  /* Full size: worker_compress bounds-checks against FD_SNAPIN_ZBUF_SZ
+     and the streamed path indexes acc_buf by the account's declared
+     data_len, so a short buffer here would turn a real overflow into
+     silent corruption. */
+  cl->acc_buf = aligned_alloc( 4096UL, fd_ulong_align_up( tile_cnt*FD_SNAPIN_ACC_BUF_SZ, 4096UL ) );
+  FD_TEST( cl->acc_buf );
+  cl->zbuf = aligned_alloc( 4096UL, fd_ulong_align_up( tile_cnt*FD_SNAPIN_ZBUF_SZ, 4096UL ) );
+  FD_TEST( cl->zbuf );
+
   /* log_snoop_checksums walks the root stake delegation pool; a zeroed
      struct (pool_idx_wmk_==0) is an empty pool. */
   cl->stake_delegations = aligned_alloc( 128UL, fd_ulong_align_up( sizeof(fd_stake_delegations_t), 128UL ) );
@@ -365,6 +378,8 @@ test_cluster_new( ulong tile_cnt,
 
     ctx->stake_delegations = cl->stake_delegations;
     ctx->write_buf         = cl->write_buf + t*TEST_FRAG_SZ;
+    ctx->acc_buf           = cl->acc_buf   + t*FD_SNAPIN_ACC_BUF_SZ;
+    ctx->zbuf              = cl->zbuf      + t*FD_SNAPIN_ZBUF_SZ;
 
     ctx->ct_out.idx       = 1UL+t;
     ctx->manifest_out.idx = ULONG_MAX;
@@ -401,6 +416,8 @@ static void
 test_cluster_delete( test_cluster_t * cl ) {
   free( cl->bank );
   free( cl->stake_delegations );
+  free( cl->zbuf );
+  free( cl->acc_buf );
   free( cl->write_buf );
   free( cl->in_mem );
   free( cl->sd_mem );

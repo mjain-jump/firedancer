@@ -17,6 +17,7 @@
 #include "fd_backup.h"
 #include "fd_backup_cache.h"
 #include "fd_backup_shmem.h"
+#include "../../flamenco/accdb/fd_zle.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/stem/fd_stem.h"
 #include "../../disco/topo/fd_topo.h"
@@ -78,8 +79,12 @@ struct fd_snapzp {
     fd_pubkey_t owner;
     uint        size;
     uint        acc_idx;
-    ulong       data_rem;
+    ulong       data_rem;   /* compressed payload bytes still to defrag */
     ulong       data_pad;
+    ulong       data_len;   /* uncompressed payload length */
+    ulong       stored_len; /* compressed payload length */
+    ulong       raw_off;    /* offset in raw where the payload expands to */
+    ulong       zoff;       /* compressed bytes defragged into zbuf so far */
   } disk;
 
   struct {
@@ -90,6 +95,12 @@ struct fd_snapzp {
     ulong io_blocked_ticks;
     ulong compress_ticks;
   } metrics;
+
+  /* Staging for the fd_zle compressed payload of a fragmented disk
+     account.  Account data is stored compressed, and decompression
+     needs the whole blob, so the compressed bytes are defragged here
+     and expanded into raw at EOM. */
+  __attribute__((aligned(64)))   uchar zbuf     [ FD_ZLE_COMPRESS_BOUND( FD_RUNTIME_ACC_SZ_MAX ) ];
 
   __attribute__((aligned(4096))) uchar raw_buf1 [ RAW_BUF_SZ  ];
   __attribute__((aligned(4096))) uchar comp_buf1[ COMP_BUF_SZ ];
@@ -563,10 +574,13 @@ msg_acc_disk_start( fd_snapzp_t *                ctx,
   FD_CHECK_CRIT( ctx->snap_fd>=0, "invalid snapshot file descriptor" );
   FD_CHECK_CRIT( !ctx->disk.active, "received account SOM while already processing a disk account" );
 
-  ulong data_len = (ulong)FD_ACCDB_SIZE_DATA( frag->size );
-  ulong rec_sz   = sizeof(snap_acc_hdr_t) + fd_ulong_align_up( data_len, 8UL );
+  ulong data_len   = (ulong)FD_ACCDB_SIZE_DATA( frag->size );
+  ulong stored_len = (ulong)frag->stored_size;
+  ulong rec_sz     = sizeof(snap_acc_hdr_t) + fd_ulong_align_up( data_len, 8UL );
   FD_CHECK_CRIT( rec_sz<=RAW_BUF_SZ, "oversize snapshot account record" );
   FD_CHECK_CRIT( frag->snap_sz==rec_sz, "disk account snapshot size mismatch" );
+  FD_CHECK_CRIT( data_len<=FD_RUNTIME_ACC_SZ_MAX, "oversize accdb disk account" );
+  FD_CHECK_CRIT( stored_len<=FD_ZLE_COMPRESS_BOUND( data_len ), "accdb disk account stored size exceeds the compression bound" );
   if( FD_UNLIKELY( ctx->raw_buf.size + rec_sz > RAW_BUF_SZ ) ) {
     zip_flush( ctx );
   }
@@ -590,8 +604,15 @@ msg_acc_disk_start( fd_snapzp_t *                ctx,
   hdr->data_len   = data_len;
 
   ctx->raw_buf.size += sizeof(snap_acc_hdr_t);
-  ctx->disk.data_rem = data_len;
-  ctx->disk.data_pad = fd_ulong_align_up( data_len, 8UL ) - data_len;
+  /* The payload region is reserved now but only filled at EOM, once the
+     whole compressed blob has been defragged into zbuf: fd_zle cannot
+     decompress a prefix. */
+  ctx->disk.raw_off    = ctx->raw_buf.size;
+  ctx->disk.data_len   = data_len;
+  ctx->disk.stored_len = stored_len;
+  ctx->disk.data_rem   = stored_len;
+  ctx->disk.zoff       = 0UL;
+  ctx->disk.data_pad   = fd_ulong_align_up( data_len, 8UL ) - data_len;
   return (ulong)frag->data_sz;
 }
 
@@ -629,16 +650,16 @@ msg_acc_disk( fd_snapzp_t * ctx,
     frag = fd_wksp_laddr_fast( ctx->snaprd_mem, sig );
   }
 
-  /* defrag copy */
+  /* defrag copy of the compressed payload into zbuf */
   ulong take = fd_ulong_min( ctx->disk.data_rem, frag_sz );
   if( FD_LIKELY( take ) ) {
-    FD_CHECK_CRIT( ctx->raw_buf.size + take <= RAW_BUF_SZ,
+    FD_CHECK_CRIT( ctx->disk.zoff + take <= sizeof(ctx->zbuf),
                    "internal bounds check failed" );
     FD_CHECK_CRIT( (ulong)frag           >= ctx->snaprd_data0 &&
                    (ulong)frag + frag_sz <= ctx->snaprd_data1,
                    "snaprd bounds check failed" );
-    fd_memcpy( ctx->raw + ctx->raw_buf.size, frag, take );
-    ctx->raw_buf.size  += take;
+    fd_memcpy( ctx->zbuf + ctx->disk.zoff, frag, take );
+    ctx->disk.zoff     += take;
     ctx->disk.data_rem -= take;
     frag_sz            -= take;
   }
@@ -648,11 +669,22 @@ msg_acc_disk( fd_snapzp_t * ctx,
   /* finish defrag operation */
   if( eom ) {
     FD_CHECK_CRIT( !ctx->disk.data_rem, "invalid accdb disk frag stream: EOM frag seen but defrag not complete" );
-    if( ctx->disk.data_pad ) {
-      FD_TEST( ctx->raw_buf.size + ctx->disk.data_pad <= RAW_BUF_SZ );
-      fd_memset( ctx->raw + ctx->raw_buf.size, 0, ctx->disk.data_pad );
-      ctx->raw_buf.size += ctx->disk.data_pad;
+    ulong pay_sz = fd_ulong_align_up( ctx->disk.data_len, 8UL );
+    FD_CHECK_CRIT( ctx->disk.raw_off + pay_sz <= RAW_BUF_SZ, "internal bounds check failed" );
+    if( FD_LIKELY( ctx->disk.data_len ) ) {
+      long res = fd_zle_decompress( ctx->raw + ctx->disk.raw_off, ctx->disk.data_len,
+                                    ctx->zbuf, ctx->disk.stored_len );
+      if( FD_UNLIKELY( res<0L ) ) {
+        FD_LOG_CRIT(( "accounts database is corrupt, fd_zle_decompress of a %lu byte disk account payload failed (%s)",
+                      ctx->disk.stored_len, fd_zle_strerror( res ) ));
+      }
+      if( FD_UNLIKELY( (ulong)res!=ctx->disk.data_len ) ) {
+        FD_LOG_CRIT(( "accounts database is corrupt, a %lu byte disk account payload expands to %ld bytes but the header says %lu",
+                      ctx->disk.stored_len, res, ctx->disk.data_len ));
+      }
     }
+    if( ctx->disk.data_pad ) fd_memset( ctx->raw + ctx->disk.raw_off + ctx->disk.data_len, 0, ctx->disk.data_pad );
+    ctx->raw_buf.size += pay_sz;
     ctx->metrics.accounts_compressed++;
     memset( &ctx->disk, 0, sizeof(ctx->disk) );
   }
@@ -703,8 +735,11 @@ msg_acc_disk_batch( fd_snapzp_t *                      ctx,
     fd_accdb_disk_meta_t const * dm = (fd_accdb_disk_meta_t const *)( base + batch->frag_off[ i ] );
     FD_CHECK_CRIT( (ulong)(dm+1) <= (ulong)ctx->snaprd_data1, "account data bounds check fail" );
 
-    ulong data_len = (ulong)FD_ACCDB_SIZE_DATA( dm->size );
-    FD_CHECK_CRIT( (ulong)(dm+1)+data_len <= (ulong)ctx->snaprd_data1, "account data bounds check fail" );
+    ulong data_len   = (ulong)FD_ACCDB_SIZE_DATA( dm->size );
+    ulong stored_len  = (ulong)dm->stored_size;
+    FD_CHECK_CRIT( data_len<=FD_RUNTIME_ACC_SZ_MAX, "oversize accdb disk account" );
+    FD_CHECK_CRIT( stored_len<=FD_ZLE_COMPRESS_BOUND( data_len ), "accdb disk account stored size exceeds the compression bound" );
+    FD_CHECK_CRIT( (ulong)(dm+1)+stored_len <= (ulong)ctx->snaprd_data1, "account data bounds check fail" );
 
     /* validate that disk data matches index */
     FD_CHECK_CRIT( FD_ACCDB_SIZE_DATA( exec_sz[ i ] )==data_len, "account query corruption detected" );
@@ -727,8 +762,18 @@ msg_acc_disk_batch( fd_snapzp_t *                      ctx,
     ctx->raw_buf.size += sizeof(snap_acc_hdr_t);
 
     if( FD_LIKELY( data_len ) ) {
-      uchar const * data = base + batch->frag_off[ i ] + sizeof(fd_accdb_disk_meta_t);
-      fd_memcpy( ctx->raw + ctx->raw_buf.size, data, data_len );
+      /* The on-disk payload is fd_zle compressed; expand it straight
+         into the snapshot record (distinct buffers, no overlap). */
+      uchar const * comp = base + batch->frag_off[ i ] + sizeof(fd_accdb_disk_meta_t);
+      long res = fd_zle_decompress( ctx->raw + ctx->raw_buf.size, data_len, comp, stored_len );
+      if( FD_UNLIKELY( res<0L ) ) {
+        FD_LOG_CRIT(( "accounts database is corrupt, fd_zle_decompress of a %lu byte disk account payload failed (%s)",
+                      stored_len, fd_zle_strerror( res ) ));
+      }
+      if( FD_UNLIKELY( (ulong)res!=data_len ) ) {
+        FD_LOG_CRIT(( "accounts database is corrupt, a %lu byte disk account payload expands to %ld bytes but the header says %lu",
+                      stored_len, res, data_len ));
+      }
       ctx->raw_buf.size += data_len;
     }
     if( data_pad ) {

@@ -6,7 +6,7 @@
 
 #define FD_ACCDB_SHMEM_ALIGN (128UL)
 
-#define FD_ACCDB_SHMEM_MAGIC (0xF17EDA2CE7ACCDB0UL) /* FIREDANCE ACCDB V0 */
+#define FD_ACCDB_SHMEM_MAGIC (0xF17EDA2CE7ACCDB1UL) /* FIREDANCE ACCDB V1 (fd_zle compressed account data) */
 
 /* Accounts are written to a tiered partition layout.  Layer 0 is the
    hot write head used by acquire/release (execution).  Layers 1..N-1
@@ -58,25 +58,52 @@ struct fd_accdb_metrics {
   ulong copy_ops;
 
   ulong bytes_copied;
+
+  /* Logical (pre-compression) counterparts of bytes_read /
+     bytes_written.  Account data is stored fd_zle compressed, so
+     bytes_read / bytes_written count the compressed bytes that actually
+     crossed the syscall boundary, while these count the uncompressed
+     account data those bytes expand to.  The ratio of the two is the
+     achieved compression ratio. */
+  ulong bytes_read_logical;
+  ulong bytes_written_logical;
 };
 
 typedef struct fd_accdb_metrics fd_accdb_metrics_t;
 
-/* fd_accdb_disk_meta_t is the on-disk account revision header. */
+/* fd_accdb_disk_meta_t is the on-disk account revision header.
+
+   The account data bytes that follow the header are fd_zle compressed
+   (see fd_zle.h).  The header therefore carries two lengths:
+
+     size         the uncompressed data length (what the runtime sees).
+     stored_size  the number of compressed bytes that immediately follow
+                  the header, i.e. the payload length on disk.
+
+   The on-disk record size is sizeof(fd_accdb_disk_meta_t)+stored_size,
+   and that is what all write head / offset / free accounting uses.
+   stored_size is bounded by FD_ZLE_COMPRESS_BOUND( size ), which can
+   exceed size by up to FD_ZLE_OVERHEAD for incompressible data.
+
+   owner MUST remain the last field: readers rely on
+   offsetof(owner)+32==sizeof() so that a record is exactly
+   [header][compressed payload] with the owner immediately preceding the
+   payload. */
 
 union fd_accdb_disk_meta {
   struct __attribute__((packed)) {
     uchar pubkey[ 32UL ];
     uint  size;
     uint  generation;
+    uint  stored_size;
     uchar owner[ 32UL ];
   };
-  uchar b[72];
+  uchar b[76];
 };
 
 typedef union fd_accdb_disk_meta fd_accdb_disk_meta_t;
 
-FD_STATIC_ASSERT( sizeof(fd_accdb_disk_meta_t)==72UL, layout );
+FD_STATIC_ASSERT( sizeof(fd_accdb_disk_meta_t)==76UL, layout );
 FD_STATIC_ASSERT( offsetof(fd_accdb_disk_meta_t,owner)+32UL==sizeof(fd_accdb_disk_meta_t), layout );
 
 FD_PROTOTYPES_BEGIN

@@ -487,9 +487,11 @@ fd_accdb_probe_pd_this_fork( fd_accdb_t *       accdb,
    buffer of at least FD_RUNTIME_ACC_SZ_MAX (10 MiB) bytes, the maximum
    account data size; the function does not bound-check against the
    account's actual length.  On a cache hit the bytes are memcpy'd from
-   the cache slot using a try-read-test (ABA) loop; on a miss the owner
-   and data are preadv2'd from the disk fd passed at join time, scattered
-   into out_owner and out_data via iovec (looping on short reads).
+   the cache slot using a try-read-test (ABA) loop; on a miss the whole
+   on-disk record is preadv2'd from the disk fd passed at join time into
+   the joiner's staging buffer, the owner is copied out of its header and
+   the fd_zle compressed payload is decompressed into out_data.  Either
+   way out_data receives uncompressed account data.
 
    If the account does not exist, *out_lamports is set to zero and the
    other outputs are undefined; otherwise *out_lamports is non-zero and
@@ -551,7 +553,25 @@ fd_accdb_reset( fd_accdb_t * accdb );
                  record on fork_id, so fd_accdb_purge can revert the
                  incremental writes on failure.  Intra-fork duplicates
                  (same pubkey from the same fork) are still replaced
-                 in-place. */
+                 in-place.
+
+   COMPRESSION CAVEAT.  Account data is stored fd_zle compressed, and
+   the size of the compressed payload is what sizes an on-disk record.
+   This helper never sees the account bytes, so it cannot compress them:
+   it reserves sizeof(fd_accdb_disk_meta_t)+data_len (the uncompressed
+   size) and records data_len as the account's stored size.  That
+   reservation is always large enough for the real compressed payload,
+   but the recorded stored size is wrong, and no valid fd_zle blob is
+   exactly data_len bytes long (the all-literal escape frame costs
+   1+varint bytes on top).  So an account written through this helper is
+   NOT readable through the normal read path, and
+   fd_accdb_snapshot_verify_readback will reject it.
+
+   There are no production callers: the parallel loader uses
+   fd_accdb_snapshot_write_batch_worker, which takes the compressed
+   length.  This helper survives only for tests that exercise the index
+   and allocator without any account bytes; a test that also reads the
+   account back must stage a real record itself. */
 
 int
 fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
@@ -642,6 +662,15 @@ typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
    the account's bytes).  Shared metrics deltas are accumulated in
    metrics instead of the shared counters.  cnt must be in [1,8].
 
+   data_lens[i] is the uncompressed account data length, which is what
+   goes into the index and what the runtime sees.  stored_lens[i] is the
+   length of the fd_zle compressed blob the caller has already produced
+   for that account, which is what actually lands on disk after the
+   record header: the reserved record is
+   sizeof(fd_accdb_disk_meta_t)+stored_lens[i] bytes and the caller must
+   write exactly the compressed bytes at file_offsets[i]+
+   sizeof(fd_accdb_disk_meta_t).  For a zero length account both are 0.
+
    snoop_candidates[i] flags entry i as interesting to the caller (set
    only for the rare accounts the caller wants to inspect, e.g. those
    owned by the stake program, a tracked feature id, or the
@@ -662,6 +691,7 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       ulong                                slot,
                                       ulong const                          lamports[],
                                       ulong const                          data_lens[],
+                                      ulong const                          stored_lens[],
                                       int const                            executables[],
                                       int const                            snoop_candidates[],
                                       fd_accdb_snapshot_whead_t *          whead,
@@ -716,19 +746,28 @@ fd_accdb_snapshot_worker_release_partitions( fd_accdb_t * accdb,
                                              ulong        cnt );
 
 /* fd_accdb_snapshot_verify_readback samples up to sample_max live
-   accounts from the index and preads each one's on-disk record header
-   at fd_accdb_acc_offset, verifying that the stored pubkey and data
-   size match the index entry.  FD_LOG_ERR on any mismatch.  Intended as
-   a post-load gate for multi-writer snapshot loading, where the on-disk
-   layout is no longer stream-ordered. */
+   accounts from the index and preads each one's whole on-disk record at
+   fd_accdb_acc_offset, verifying that the stored pubkey, data size and
+   stored (compressed) size match the index entry, and that the
+   compressed payload decompresses to exactly data size bytes.
+   FD_LOG_ERR on any mismatch.  Intended as a post-load gate for
+   multi-writer snapshot loading, where the on-disk layout is no longer
+   stream-ordered.
+
+   scratch is the decompression destination and must be at least
+   FD_ACCDB_DATA_SZ_MAX (10 MiB) bytes. */
 
 void
 fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
-                                   ulong        sample_max );
+                                   ulong        sample_max,
+                                   void *       scratch );
 
-/* fd_accdb_snapshot_write_batch processes up to 8 accounts at once,
-   using software prefetching to overlap hash chain memory latency with
-   useful work.  This function is not thread safe and must not be called
+/* fd_accdb_snapshot_write_batch processes up to 8 accounts at once.
+   Carries the same COMPRESSION CAVEAT as fd_accdb_snapshot_write_one:
+   it reserves uncompressed-sized records and has no production callers.
+
+   It uses software prefetching to overlap hash chain memory latency
+   with useful work.  This function is not thread safe and must not be called
    concurrently.  Each pubkey[i] points to a 32-byte public key.
    *out_replaced_lamports is set to the sum of the lamports of all
    accounts replaced by this batch (i.e. the previous lamports value of

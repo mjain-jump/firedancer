@@ -92,7 +92,8 @@ struct __attribute__((aligned(64))) fd_snapio_totals {
   ulong input_lamports;
   ulong replaced_lamports;
   ulong ignored_lamports;
-  ulong bytes_written;
+  ulong bytes_written;         /* fd_zle compressed account bytes actually written */
+  ulong bytes_written_logical; /* uncompressed account data those bytes expand to */
   ulong eq_slot_dups;
   ulong eq_slot_lamports_diff;
   ulong appendvecs_processed;

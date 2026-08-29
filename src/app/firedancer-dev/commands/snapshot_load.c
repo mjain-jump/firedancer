@@ -440,6 +440,10 @@ accounts_hist( accounts_hist_t * hist,
     while( acc_idx!=UINT_MAX ) {
       fd_accdb_accmeta_t const * accmeta = &acc_pool[ acc_idx ];
       ulong data_sz = (ulong)FD_ACCDB_SIZE_DATA( accmeta->executable_size );
+      /* Logical (uncompressed) record size.  Account data is stored
+         fd_zle compressed, so the real on-disk record is smaller; the
+         per-account stored size lives in a shmem side array this
+         layout mirror deliberately does not walk. */
       accounts_hist_update( hist, sizeof(fd_accdb_disk_meta_t) + data_sz );
       acc_idx = accmeta->map.next;
     }

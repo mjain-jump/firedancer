@@ -3,6 +3,7 @@
 #include "fd_accdb.h"
 #include "fd_accdb_cache.h"
 #include "fd_accdb_private.h"
+#include "fd_zle.h"
 #include "../../util/fd_util.h"
 
 #include <stdlib.h>
@@ -1253,6 +1254,62 @@ test_reset( void ) {
   test_teardown( accdb, fd );
 }
 
+/* test_stage_zero_record lays down a valid on-disk record (header plus
+   the fd_zle blob of an all-zero body) for an account already in the
+   index, at the offset the index recorded for it.
+   fd_accdb_snapshot_write_one only RESERVES the record -- it never sees
+   the account bytes -- so a test that later reads the account back has
+   to stage the record itself, or the cold read path has no compressed
+   payload to expand.  The blob is far smaller than the uncompressed
+   reservation, so it always fits.
+
+   Walks the hash chain out of shmem directly, re-deriving the same
+   layout fd_accdb_shmem_new used. */
+
+static void
+test_stage_zero_record( int           fd,
+                        ulong         max_accounts,
+                        uchar const * pubkey,
+                        ulong         data_len ) {
+  fd_accdb_shmem_t * shmem          = test_shmem_mem;
+  ulong              max_live_slots = shmem->max_live_slots;
+  ulong              chain_cnt      = shmem->chain_cnt;
+  FD_SCRATCH_ALLOC_INIT( l, shmem );
+                                 FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
+                                 FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
+                                 FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
+  uint *               acc_map   = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                 );
+  fd_accdb_accmeta_t * acc_pool  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                );
+
+  ulong hash = fd_hash32( pubkey, shmem->seed )&(chain_cnt-1UL);
+  fd_accdb_accmeta_t * acc = NULL;
+  for( uint next=acc_map[ hash ]; next!=UINT_MAX; next=acc_pool[ next ].map.next ) {
+    if( !memcmp( acc_pool[ next ].key.pubkey, pubkey, 32UL ) ) { acc = &acc_pool[ next ]; break; }
+  }
+  FD_TEST( acc );
+  FD_TEST( FD_ACCDB_SIZE_DATA( acc->executable_size )==data_len );
+
+  ulong   rec_max = sizeof(fd_accdb_disk_meta_t)+FD_ZLE_COMPRESS_BOUND( data_len );
+  uchar * body    = calloc( 1UL, data_len ? data_len : 1UL );
+  uchar * rec     = malloc( rec_max );
+  FD_TEST( body && rec );
+
+  ulong stored_len = data_len ? fd_zle_compress( rec+sizeof(fd_accdb_disk_meta_t), body, data_len ) : 0UL;
+  fd_accdb_disk_meta_t * meta = (fd_accdb_disk_meta_t *)rec;
+  fd_memcpy( meta->pubkey, pubkey, 32UL );
+  meta->size        = (uint)data_len;
+  meta->generation  = acc->key.generation;
+  meta->stored_size = (uint)stored_len;
+  fd_memset( meta->owner, 0, 32UL );
+
+  ulong rec_sz   = sizeof(fd_accdb_disk_meta_t)+stored_len;
+  ulong file_off = fd_accdb_acc_offset( acc );
+  FD_TEST( pwrite( fd, rec, rec_sz, (long)file_off )==(long)rec_sz );
+
+  free( rec );
+  free( body );
+}
+
 /* test_revert_whead: revert_whead releases partitions and restores
    disk_current_bytes.  Use a partition size close to the minimum and
    large account writes to deterministically allocate additional
@@ -1281,6 +1338,10 @@ test_revert_whead( void ) {
                                  10UL, (i+1UL)*100UL, 4UL<<20UL, 0, &replaced );
   }
   fd_accdb_snapshot_load_end( accdb );
+
+  /* These five are read back at the end of the test, so they need real
+     records on disk, not just reservations. */
+  for( ulong i=0UL; i<5UL; i++ ) test_stage_zero_record( fd, 1024UL, snap_pks[ i ], 4UL<<20UL );
 
   /* Capture savepoint. */
   fd_accdb_snapshot_recovery_t recovery;
@@ -1602,6 +1663,47 @@ typedef struct {
 #define PAR_LAMPORTS( t, k )  ( 1000000UL + (t)*1000UL + (k) )
 #define PAR_DATA_LEN( t, k )  ( ((t)+(k))%64UL )
 
+/* Account bodies in the striped-loader tests are all zeros, so the
+   fd_zle stored (on-disk) size of a body is a pure function of its
+   length.  The writers reserve records of that size and stage payloads
+   of that size, and the assertions on disk_used_bytes / allocation
+   disjointness derive their expected values from here. */
+
+#define PAR_BODY_MAX (64UL)
+
+static uchar const par_zero_body[ PAR_BODY_MAX ] = {0};
+
+static ulong
+par_stored_len( ulong data_len ) {
+  FD_TEST( data_len<=PAR_BODY_MAX );
+  uchar comp[ FD_ZLE_COMPRESS_BOUND( PAR_BODY_MAX ) ];
+  return fd_zle_compress( comp, par_zero_body, data_len );
+}
+
+/* par_stage_record lays down the whole on-disk record (header plus
+   fd_zle compressed payload) that the accdb writer just reserved, so
+   fd_accdb_snapshot_verify_readback can decompress it. */
+
+static void
+par_stage_record( int           fd,
+                  ulong         file_off,
+                  uchar const * pubkey,
+                  ulong         data_len,
+                  ulong         stored_len ) {
+  uchar rec[ sizeof(fd_accdb_disk_meta_t)+FD_ZLE_COMPRESS_BOUND( PAR_BODY_MAX ) ];
+  fd_accdb_disk_meta_t * meta = (fd_accdb_disk_meta_t *)rec;
+  fd_memcpy( meta->pubkey, pubkey, 32UL );
+  meta->size        = (uint)data_len;
+  meta->generation  = 0U;
+  meta->stored_size = (uint)stored_len;
+  fd_memset( meta->owner, 0, 32UL );
+  if( FD_LIKELY( stored_len ) ) {
+    FD_TEST( fd_zle_compress( rec+sizeof(fd_accdb_disk_meta_t), par_zero_body, data_len )==stored_len );
+  }
+  ulong rec_sz = sizeof(fd_accdb_disk_meta_t)+stored_len;
+  FD_TEST( pwrite( fd, rec, rec_sz, (long)file_off )==(long)rec_sz );
+}
+
 static void *
 par_writer_main( void * _ctx ) {
   par_writer_ctx_t * ctx = _ctx;
@@ -1610,22 +1712,24 @@ par_writer_main( void * _ctx ) {
   ulong k = 0UL;
   while( k<PAR_KEYS ) {
     ulong batch = fd_ulong_min( 1UL+((t+k)%8UL), PAR_KEYS-k );
-    uchar const * pubkeys  [ 8 ];
-    ulong         lamports [ 8 ];
-    ulong         data_lens[ 8 ];
-    int           execs    [ 8 ];
-    ulong         offs     [ 8 ];
+    uchar const * pubkeys    [ 8 ];
+    ulong         lamports   [ 8 ];
+    ulong         data_lens  [ 8 ];
+    ulong         stored_lens[ 8 ];
+    int           execs      [ 8 ];
+    ulong         offs       [ 8 ];
     for( ulong i=0UL; i<batch; i++ ) {
-      pubkeys  [ i ] = ctx->pks[ k+i ];
-      lamports [ i ] = PAR_LAMPORTS( t, k+i );
-      data_lens[ i ] = PAR_DATA_LEN( t, k+i );
-      execs    [ i ] = 0;
+      pubkeys    [ i ] = ctx->pks[ k+i ];
+      lamports   [ i ] = PAR_LAMPORTS( t, k+i );
+      data_lens  [ i ] = PAR_DATA_LEN( t, k+i );
+      stored_lens[ i ] = par_stored_len( data_lens[ i ] );
+      execs      [ i ] = 0;
     }
     ulong slot = ctx->equal_slot ? 200UL : 100UL+t;
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( ctx->accdb, ctx->fork, batch, pubkeys, slot, lamports,
-                                                    data_lens, execs, NULL, &ctx->whead,
+                                                    data_lens, stored_lens, execs, NULL, &ctx->whead,
                                                     ctx->stripe_locks, ctx->stripe_msk, ctx->m,
                                                     offs, &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
@@ -1633,15 +1737,11 @@ par_writer_main( void * _ctx ) {
     for( ulong i=0UL; i<batch; i++ ) {
       if( offs[ i ]==ULONG_MAX ) continue; /* ignored dup burns no space */
       ctx->alloc_offs[ ctx->alloc_cnt ] = offs[ i ];
-      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+stored_lens[ i ];
       ctx->alloc_cnt++;
-      /* Stage the disk meta so verify_readback can gate the layout. */
-      fd_accdb_disk_meta_t meta;
-      fd_memcpy( meta.pubkey, pubkeys[ i ], 32UL );
-      meta.size       = (uint)data_lens[ i ];
-      meta.generation = 0U;
-      fd_memset( meta.owner, 0, 32UL );
-      FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)offs[ i ] )==(long)sizeof(meta) );
+      /* Stage the whole record so verify_readback can gate the layout
+         and decompress the payload. */
+      par_stage_record( ctx->fd, offs[ i ], pubkeys[ i ], data_lens[ i ], stored_lens[ i ] );
     }
     ctx->ignored  += ignored;
     ctx->replaced += replaced;
@@ -1709,6 +1809,7 @@ par_layout( ulong max_accounts ) {
                  FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
                  FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
   out.acc_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
+                 FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  max_accounts*sizeof(uint)                               ); /* acc_stored_sz */
   out.txn_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),        txn_max*sizeof(fd_accdb_txn_t)                          );
   return out;
 }
@@ -1861,13 +1962,16 @@ test_snapshot_striped_writers( void ) {
     fd_accdb_snapshot_writer_end( joins[ t ] );
   }
 
-  /* disk_used_bytes invariant: sum of (72+len) over the live set. */
+  /* disk_used_bytes invariant: sum of (header + compressed len) over
+     the live set.  Records hold the fd_zle blob, not the raw body, so
+     the expected size comes from par_stored_len of each winner's data
+     length -- the same function the writers reserved with. */
   fd_accdb_flush_metrics( accdb );
   for( ulong t=0UL; t<PAR_THREADS; t++ ) fd_accdb_flush_metrics( joins[ t ] );
   ulong expect_used = 0UL;
   for( ulong k=0UL; k<PAR_KEYS; k++ ) {
     fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
-    expect_used += sizeof(fd_accdb_disk_meta_t)+FD_ACCDB_SIZE_DATA( acc->executable_size );
+    expect_used += sizeof(fd_accdb_disk_meta_t)+par_stored_len( FD_ACCDB_SIZE_DATA( acc->executable_size ) );
   }
   fd_accdb_shmem_metrics_t const * shmetrics = fd_accdb_shmetrics( accdb );
   FD_TEST( shmetrics->accounts_total ==PAR_KEYS );
@@ -1875,9 +1979,13 @@ test_snapshot_striped_writers( void ) {
 
   fd_accdb_snapshot_load_end( accdb );
 
-  /* The sampled index->file readback gate passes against the metas the
-     winners staged at their explicit offsets. */
-  fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS );
+  /* The sampled index->file readback gate passes against the records
+     the winners staged at their explicit offsets, decompressing each
+     payload. */
+  uchar * readback_scratch = malloc( FD_ACCDB_DATA_SZ_MAX );
+  FD_TEST( readback_scratch );
+  fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS, readback_scratch );
+  free( readback_scratch );
 
   /* writer_end returned every unused block tail, so exactly the live
      entries are still checked out of the shared pool.  Drains the pool,
@@ -1917,30 +2025,26 @@ par_incr_writer_main( void * _ctx ) {
   for( ulong k=0UL; k<PAR_INCR_KEYS; k++ ) {
     if( k<PAR_KEYS && k%4UL==2UL ) continue; /* group 2 untouched */
 
-    uchar const * pubkeys  [ 1 ] = { ctx->pks[ k ] };
-    ulong         lamports [ 1 ] = { k%4UL==1UL && k<PAR_KEYS ? 9000000UL+k : PAR_INCR_LAMPORTS( t, k ) };
-    ulong         data_lens[ 1 ] = { PAR_INCR_DLEN( t, k ) };
-    int           execs    [ 1 ] = { 0 };
-    ulong         offs     [ 1 ];
+    uchar const * pubkeys    [ 1 ] = { ctx->pks[ k ] };
+    ulong         lamports   [ 1 ] = { k%4UL==1UL && k<PAR_KEYS ? 9000000UL+k : PAR_INCR_LAMPORTS( t, k ) };
+    ulong         data_lens  [ 1 ] = { PAR_INCR_DLEN( t, k ) };
+    ulong         stored_lens[ 1 ] = { par_stored_len( data_lens[ 0 ] ) };
+    int           execs      [ 1 ] = { 0 };
+    ulong         offs       [ 1 ];
     ulong slot = ( k<PAR_KEYS && k%4UL==1UL ) ? 50UL : 200UL+t;
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( ctx->accdb, ctx->fork, 1UL, pubkeys, slot, lamports,
-                                                    data_lens, execs, NULL, &ctx->whead,
+                                                    data_lens, stored_lens, execs, NULL, &ctx->whead,
                                                     ctx->stripe_locks, ctx->stripe_msk, ctx->m,
                                                     offs, &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
                                                     NULL, NULL ) );
     if( offs[ 0 ]!=ULONG_MAX ) {
       ctx->alloc_offs[ ctx->alloc_cnt ] = offs[ 0 ];
-      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ 0 ];
+      ctx->alloc_szs [ ctx->alloc_cnt ] = sizeof(fd_accdb_disk_meta_t)+stored_lens[ 0 ];
       ctx->alloc_cnt++;
-      fd_accdb_disk_meta_t meta;
-      fd_memcpy( meta.pubkey, pubkeys[ 0 ], 32UL );
-      meta.size       = (uint)data_lens[ 0 ];
-      meta.generation = 0U;
-      fd_memset( meta.owner, 0, 32UL );
-      FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)offs[ 0 ] )==(long)sizeof(meta) );
+      par_stage_record( ctx->fd, offs[ 0 ], pubkeys[ 0 ], data_lens[ 0 ], stored_lens[ 0 ] );
     }
     ctx->ignored           += ignored;
     ctx->replaced          += replaced;
@@ -2162,14 +2266,14 @@ test_snapshot_striped_writers_incremental( void ) {
     ulong         offs     [ 1 ];
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
-                                                    data_lens, execs, NULL, &eq->whead,
+                                                    data_lens, data_lens, execs, NULL, &eq->whead,
                                                     stripe_locks, stripe_msk, eq->m,
                                                     offs, &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
                                                     NULL, NULL ) );
     FD_TEST( replaced==1UL && offs[ 0 ]!=ULONG_MAX && !eq->m->eq_slot_dups ); /* cross override of the promoted winner */
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
-                                                    data_lens, execs, NULL, &eq->whead,
+                                                    data_lens, data_lens, execs, NULL, &eq->whead,
                                                     stripe_locks, stripe_msk, eq->m,
                                                     offs, &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
@@ -2197,8 +2301,11 @@ test_snapshot_striped_writers_incremental( void ) {
   FD_TEST( shmetrics->accounts_total==PAR_INCR_KEYS );
 
   /* The sampled index->file readback covers both phases' explicit
-     offsets. */
-  fd_accdb_snapshot_verify_readback( reader, PAR_INCR_KEYS );
+     offsets, decompressing each payload. */
+  uchar * readback_scratch = malloc( FD_ACCDB_DATA_SZ_MAX );
+  FD_TEST( readback_scratch );
+  fd_accdb_snapshot_verify_readback( reader, PAR_INCR_KEYS, readback_scratch );
+  free( readback_scratch );
 
   for( ulong t=0UL; t<PAR_THREADS; t++ ) free( joins[ t ] );
   test_teardown( reader, fd );
@@ -2241,6 +2348,12 @@ test_incremental_cross_fork_override( void ) {
   fd_accdb_snapshot_write_one( accdb, SENTINEL, pk1, 10UL, 200UL, 1024UL, 0, &replaced );
   fd_accdb_snapshot_write_one( accdb, SENTINEL, pk2, 10UL, 300UL, 1024UL, 0, &replaced );
   fd_accdb_snapshot_load_end( accdb );
+
+  /* The root-fork versions are read back after the purge, so they need
+     real records on disk, not just reservations. */
+  test_stage_zero_record( fd, 1024UL, pk0, 1024UL );
+  test_stage_zero_record( fd, 1024UL, pk1, 1024UL );
+  test_stage_zero_record( fd, 1024UL, pk2, 1024UL );
 
   /* Save whead. */
   fd_accdb_snapshot_recovery_t recovery;
@@ -2410,7 +2523,7 @@ test_incremental_release_partitions( void ) {
   whead_full.attempt_partition_max  = 4UL;
   pubkeys[ 0 ] = pk_full;
   FD_TEST( !fd_accdb_snapshot_write_batch_worker( writer, SENTINEL, 1UL, pubkeys, 100UL, lamports,
-                                                  data_lens, execs, NULL, &whead_full,
+                                                  data_lens, data_lens, execs, NULL, &whead_full,
                                                   stripe_locks, stripe_msk, m,
                                                   offs, &ignored, &replaced, &loaded,
                                                   &replaced_lamports, &ignored_lamports,
@@ -2434,7 +2547,7 @@ test_incremental_release_partitions( void ) {
   whead_a.attempt_partition_max  = 4UL;
   pubkeys[ 0 ] = pk_incr;
   FD_TEST( !fd_accdb_snapshot_write_batch_worker( writer, incr_a, 1UL, pubkeys, 200UL, lamports,
-                                                  data_lens, execs, NULL, &whead_a,
+                                                  data_lens, data_lens, execs, NULL, &whead_a,
                                                   stripe_locks, stripe_msk, m,
                                                   offs, &ignored, &replaced, &loaded,
                                                   &replaced_lamports, &ignored_lamports,
@@ -2463,7 +2576,7 @@ test_incremental_release_partitions( void ) {
   whead_b.attempt_partitions     = fp_b;
   whead_b.attempt_partition_max  = 4UL;
   FD_TEST( !fd_accdb_snapshot_write_batch_worker( writer, incr_b, 1UL, pubkeys, 200UL, lamports,
-                                                  data_lens, execs, NULL, &whead_b,
+                                                  data_lens, data_lens, execs, NULL, &whead_b,
                                                   stripe_locks, stripe_msk, m,
                                                   offs, &ignored, &replaced, &loaded,
                                                   &replaced_lamports, &ignored_lamports,
@@ -2587,14 +2700,14 @@ test_snoop_winner_gated_callback( void ) {
 
     ctx.cur_slot = 10UL;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 10UL,
-                                                    lamports, data_lens, executables, snoop_cands,
+                                                    lamports, data_lens, data_lens, executables, snoop_cands,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
                                                     test_snoop_record, &ctx ) );
     ctx.cur_slot = 20UL;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 20UL,
-                                                    lamports, data_lens, executables, snoop_cands,
+                                                    lamports, data_lens, data_lens, executables, snoop_cands,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
@@ -2626,14 +2739,14 @@ test_snoop_winner_gated_callback( void ) {
 
     ctx.cur_slot = 20UL;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 20UL,
-                                                    lamports, data_lens, executables, snoop_cands,
+                                                    lamports, data_lens, data_lens, executables, snoop_cands,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
                                                     test_snoop_record, &ctx ) );
     ctx.cur_slot = 10UL;
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 10UL,
-                                                    lamports, data_lens, executables, snoop_cands,
+                                                    lamports, data_lens, data_lens, executables, snoop_cands,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
@@ -2664,7 +2777,7 @@ test_snoop_winner_gated_callback( void ) {
 
     int not_a_candidate[ 1 ] = { 0 };
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 30UL,
-                                                    lamports, data_lens, executables, not_a_candidate,
+                                                    lamports, data_lens, data_lens, executables, not_a_candidate,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,
@@ -2688,7 +2801,7 @@ test_snoop_winner_gated_callback( void ) {
     fd_accdb_snapshot_worker_metrics_t metrics             = {0};
 
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 40UL,
-                                                    lamports, data_lens, executables, snoop_cands,
+                                                    lamports, data_lens, data_lens, executables, snoop_cands,
                                                     &whead, stripe_locks, 3UL, &metrics, file_offsets,
                                                     &ignored, &replaced, &loaded,
                                                     &replaced_lamports, &ignored_lamports,

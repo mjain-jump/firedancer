@@ -23,6 +23,7 @@
 #include "../../flamenco/stakes/fd_stake_types.h"
 #include "../../disco/stem/fd_stem.h"
 #include "../../flamenco/accdb/fd_accdb.h"
+#include "../../flamenco/accdb/fd_zle.h"
 #include "../../disco/events/generated/fd_event_gen.h"
 
 #include "generated/fd_snapin_tile_seccomp.h"
@@ -72,6 +73,25 @@
    consecutive accounts into one pwrite. */
 
 #define FD_SNAPIN_WRITE_BUF_SZ (2UL<<20)
+
+/* Per-tile fd_zle scratch.  Account data is stored compressed, and a
+   whole account must be compressed before its record can be sized and
+   placed, so:
+
+     acc_buf  assembles a fragmented (streamed) account body in full.
+              One maximum-size Solana account.
+     zbuf     receives compressed payloads.  It holds either one
+              streamed account or a whole ACCOUNT_BATCH: the parser only
+              batches accounts that fit entirely inside one input frag,
+              so a batch's total uncompressed data is bounded by the
+              data-stream MTU, far below one maximum-size account.
+
+   Together these add ~20 MiB of scratch per snapin tile. */
+
+#define FD_SNAPIN_ACC_BUF_SZ (FD_RUNTIME_ACC_SZ_MAX)
+#define FD_SNAPIN_ZBUF_SZ    (FD_ZLE_COMPRESS_BOUND( FD_RUNTIME_ACC_SZ_MAX ))
+
+FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SNAPSHOT_DATA_MTU + FD_SSPARSE_ACC_BATCH_MAX*FD_ZLE_OVERHEAD, zbuf_batch );
 
 /* Write-behind: tiles kick async writeback of their flushed records in
    large contiguous runs and bound their in-flight (kicked but not yet
@@ -328,13 +348,13 @@ struct fd_snapin_tile {
   uchar * write_buf;
   ulong   write_buf_used;
   ulong   flush_off;        /* file offset of write_buf[0] */
-  ulong   bytes_written;
+  ulong   bytes_written;         /* compressed bytes actually pwritten */
+  ulong   bytes_written_logical; /* uncompressed account data those bytes hold */
   fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
-  struct {
-    int   accepted;    /* 0 = ignored duplicate: drop the data bytes */
-    ulong received;
-    ulong file_off;    /* allocated meta offset; data at +sizeof(disk_meta) */
-  } open_acc;
+
+  /* fd_zle scratch (see FD_SNAPIN_ACC_BUF_SZ / FD_SNAPIN_ZBUF_SZ). */
+  uchar * acc_buf;
+  uchar * zbuf;
 
   /* Snoop view of the batch currently inside
      fd_accdb_snapshot_write_batch_worker.  The callback only receives
@@ -352,26 +372,29 @@ struct fd_snapin_tile {
     int   const *         executables;
   } snoop_view;
 
-  /* Streaming-path snoop deferral.  A fragmented account body is not
-     available at ACCOUNT_HEADER time, but the shared snoop targets may
-     only be written from inside the callback, with the account's stripe
-     lock held.  So for the rare accounts a snoop cares about, the accdb
-     insert (and therefore the record staging) is held back until the
-     body prefix the snoop needs has been buffered here, and only then
-     issued as a one-entry batch.  `need` is always <= data_len, so the
-     buffer always fills before the body ends. */
+  /* Streamed (fragmented) account assembly.  An account's data must be
+     compressed as a whole before its on-disk record can be sized, so a
+     body that crosses frag boundaries is buffered into acc_buf in full
+     and the accdb insert + record staging happen in one shot at
+     completion.  There is no explicit end-of-account event: the parser
+     guarantees the whole body is delivered before the next header, so
+     completion is received==data_len.
+
+     This also subsumes the old snoop-prefix deferral: because the
+     insert is now always held until the body is complete, the snoop
+     callback always sees the whole body and no prefix bookkeeping is
+     needed. */
   struct {
     int   active;
     int   executable;
+    int   candidate;
     ulong slot;
     ulong lamports;
     ulong data_len;
-    ulong need;
-    ulong write_pos;
+    ulong received;
     uchar pubkey[ 32UL ];
     uchar owner [ 32UL ];
-    uchar buf   [ FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ];
-  } pending;
+  } open_acc;
 
   /* Write-behind (bounded in-flight dirty bytes). */
   ulong wb_total_window;    /* aggregate cap, sized from MemTotal at privileged_init */
@@ -392,6 +415,7 @@ struct fd_snapin_tile {
     ulong eq_slot_dups;
     ulong eq_slot_lamports_diff;
     ulong bytes_written;
+    ulong bytes_written_logical;
   } worker_fold;
 
   /* Tile 0: cross-tile account totals, accumulated out of the shared
@@ -518,6 +542,8 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
     l = FD_LAYOUT_APPEND( l, alignof(fd_sstxncache_hash_t), sizeof(fd_sstxncache_hash_t)*FD_SNAPIN_TXNCACHE_MAX_ENTRIES );
   }
   l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPIN_WRITE_BUF_SZ                                      );
+  l = FD_LAYOUT_APPEND( l, 64UL,                            FD_SNAPIN_ACC_BUF_SZ                                        );
+  l = FD_LAYOUT_APPEND( l, 64UL,                            FD_SNAPIN_ZBUF_SZ                                           );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -1108,6 +1134,7 @@ worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
   ctx->write_buf_used      = 0UL;
   ctx->flush_off           = 0UL;
   ctx->bytes_written       = 0UL;
+  ctx->bytes_written_logical = 0UL;
   ctx->whead.val           = 0UL;
   ctx->whead.has_partition = 0;
   ctx->whead.attempt_partition_cnt = 0UL; /* tracker buffer/capacity are set once at init */
@@ -1248,13 +1275,30 @@ worker_stage_meta( fd_snapin_tile_t * ctx,
                    ulong              file_off,
                    uchar const *      pubkey,
                    uchar const *      owner,
-                   ulong              data_len ) {
+                   ulong              data_len,
+                   ulong              stored_len ) {
   fd_accdb_disk_meta_t meta;
   fd_memcpy( meta.pubkey, pubkey, 32UL );
-  meta.size       = (uint)data_len;
-  meta.generation = 0U;
+  meta.size        = (uint)data_len;
+  meta.generation  = 0U;
+  meta.stored_size = (uint)stored_len;
   fd_memcpy( meta.owner, owner, 32UL );
   worker_buffer_write( ctx, file_off, meta.b, sizeof(fd_accdb_disk_meta_t) );
+}
+
+/* worker_compress compresses data_len bytes of account data into the
+   tile's zbuf at offset zoff, and returns the compressed size. */
+
+static ulong
+worker_compress( fd_snapin_tile_t * ctx,
+                 ulong              zoff,
+                 uchar const *      data,
+                 ulong              data_len ) {
+  if( FD_UNLIKELY( !data_len ) ) return 0UL;
+  FD_TEST( zoff+FD_ZLE_COMPRESS_BOUND( data_len )<=FD_SNAPIN_ZBUF_SZ );
+  ulong stored_len = fd_zle_compress( ctx->zbuf+zoff, data, data_len );
+  ctx->bytes_written_logical += data_len;
+  return stored_len;
 }
 
 /* Winner-gated snoops ***********************************************/
@@ -1271,33 +1315,6 @@ worker_snoop_candidate( uchar const * pubkey,
       || !memcmp( owner,  fd_solana_stake_program_id.uc,   32UL )
       || !memcmp( pubkey, fd_sysvar_slot_history_id.uc,    32UL );
 }
-
-/* worker_snoop_need returns how many leading body bytes the snoops need
-   from a candidate account, applying the same gates as the sequential
-   loader (a gate that rejects the account outright yields 0).  It is
-   always <= data_len, so the streaming path's buffer fills before the
-   body ends. */
-
-static inline ulong
-worker_snoop_need( uchar const * pubkey,
-                   uchar const * owner,
-                   ulong         lamports,
-                   ulong         data_len ) {
-  if( FD_UNLIKELY( !memcmp( pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
-    return data_len<=FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ? data_len : 0UL;
-  }
-  if( FD_UNLIKELY( !lamports ) ) return 0UL;
-  if( FD_UNLIKELY( !memcmp( owner, fd_solana_feature_program_id.uc, 32UL ) ) ) {
-    return fd_ulong_min( data_len, sizeof(fd_feature_t) );
-  }
-  if( FD_UNLIKELY( !memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) ) ) {
-    return data_len>=sizeof(fd_stake_state_t) ? sizeof(fd_stake_state_t) : 0UL;
-  }
-  return 0UL;
-}
-
-FD_STATIC_ASSERT( sizeof(fd_feature_t)    <=FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ, snoop_prefix_buf );
-FD_STATIC_ASSERT( sizeof(fd_stake_state_t)<=FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ, snoop_prefix_buf );
 
 /* worker_snoop_winner is the accdb snoop callback: the striped writer
    invokes it for every insert-or-replace winner the tile flagged as a
@@ -1387,7 +1404,7 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   worker_reset_write_engine( ctx );
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
   fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
-  ctx->pending.active            = 0;
+  ctx->open_acc.active           = 0;
   fd_ssparse_init( ctx->ssparse );
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
   fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, 1 );
@@ -1448,6 +1465,8 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   uchar const * datas       [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         lamports    [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         data_lens   [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  ulong         stored_lens [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
+  ulong         zoffs       [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   int           executables [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   int           candidates  [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         file_offsets[ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
@@ -1463,6 +1482,21 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
     executables[ i ] = e[ 96UL ];
     candidates[ i ]  = worker_snoop_candidate( pubkeys[ i ], owners[ i ] );
     batch_lamports   = fd_ulong_sat_add( batch_lamports, lamports[ i ] );
+    if( FD_UNLIKELY( data_lens[ i ]>FD_RUNTIME_ACC_SZ_MAX ) ) {
+      FD_LOG_WARNING(( "corrupt snapshot: account data length %lu exceeds %lu", data_lens[ i ], FD_RUNTIME_ACC_SZ_MAX ));
+      return -1;
+    }
+  }
+
+  /* Compress every body up front: the accdb reservation is sized from
+     the compressed length, and the whole batch's compressed payloads
+     have to survive until they are staged below.  Batched accounts all
+     came out of one input frag, so their total fits zbuf easily. */
+  ulong zoff = 0UL;
+  for( ulong i=0UL; i<cnt; i++ ) {
+    zoffs      [ i ] = zoff;
+    stored_lens[ i ] = worker_compress( ctx, zoff, datas[ i ], data_lens[ i ] );
+    zoff            += stored_lens[ i ];
   }
 
   ctx->snoop_view.slot        = batch_slot;
@@ -1477,7 +1511,7 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
-                                                            data_lens, executables, candidates, &ctx->whead,
+                                                            data_lens, stored_lens, executables, candidates, &ctx->whead,
                                                             ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->worker_metrics,
                                                             file_offsets, &accounts_ignored, &accounts_replaced,
                                                             &accounts_loaded, &replaced_lamports, &ignored_lamports,
@@ -1485,13 +1519,15 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
     return -1;
   }
 
-  /* Stage the accepted disk records (72 byte header + data, packed at
-     the allocated explicit offsets; ignored dups burn no space). */
+  /* Stage the accepted disk records (header + compressed payload,
+     packed at the allocated explicit offsets; ignored dups burn no
+     space). */
   for( ulong i=0UL; i<cnt; i++ ) {
     if( FD_UNLIKELY( file_offsets[ i ]==ULONG_MAX ) ) continue;
-    worker_stage_meta( ctx, file_offsets[ i ], pubkeys[ i ], owners[ i ], data_lens[ i ] );
-    if( FD_LIKELY( data_lens[ i ] ) ) {
-      worker_buffer_write( ctx, file_offsets[ i ]+sizeof(fd_accdb_disk_meta_t), datas[ i ], data_lens[ i ] );
+    worker_stage_meta( ctx, file_offsets[ i ], pubkeys[ i ], owners[ i ], data_lens[ i ], stored_lens[ i ] );
+    if( FD_LIKELY( stored_lens[ i ] ) ) {
+      worker_buffer_write( ctx, file_offsets[ i ]+sizeof(fd_accdb_disk_meta_t),
+                           ctx->zbuf+zoffs[ i ], stored_lens[ i ] );
     }
   }
 
@@ -1501,10 +1537,11 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   return 0;
 }
 
-/* worker_insert_one inserts a single streamed account, stages its meta
-   record and opens the tile's body-write window.  candidate flags the
-   account for the snoop callback, in which case data[0,data_sz) is the
-   body prefix the snoops read (see ctx->pending). */
+/* worker_insert_one inserts a single streamed account whose full body
+   is at data[0,data_len).  The body is compressed first, because the
+   compressed length is what sizes the on-disk record and therefore the
+   accdb reservation.  candidate flags the account for the snoop
+   callback, which sees the whole body. */
 
 static int
 worker_insert_one( fd_snapin_tile_t * ctx,
@@ -1515,14 +1552,15 @@ worker_insert_one( fd_snapin_tile_t * ctx,
                    ulong              data_len,
                    int                executable,
                    int                candidate,
-                   uchar const *      data,
-                   ulong              data_sz ) {
+                   uchar const *      data ) {
+  ulong stored_len = worker_compress( ctx, 0UL, data, data_len );
+
   uchar const * pubkeys     [ 1 ] = { pubkey };
   uchar const * owners      [ 1 ] = { owner };
   uchar const * datas       [ 1 ] = { data };
   ulong         lamports_a  [ 1 ] = { lamports };
   ulong         data_lens   [ 1 ] = { data_len };
-  ulong         data_szs    [ 1 ] = { data_sz };
+  ulong         stored_lens [ 1 ] = { stored_len };
   int           executables [ 1 ] = { executable };
   int           candidates  [ 1 ] = { candidate };
   ulong         file_offsets[ 1 ];
@@ -1533,25 +1571,29 @@ worker_insert_one( fd_snapin_tile_t * ctx,
   ctx->snoop_view.datas       = datas;
   ctx->snoop_view.lamports    = lamports_a;
   ctx->snoop_view.data_lens   = data_lens;
-  ctx->snoop_view.data_szs    = data_szs;
+  ctx->snoop_view.data_szs    = data_lens; /* the whole body is available */
   ctx->snoop_view.executables = executables;
 
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
-                                                            data_lens, executables, candidates, &ctx->whead,
+                                                            data_lens, stored_lens, executables, candidates, &ctx->whead,
                                                             ctx->stripe_locks, FD_SNAPIO_STRIPE_MSK, ctx->worker_metrics,
                                                             file_offsets, &accounts_ignored, &accounts_replaced,
                                                             &accounts_loaded, &replaced_lamports, &ignored_lamports,
                                                             worker_snoop_winner, ctx ) ) ) {
     return -1;
   }
-  int ignored = file_offsets[ 0 ]==ULONG_MAX;
 
-  ctx->open_acc.accepted = !ignored;
-  ctx->open_acc.received = 0UL;
-  ctx->open_acc.file_off = file_offsets[ 0 ];
-  if( FD_LIKELY( !ignored ) ) worker_stage_meta( ctx, file_offsets[ 0 ], pubkey, owner, data_len );
+  /* file_offsets[0]==ULONG_MAX means the accdb writer classified this
+     account as an ignored duplicate: it burns no disk space and its
+     bytes are dropped. */
+  if( FD_LIKELY( file_offsets[ 0 ]!=ULONG_MAX ) ) {
+    worker_stage_meta( ctx, file_offsets[ 0 ], pubkey, owner, data_len, stored_len );
+    if( FD_LIKELY( stored_len ) ) {
+      worker_buffer_write( ctx, file_offsets[ 0 ]+sizeof(fd_accdb_disk_meta_t), ctx->zbuf, stored_len );
+    }
+  }
 
   worker_record_insert_metrics( ctx, 1UL, accounts_ignored, accounts_replaced, accounts_loaded,
                                 lamports, replaced_lamports, ignored_lamports );
@@ -1559,22 +1601,15 @@ worker_insert_one( fd_snapin_tile_t * ctx,
   return 0;
 }
 
-/* worker_pending_flush issues the held-back insert of a snoop candidate
-   now that its body prefix is buffered, then stages that prefix; the
-   rest of the body streams normally from here. */
+/* worker_open_acc_finish issues the held-back insert of the streamed
+   account whose body is now fully assembled in acc_buf. */
 
 static int
-worker_pending_flush( fd_snapin_tile_t * ctx ) {
-  ctx->pending.active = 0;
-  if( FD_UNLIKELY( 0!=worker_insert_one( ctx, ctx->pending.pubkey, ctx->pending.owner, ctx->pending.slot,
-                                         ctx->pending.lamports, ctx->pending.data_len, ctx->pending.executable,
-                                         1, ctx->pending.buf, ctx->pending.write_pos ) ) ) return -1;
-  if( FD_LIKELY( ctx->open_acc.accepted && ctx->pending.write_pos ) ) {
-    worker_buffer_write( ctx, ctx->open_acc.file_off+sizeof(fd_accdb_disk_meta_t),
-                         ctx->pending.buf, ctx->pending.write_pos );
-  }
-  ctx->open_acc.received = ctx->pending.write_pos;
-  return 0;
+worker_open_acc_finish( fd_snapin_tile_t * ctx ) {
+  ctx->open_acc.active = 0;
+  return worker_insert_one( ctx, ctx->open_acc.pubkey, ctx->open_acc.owner, ctx->open_acc.slot,
+                            ctx->open_acc.lamports, ctx->open_acc.data_len, ctx->open_acc.executable,
+                            ctx->open_acc.candidate, ctx->acc_buf );
 }
 
 static int
@@ -1585,24 +1620,23 @@ worker_process_account_header( fd_snapin_tile_t *            ctx,
   ulong         lamports = result->account_header.lamports;
   ulong         data_len = result->account_header.data_len;
 
-  if( FD_LIKELY( !worker_snoop_candidate( pubkey, owner ) ) ) {
-    return worker_insert_one( ctx, pubkey, owner, result->account_header.slot, lamports, data_len,
-                              result->account_header.executable, 0, NULL, 0UL );
+  if( FD_UNLIKELY( data_len>FD_RUNTIME_ACC_SZ_MAX ) ) {
+    FD_LOG_WARNING(( "corrupt snapshot: account data length %lu exceeds %lu", data_len, FD_RUNTIME_ACC_SZ_MAX ));
+    return -1;
   }
 
-  /* Snoop candidate: hold the insert back until the prefix the snoops
-     need has been buffered, so the callback can write the shared
-     targets with the stripe lock held. */
-  ctx->pending.active     = 1;
-  ctx->pending.executable = result->account_header.executable;
-  ctx->pending.slot       = result->account_header.slot;
-  ctx->pending.lamports   = lamports;
-  ctx->pending.data_len   = data_len;
-  ctx->pending.need       = worker_snoop_need( pubkey, owner, lamports, data_len );
-  ctx->pending.write_pos  = 0UL;
-  fd_memcpy( ctx->pending.pubkey, pubkey, 32UL );
-  fd_memcpy( ctx->pending.owner,  owner,  32UL );
-  if( FD_UNLIKELY( !ctx->pending.need ) ) return worker_pending_flush( ctx );
+  ctx->open_acc.active     = 1;
+  ctx->open_acc.executable = result->account_header.executable;
+  ctx->open_acc.candidate  = worker_snoop_candidate( pubkey, owner );
+  ctx->open_acc.slot       = result->account_header.slot;
+  ctx->open_acc.lamports   = lamports;
+  ctx->open_acc.data_len   = data_len;
+  ctx->open_acc.received   = 0UL;
+  fd_memcpy( ctx->open_acc.pubkey, pubkey, 32UL );
+  fd_memcpy( ctx->open_acc.owner,  owner,  32UL );
+
+  /* A zero length account has no body to wait for. */
+  if( FD_UNLIKELY( !data_len ) ) return worker_open_acc_finish( ctx );
   return 0;
 }
 
@@ -1614,22 +1648,19 @@ worker_process_account_data( fd_snapin_tile_t *            ctx,
   uchar const * data    = result->account_data.data;
   ulong         data_sz = result->account_data.data_sz;
 
-  if( FD_UNLIKELY( ctx->pending.active ) ) {
-    ulong copy_sz = fd_ulong_min( data_sz, ctx->pending.need-ctx->pending.write_pos );
-    fd_memcpy( ctx->pending.buf+ctx->pending.write_pos, data, copy_sz );
-    ctx->pending.write_pos += copy_sz;
-    if( FD_UNLIKELY( ctx->pending.write_pos<ctx->pending.need ) ) return 0;
-    if( FD_UNLIKELY( 0!=worker_pending_flush( ctx ) ) ) return -1;
-    data    += copy_sz;
-    data_sz -= copy_sz;
-    if( FD_LIKELY( !data_sz ) ) return 0;
+  /* The parser never delivers more body bytes than the header declared,
+     but a corrupt stream must not be allowed to run off acc_buf. */
+  if( FD_UNLIKELY( !ctx->open_acc.active ||
+                   ctx->open_acc.received+data_sz>ctx->open_acc.data_len ) ) {
+    FD_LOG_WARNING(( "corrupt snapshot: %lu account data bytes past the declared body of %lu bytes",
+                     data_sz, ctx->open_acc.data_len ));
+    return -1;
   }
 
-  if( FD_LIKELY( ctx->open_acc.accepted ) ) {
-    worker_buffer_write( ctx, ctx->open_acc.file_off+sizeof(fd_accdb_disk_meta_t)+ctx->open_acc.received,
-                         data, data_sz );
-  }
+  fd_memcpy( ctx->acc_buf+ctx->open_acc.received, data, data_sz );
   ctx->open_acc.received += data_sz;
+
+  if( FD_LIKELY( ctx->open_acc.received==ctx->open_acc.data_len ) ) return worker_open_acc_finish( ctx );
   return 0;
 }
 
@@ -1967,6 +1998,7 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   ctx->worker_fold.eq_slot_dups          += totals->eq_slot_dups;
   ctx->worker_fold.eq_slot_lamports_diff += totals->eq_slot_lamports_diff;
   ctx->worker_fold.bytes_written         += totals->bytes_written;
+  ctx->worker_fold.bytes_written_logical += totals->bytes_written_logical;
 
   /* Slot history: hdr already holds the single winner-gated copy. */
   fd_snapio_snoop_hdr_t const * hdr = ctx->snoop_hdr;
@@ -2390,8 +2422,10 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       fd_accdb_snapshot_writer_end( ctx->accdb );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
 
-      FD_LOG_NOTICE(( "snapin %lu: owned appendvecs=%lu owned_bytes=%lu bytes_written=%lu, wb kicks=%lu waits=%lu",
+      FD_LOG_NOTICE(( "snapin %lu: owned appendvecs=%lu owned_bytes=%lu bytes_written=%lu (logical=%lu, zle ratio=%.2fx), wb kicks=%lu waits=%lu",
                       ctx->tile_idx, ctx->owned_appendvecs, ctx->owned_bytes, ctx->bytes_written,
+                      ctx->bytes_written_logical,
+                      ctx->bytes_written ? (double)ctx->bytes_written_logical/(double)ctx->bytes_written : 0.0,
                       ctx->wb_kick_cnt, ctx->wb_wait_cnt ));
       if( FD_UNLIKELY( is_lead( ctx ) ) ) log_appendvec_stats( ctx );
 
@@ -2413,6 +2447,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,     ctx->worker.replaced_lamports              );
       FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,      ctx->worker.ignored_lamports               );
       FD_ATOMIC_FETCH_AND_ADD( &totals->bytes_written,         ctx->bytes_written                         );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->bytes_written_logical, ctx->bytes_written_logical                 );
       FD_ATOMIC_FETCH_AND_ADD( &totals->eq_slot_dups,          ctx->worker_metrics->eq_slot_dups          );
       FD_ATOMIC_FETCH_AND_ADD( &totals->eq_slot_lamports_diff, ctx->worker_metrics->eq_slot_lamports_diff );
       FD_ATOMIC_FETCH_AND_ADD( &totals->appendvecs_processed,  ctx->owned_appendvecs                      );
@@ -2494,8 +2529,11 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
          shadowed full entries, which can be recycled under our chain
          walk (this joiner publishes no epoch).  Pre-promotion, both the
          old and new versions are chain-linked with valid on-disk
-         records, so the readback covers both phases. */
-      fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL );
+         records, so the readback covers both phases.  It also
+         decompresses every sampled payload, so it doubles as an
+         end-to-end check of the fd_zle write path.  acc_buf is idle at
+         FINI and is exactly the 10 MiB the readback needs. */
+      fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL, ctx->acc_buf );
 
       if( !ctx->full ) {
         fd_accdb_snapshot_recover_delta( ctx->accdb, ctx->accdb_incr_fork_id );
@@ -2510,9 +2548,13 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       fd_feature_snoop_finalize( &ctx->bank->f.features, ctx->bank_slot, &ctx->epoch_schedule, ctx->feature_snoop );
 
-      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu (lamports-diff=%lu), worker bytes written=%lu",
+      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu (lamports-diff=%lu), worker bytes written=%lu "
+                      "(logical=%lu, fd_zle ratio=%.3fx, saved=%lu)",
                       ctx->worker_fold.eq_slot_dups, ctx->worker_fold.eq_slot_lamports_diff,
-                      ctx->worker_fold.bytes_written ));
+                      ctx->worker_fold.bytes_written, ctx->worker_fold.bytes_written_logical,
+                      ctx->worker_fold.bytes_written ? (double)ctx->worker_fold.bytes_written_logical/(double)ctx->worker_fold.bytes_written : 0.0,
+                      ctx->worker_fold.bytes_written_logical>ctx->worker_fold.bytes_written
+                        ? ctx->worker_fold.bytes_written_logical-ctx->worker_fold.bytes_written : 0UL ));
       if( FD_UNLIKELY( ctx->worker_fold.eq_slot_dups ) ) {
         FD_LOG_WARNING(( "parallel loader: accepted %lu equal-slot cross-appendvec duplicates (lamports-diff=%lu); "
                          "stripe-lock arrival order picked the winner",
@@ -2904,6 +2946,8 @@ unprivileged_init( fd_topo_t const *      topo,
   }
 
   ctx->write_buf = FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPIN_WRITE_BUF_SZ );
+  ctx->acc_buf   = FD_SCRATCH_ALLOC_APPEND( l, 64UL,   FD_SNAPIN_ACC_BUF_SZ   );
+  ctx->zbuf      = FD_SCRATCH_ALLOC_APPEND( l, 64UL,   FD_SNAPIN_ZBUF_SZ      );
 
   ctx->alpenglow = tile->snapin.alpenglow;
   ctx->blockhash_groups_len = 0UL;

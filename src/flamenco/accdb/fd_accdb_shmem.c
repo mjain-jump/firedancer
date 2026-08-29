@@ -1,5 +1,6 @@
 #include "fd_accdb_shmem.h"
 #include "fd_accdb_private.h"
+#include "fd_zle.h"
 
 #include "../../util/log/fd_log.h"
 
@@ -106,6 +107,7 @@ fd_accdb_shmem_footprint( ulong max_accounts,
   l = FD_LAYOUT_APPEND( l, descends_set_align(),     max_live_slots*descends_set_footprint( max_live_slots ) );
   l = FD_LAYOUT_APPEND( l, alignof(uint),            chain_cnt*sizeof(uint)                                  );
   l = FD_LAYOUT_APPEND( l, alignof(fd_accdb_accmeta_t), max_accounts*sizeof(fd_accdb_accmeta_t)              );
+  l = FD_LAYOUT_APPEND( l, alignof(uint),            max_accounts*sizeof(uint)                               );
   l = FD_LAYOUT_APPEND( l, alignof(fd_accdb_txn_t),  txn_max*sizeof(fd_accdb_txn_t)                          );
   l = FD_LAYOUT_APPEND( l, partition_pool_align(),   partition_pool_footprint( partition_cnt )               );
   for( ulong k=0UL; k<FD_ACCDB_COMPACTION_LAYER_CNT; k++ ) {
@@ -221,8 +223,12 @@ fd_accdb_shmem_new( void * shmem,
   /* partition_sz must be large enough to hold at least one worst-case
      account write (disk metadata header + largest cache class payload).
      Without this, allocate_next_write can never fit the entry in a
-     single partition. */
-  ulong min_partition_sz = sizeof(fd_accdb_disk_meta_t) + fd_accdb_cache_slot_sz[ FD_ACCDB_CACHE_CLASS_CNT-1UL ] - FD_ACCDB_CACHE_META_SZ;
+     single partition.  The payload is fd_zle compressed, and an
+     incompressible payload costs up to FD_ZLE_OVERHEAD more than the
+     account data itself, so the bound is the compression bound of the
+     largest cache class. */
+  ulong min_partition_sz = sizeof(fd_accdb_disk_meta_t) +
+      FD_ZLE_COMPRESS_BOUND( fd_accdb_cache_slot_sz[ FD_ACCDB_CACHE_CLASS_CNT-1UL ] - FD_ACCDB_CACHE_META_SZ );
   if( FD_UNLIKELY( partition_sz<min_partition_sz ) ) {
     FD_LOG_WARNING(( "partition_sz must be at least %lu to fit worst-case account write", min_partition_sz ));
     return NULL;
@@ -291,6 +297,7 @@ fd_accdb_shmem_new( void * shmem,
   void * _descends_sets    = FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),     max_live_slots*descends_set_footprint( max_live_slots ) );
   void * _acc_map          = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),            chain_cnt*sizeof(uint)                                  );
   void * _acc_pool_ele     = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t), max_accounts*sizeof(fd_accdb_accmeta_t)                     );
+  void * _acc_stored_sz    = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),            max_accounts*sizeof(uint)                               );
   void * _txn_pool_ele     = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),  txn_max*sizeof(fd_accdb_txn_t)                          );
   void * _partition_pool   = FD_SCRATCH_ALLOC_APPEND( l, partition_pool_align(),   partition_pool_footprint( partition_cnt )               );
   void * _compaction_dlists[ FD_ACCDB_COMPACTION_LAYER_CNT ];
@@ -397,6 +404,9 @@ fd_accdb_shmem_new( void * shmem,
     accdb->compaction_dlist_off[ k ] = (ulong)_compaction_dlists[ k ] - (ulong)shmem;
   }
   accdb->deferred_free_dlist_off = (ulong)_deferred_free_dlist - (ulong)shmem;
+
+  accdb->acc_stored_sz_off = (ulong)_acc_stored_sz - (ulong)shmem;
+  fd_memset( _acc_stored_sz, 0, max_accounts*sizeof(uint) );
 
   accdb->deferred_acc_buf_off = (ulong)_deferred_acc_buf - (ulong)shmem;
   accdb->deferred_acc_buf_cnt = 0UL;

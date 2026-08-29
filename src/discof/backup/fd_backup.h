@@ -87,7 +87,8 @@ typedef struct fd_backup_cache_msg fd_backup_cache_msg_t;
 struct fd_backup_disk_msg {
   fd_pubkey_t pubkey;
   fd_pubkey_t owner;
-  uint        size;
+  uint        size;        /* uncompressed account data length */
+  uint        stored_size; /* fd_zle compressed payload length on disk */
   uint        acc_idx;
   uint        snap_sz;
   uint        data_sz;

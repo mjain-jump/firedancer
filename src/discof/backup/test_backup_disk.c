@@ -273,8 +273,9 @@ test_prestage_skips_too_new( void ) {
 
     memset( &recs[ i ], 0, sizeof(recs[ i ]) );
     memcpy( recs[ i ].pubkey, pubkey, 32UL );
-    recs[ i ].size       = 0U;
-    recs[ i ].generation = gen;
+    recs[ i ].size        = 0U;
+    recs[ i ].stored_size = 0U;
+    recs[ i ].generation  = gen;
 
     uint ele = index_add( (uint)(50UL+i), chain, pubkey, gen, 1000UL, off_base + i*rec_sz );
     expected[ i ] = ( gen<=ROOT_GEN ) ? ele : UINT_MAX;
@@ -304,7 +305,16 @@ test_prestage_skips_too_new( void ) {
   FD_TEST( !parse->data_sz ); /* every record consumed, skipped ones too */
 }
 
-/* record_init writes one disk record and returns its total byte size. */
+/* record_init writes one disk record and returns its total byte size.
+
+   These tests exercise record framing (straddle handling, prestage,
+   generation filtering), not compression: the parser only ever walks
+   and republishes the payload, it never decompresses it.  So the
+   synthesized records use stored_size==size, i.e. an
+   "incompressible" payload of opaque bytes.  That satisfies the
+   parser's stored_size<=FD_ZLE_COMPRESS_BOUND(size) check and keeps
+   every record advance equal to sizeof(disk_meta)+data_sz, which is
+   what the offset assertions below are written against. */
 
 static ulong
 record_init( uchar *       dst,
@@ -314,8 +324,9 @@ record_init( uchar *       dst,
   fd_accdb_disk_meta_t * dm = (fd_accdb_disk_meta_t *)dst;
   memset( dm, 0, sizeof(fd_accdb_disk_meta_t) );
   memcpy( dm->pubkey, pubkey, 32UL );
-  dm->size       = data_sz;
-  dm->generation = generation;
+  dm->size        = data_sz;
+  dm->stored_size = data_sz;
+  dm->generation  = generation;
   memset( dst + sizeof(fd_accdb_disk_meta_t), 0xa5, data_sz );
   return sizeof(fd_accdb_disk_meta_t) + (ulong)data_sz;
 }

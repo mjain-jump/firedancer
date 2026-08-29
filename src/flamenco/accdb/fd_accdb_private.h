@@ -565,6 +565,21 @@ struct fd_accdb_shmem_private {
   ulong deferred_acc_buf_max;
   ulong deferred_acc_epoch;
 
+  /* Byte offset (from shmem base) of the per-account stored-size side
+     array: max_accounts uints, indexed by acc pool index.
+     acc_stored_sz[i] is the number of fd_zle compressed payload bytes
+     of the record that acc_pool[i]'s offset points at, so the on-disk
+     record size is sizeof(fd_accdb_disk_meta_t)+acc_stored_sz[i].
+
+     This cannot live in fd_accdb_accmeta_t: that struct is exactly one
+     64 byte cache line with zero slack, and the offset/fork/lamports/
+     size fields have no spare bits to steal (a 10 MiB account needs 24
+     bits of stored size).  A side array costs 4 bytes per account
+     (6% on top of the 64 byte accmeta) and is only touched on the
+     write and free paths — cold reads recover stored_size from the
+     record header they are already reading. */
+  ulong acc_stored_sz_off;
+
   acc_pool_shmem_t  acc_pool [1];
   fork_pool_shmem_t fork_pool[1];
   txn_pool_shmem_t  txn_pool [1];
