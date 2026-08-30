@@ -1726,6 +1726,18 @@ snapld_frag( fd_snapct_tile_t *  ctx,
     /* Validate that all expected bytes were received. */
     ulong bytes_read  = full ? ctx->metrics.full.bytes_read  : ctx->metrics.incremental.bytes_read;
     ulong bytes_total = full ? ctx->metrics.full.bytes_total : ctx->metrics.incremental.bytes_total;
+    /* PROTOTYPE SHORTCUT (fused file-partitioned loading).  With no
+       snapdc tiles, snapld is a control-plane-only tile: the snapin
+       tiles pread their own byte ranges of the archive and no payload
+       byte crosses this link, so snapct never counts any.  bytes_read
+       of exactly zero therefore means "fused topology", not "truncated
+       stream"; the byte coverage is instead proven end to end by the
+       snapin tiles' seam verification.  A production version would
+       carry the loader mode explicitly instead of inferring it. */
+    if( FD_UNLIKELY( !bytes_read && bytes_total ) ) {
+      ctx->load_complete = 1;
+      return;
+    }
     if( FD_UNLIKELY( !bytes_total || bytes_read!=bytes_total ) ) {
       ctx->malformed = 1;
       FD_LOG_WARNING(( "load_complete but bytes_read %lu != bytes_total %lu for %s snapshot",

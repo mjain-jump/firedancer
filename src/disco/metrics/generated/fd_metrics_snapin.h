@@ -15,6 +15,7 @@ enum {
   FD_METRICS_GAUGE_SNAPIN_ACCOUNT_IGNORED_OFF,
   FD_METRICS_COUNTER_SNAPIN_ACCOUNT_PROCESSED_OFF,
   FD_METRICS_COUNTER_SNAPIN_ACCOUNT_BATCH_PROCESSED_OFF,
+  FD_METRICS_GAUGE_SNAPIN_COMPRESSED_BYTES_READ_OFF,
 };
 
 #define FD_METRICS_GAUGE_SNAPIN_STATE_NAME "snapin_state"
@@ -57,7 +58,12 @@ enum {
 #define FD_METRICS_COUNTER_SNAPIN_ACCOUNT_BATCH_PROCESSED_DESC "Account batches processed across all snapshots (parallelism indicator)"
 #define FD_METRICS_COUNTER_SNAPIN_ACCOUNT_BATCH_PROCESSED_CVT  (FD_METRICS_CONVERTER_NONE)
 
-#define FD_METRICS_SNAPIN_TOTAL (8UL)
+#define FD_METRICS_GAUGE_SNAPIN_COMPRESSED_BYTES_READ_NAME "snapin_compressed_bytes_read"
+#define FD_METRICS_GAUGE_SNAPIN_COMPRESSED_BYTES_READ_TYPE (FD_METRICS_TYPE_GAUGE)
+#define FD_METRICS_GAUGE_SNAPIN_COMPRESSED_BYTES_READ_DESC "Compressed snapshot bytes this tile has read and decoded from its own byte range of the archive. Might decrease if snapshot load is aborted and restarted"
+#define FD_METRICS_GAUGE_SNAPIN_COMPRESSED_BYTES_READ_CVT  (FD_METRICS_CONVERTER_NONE)
+
+#define FD_METRICS_SNAPIN_TOTAL (9UL)
 extern const fd_metrics_meta_t FD_METRICS_SNAPIN[FD_METRICS_SNAPIN_TOTAL];
 
 #endif /* HEADER_fd_src_disco_metrics_generated_fd_metrics_snapin_h */

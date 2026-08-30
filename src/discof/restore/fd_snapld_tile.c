@@ -40,6 +40,7 @@ typedef struct fd_snapld_tile {
   int   load_file;
   int   sent_meta;
   int   is_redirect;
+  int   fused;      /* file-partitioned loading: publish no data frags */
   ulong gossip_slot;
   ulong file_sz;
 
@@ -199,6 +200,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_memcpy( ctx->config.path, tile->snapld.snapshots_path, PATH_MAX );
   ctx->config.min_download_speed_mibs = tile->snapld.min_download_speed_mibs;
+  ctx->fused                          = tile->snapld.fused;
+  if( FD_UNLIKELY( ctx->fused ) ) {
+    FD_LOG_NOTICE(( "snapld: fused file-partitioned loading -- publishing control frags only, "
+                    "the snapin tiles read the archive themselves" ));
+  }
 
   ctx->state            = FD_SNAPSHOT_STATE_IDLE;
 
@@ -309,6 +315,17 @@ after_credit( fd_snapld_tile_t *  ctx,
       ctx->sent_meta = 1;
       fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_META, ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), 0UL, 0UL, 0UL );
       ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), ctx->out_dc.chunk0, ctx->out_dc.wmark );
+      return;
+    }
+    if( FD_UNLIKELY( ctx->fused ) ) {
+      /* Fused file-partitioned loading: every snapin tile preads its own
+         compressed byte range of the archive, so no payload byte passes
+         through this tile.  Declare the load complete as soon as META is
+         out; snapct then drives FINI, which each snapin tile HOLDS until
+         its own range is fully parsed. */
+      FD_LOG_INFO(( "fused loading of %s snapshot delegated to the snapin tiles", ctx->load_full ? "full" : "incremental" ));
+      ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, 0UL, 0UL, 0UL );
       return;
     }
     long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, out, ctx->out_dc.mtu );

@@ -6,6 +6,8 @@
 #include "utils/fd_ssmanifest_parser.h"
 #include "utils/fd_slot_delta_parser.h"
 #include "utils/fd_snapin_io.h"
+#include "utils/fd_snapfs.h"
+#include "utils/fd_ssarchive.h"
 #include "../../util/fd_hash32.h"
 
 #include "../../disco/topo/fd_topo.h"
@@ -28,38 +30,69 @@
 
 #include "generated/fd_snapin_tile_seccomp.h"
 
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #define NAME "snapin"
 
-/* The snapshot loader runs as N identical fused parse+insert+write
-   snapin tiles (kind_id 0..N-1).  Every tile independently reassembles
-   the decompressed snapshot stream from all snapdc lanes (full reliable
-   consumer, expected-frame rotation), walks the tar entry headers via
-   the ssparse appendvec passthrough, and parses+inserts only the
-   appendvecs it claimed from the shared `next_appendvec` counter: one
-   eager claim when its attempt-slot gate opens, and the next claim taken
-   as it starts parsing the appendvec it holds, so ownership follows the
-   tiles' actual progress instead of a static rule.
+/* FUSED FILE-PARTITIONED SNAPSHOT LOADER.
 
-   Non-owned appendvec bodies are skipped by pure arithmetic inside the
-   passthrough parser, so a tile's frag release rate is its own scan
-   position -- there is no coordinator, no job/coverage protocol and no
-   returnable-frag hold.  Owned accounts are inserted through the
-   striped-lock accdb writer and their packed disk records pwrite()n at
-   the tile's own explicit offsets through a staging buffer.
+   The snapshot loader runs as N identical fused read+decompress+
+   parse+insert+write snapin tiles (kind_id 0..N-1).  There is no
+   snapld->snapdc->snapin data pipeline: each tile opens the snapshot
+   file itself, owns a disjoint COMPRESSED BYTE RANGE of it, and pulls
+   its own bytes off the device.  No payload byte ever crosses a link.
 
-   All controls (INIT/FINI/...) ride the data lanes as barriers exactly
-   as in the sequential loader, and every tile acks them to snapct on
-   its own snapin_ct link (snapct counts ack links by name).  Tile 0
-   additionally parses the manifest and status cache (the stream places
-   them before all appendvecs; the other tiles discard those byte
-   ranges), owns the manif/gui out links, publishes the attempt slot,
-   and at end of load reads the shared totals and winner-gated snoop
-   targets and runs the readback gate.  Cross-tile coordination happens
-   exclusively through the snapio_snoop shared object; see
+   Ownership.  Tile i's range is [lo_i, hi_i), where lo_i is the first
+   zstd frame start at or after i*file_sz/N (found by a local forward
+   search, see fd_snapfs.h) and hi_i == lo_{i+1}.  Because the search is
+   a pure function of the file, tile i and tile i+1 independently
+   compute the same boundary and no handshake is needed to partition the
+   file.  Tile 0 starts at byte 0, tile N-1 ends at file_sz.
+
+   Frames.  Agave chunks the uncompressed archive at a fixed 32 MiB and
+   compresses each chunk as an independent zstd frame, so a frame start
+   is a valid decode entry point and no cross-range decompressor state
+   exists.  A tile decompresses its frames back to back into a private
+   ring and feeds the bytes straight into its own fd_ssparse instance.
+
+   Tar seams.  A range boundary lands mid-entry essentially always, so
+   tile i>0 scans its first decompressed frame forward for the first
+   confirmed tar entry header and seeds its parser there
+   (fd_ssparse_init_midstream); the partial entry before it belongs to
+   tile i-1, which parses PAST its own range end until that entry closes
+   -- at most two extra frames, since the largest appendvec on mainnet
+   (30.1 MiB) is smaller than one frame.  Both local discoveries are
+   heuristics over attacker-controlled bytes, so both are confirmed
+   after the fact at the NEXT/DONE barrier from the per-tile records in
+   the shared object (fd_snapio_seam_t); any mismatch fails the load.
+
+   Appendvec ownership is implicit -- a tile parses EVERY entry whose
+   header falls in its range -- so the old shared `next_appendvec` claim
+   counter is gone.  Duplicate resolution was already slot-based inside
+   the accdb writer, not stream-position based, so out-of-range-order
+   insertion is safe unchanged.
+
+   Owned accounts are inserted through the striped-lock accdb writer and
+   their packed disk records pwrite()n at the tile's own explicit
+   offsets through a staging buffer, exactly as before.
+
+   Controls (INIT/FINI/...) still ride a link from snapld, which in this
+   topology is a control-plane-only tile: it publishes no data frags.  A
+   tile HOLDS the FINI barrier frag until its own file range is fully
+   parsed (fd_ssctrl.h explicitly permits holding a control message),
+   which is what synchronizes N independent readers with snapct's
+   sequential state machine.  Tile 0 additionally parses the manifest
+   and status cache (they live in the first ~217 MiB of the archive,
+   i.e. frames 0-6, entirely inside tile 0's range for any sane N),
+   owns the manif/gui out links, publishes the attempt slot, and at end
+   of load reads the shared totals and winner-gated snoop targets, runs
+   the seam confirmation and the readback gate.  Cross-tile coordination
+   happens exclusively through the snapio_snoop shared object; see
    utils/fd_snapin_io.h for the happens-before chains.
 
    Every write a tile makes to that shared object is one of exactly
@@ -86,12 +119,50 @@
               so a batch's total uncompressed data is bounded by the
               data-stream MTU, far below one maximum-size account.
 
-   Together these add ~20 MiB of scratch per snapin tile. */
+   Together these add ~20 MiB of scratch per snapin tile.
+
+   NOTE.  The batch bound used to come for free from the data link MTU:
+   the parser only saw one 64 KiB frag at a time, so a batch could not
+   span more.  A fused tile feeds it a whole 32 MiB zstd frame, where
+   eight maximum-size accounts (80 MiB) could land in one batch, so
+   fd_ssparse now caps a batch's total body bytes explicitly and zbuf is
+   sized from that cap. */
 
 #define FD_SNAPIN_ACC_BUF_SZ (FD_RUNTIME_ACC_SZ_MAX)
 #define FD_SNAPIN_ZBUF_SZ    (FD_ZLE_COMPRESS_BOUND( FD_RUNTIME_ACC_SZ_MAX ))
 
-FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SNAPSHOT_DATA_MTU + FD_SSPARSE_ACC_BATCH_MAX*FD_ZLE_OVERHEAD, zbuf_batch );
+/* Fused intake buffers, per tile.
+
+   dbuf   decompressed staging.  Sized to one whole zstd frame (32 MiB
+          in every snapshot Agave writes) so tile i>0 can scan its
+          first frame for a tar header without a second buffer, and so
+          the parser sees the largest possible contiguous window (which
+          maximizes the unfragmented account batch fast path).
+   cbuf   compressed read staging.  Read granularity; the recon sweep
+          showed buffered sequential reads at >=4 concurrent streams
+          reach the array's ceiling, so plain pread + FADV_SEQUENTIAL
+          is enough and no io_uring queueing is needed.
+   scan   frame-start pattern search window, plus a small block-walk
+          window for the confirmation chain.
+
+   PARSE_CHUNK bounds how many decompressed bytes one after_credit call
+   feeds the parser, so the tile returns to the stem loop often enough
+   to stay responsive to control frags. */
+
+#define FD_SNAPIN_ZSTD_WINDOW_SZ (1UL<<25)
+#define FD_SNAPIN_DBUF_SZ        (1UL<<25)
+#define FD_SNAPIN_CBUF_SZ        (8UL<<20)
+#define FD_SNAPIN_PARSE_CHUNK    (4UL<<20)
+
+/* Frames a tile may decompress past its range end while closing its
+   last straddling entry.  The largest appendvec measured on mainnet is
+   30.1 MiB < one frame, so the true bound is 2; the margin here only
+   turns a pathological snapshot into a clean hard failure instead of a
+   runaway read. */
+
+#define FD_SNAPIN_OVERRUN_FRAME_MAX (16UL)
+
+FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SSPARSE_ACC_BATCH_BYTES_MAX + FD_SSPARSE_ACC_BATCH_MAX*FD_ZLE_OVERHEAD, zbuf_batch );
 
 /* Write-behind: tiles kick async writeback of their flushed records in
    large contiguous runs and bound their in-flight (kicked but not yet
@@ -328,11 +399,50 @@ struct fd_snapin_tile {
   int *                   stripe_locks;
   fd_snapio_worker_t *    my_snoop;                      /* this tile's fail-partition staging */
   fd_snapio_worker_t *    snoops[ FD_TOPO_MAX_TILE_IN_LINKS ]; /* tile 0: all tiles' fail-partition staging */
+  fd_snapio_seam_t *      my_seam;                       /* this tile's file-partition record */
+
+  /* Fused file-partitioned intake (see the header comment).  The
+     snapshot file is opened in privileged_init, one fd per tile, so
+     every tile has its own kernel readahead state. */
+  int         snap_fd;
+  ulong       snap_file_sz;
+  ZSTD_DCtx * dctx;
+  uchar *     cbuf;
+  uchar *     dbuf;
+  uchar *     scan_buf;      /* frame-start pattern search window */
+  uchar *     walk_buf;      /* block-walk confirmation window */
+
+  ulong range_lo;            /* compressed file offset of this tile's first frame */
+  ulong range_hi;            /* compressed file offset one past its last owned frame */
+  ulong read_off;            /* file read cursor (>= comp_off) */
+  ulong comp_off;            /* file offset of the next compressed byte to decode */
+  ulong cbuf_len;
+  ulong cbuf_pos;
+  ulong dbuf_len;
+  ulong dbuf_pos;
+  ulong comp_read;           /* compressed bytes this tile has decoded (metrics) */
+  ulong dprod;               /* decompressed bytes produced since range_lo's frame start */
+  ulong range_end_dprod;     /* dprod at comp_off==range_hi, ULONG_MAX until reached */
+  ulong first_hdr_delta;     /* dprod offset of this tile's first tar header */
+  ulong range_frames;        /* frames decoded inside [range_lo, range_hi) */
+  ulong overrun_frames;      /* frames decoded past range_hi */
+  int   fused_located;       /* range + first header discovered for this attempt? */
+  int   range_covered;       /* compressed cursor reached range_hi? */
+  int   fused_done;          /* range fully parsed (this tile's EOF) */
+
+  /* Where a fused tile's wall clock goes, in ticks.  Every stage is now
+     inside one tile, so this is the whole cost model of a snapshot load
+     and it is what says which stage to attack next.  Logged per tile at
+     FINI.  ~3 rdtsc pairs per 8 MiB of read / per frame / per 2 MiB
+     flush, i.e. immeasurable overhead. */
+  long  t_start;
+  ulong t_read;              /* pread of the compressed range */
+  ulong t_zstd;              /* ZSTD_decompressStream */
+  ulong t_write;             /* pwrite of packed account records */
 
   /* Sharded parse state (per attempt). */
-  ulong appendvec_seq;      /* stream sequence number of the next appendvec header */
-  ulong claimed_appendvec;  /* the one outstanding claim off hdr->next_appendvec */
-  ulong owned_appendvecs;   /* claims consumed this attempt */
+  ulong appendvec_seq;      /* appendvecs whose header this tile parsed */
+  ulong owned_appendvecs;   /* == appendvec_seq in the fused loader (every entry in range is owned) */
   ulong owned_bytes;
   ulong incr_fork;          /* accdb fork for this attempt's inserts, from the attempt slot (USHORT_MAX = full) */
   long  gate_warn_ts;       /* next wallclock at which a held-data diagnostic may be logged */
@@ -550,6 +660,11 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPIN_WRITE_BUF_SZ                                      );
   l = FD_LAYOUT_APPEND( l, 64UL,                            FD_SNAPIN_ACC_BUF_SZ                                        );
   l = FD_LAYOUT_APPEND( l, 64UL,                            FD_SNAPIN_ZBUF_SZ                                           );
+  l = FD_LAYOUT_APPEND( l, 32UL,                            ZSTD_estimateDStreamSize( FD_SNAPIN_ZSTD_WINDOW_SZ )        );
+  l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPIN_CBUF_SZ                                           );
+  l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPIN_DBUF_SZ                                           );
+  l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPFS_SCAN_BUF_SZ                                       );
+  l = FD_LAYOUT_APPEND( l, 4096UL,                          FD_SNAPFS_WALK_BUF_SZ                                       );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -565,6 +680,7 @@ metrics_write( fd_snapin_tile_t * ctx ) {
   FD_MGAUGE_SET( SNAPIN, ACCOUNT_IGNORED,        ctx->metrics.accounts_ignored );
   FD_MCNT_SET  ( SNAPIN, ACCOUNT_PROCESSED,       ctx->metrics.total_accounts_processed );
   FD_MCNT_SET  ( SNAPIN, ACCOUNT_BATCH_PROCESSED, ctx->metrics.total_account_batches_processed );
+  FD_MGAUGE_SET( SNAPIN, COMPRESSED_BYTES_READ,  ctx->comp_read );
 }
 
 /* verify_slot_deltas_with_slot_history verifies the 'SlotHistory'
@@ -1239,6 +1355,7 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
   ulong sz  = ctx->write_buf_used;
   ulong off = ctx->flush_off;
   ulong bytes_written = 0UL;
+  long  t0  = fd_tickcount();
   while( bytes_written<sz ) {
     long res = pwrite( FD_ACCDB_FD_RW, ctx->write_buf+bytes_written, sz-bytes_written, (long)(off+bytes_written) );
     if( FD_UNLIKELY( -1L==res ) ) {
@@ -1248,6 +1365,7 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
     bytes_written      += (ulong)res;
     ctx->bytes_written += (ulong)res;
   }
+  ctx->t_write        += (ulong)( fd_tickcount() - t0 );
   ctx->flush_off      += sz;
   ctx->write_buf_used  = 0UL;
 
@@ -1407,6 +1525,30 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->owned_bytes      = 0UL;
   ctx->incr_fork        = ULONG_MAX;
   ctx->gate_pending     = 0;
+
+  /* Fused intake: re-discover the range from scratch on every attempt. */
+  ctx->fused_located    = 0;
+  ctx->fused_done       = 0;
+  ctx->range_covered    = 0;
+  ctx->range_lo         = 0UL;
+  ctx->range_hi         = 0UL;
+  ctx->read_off         = 0UL;
+  ctx->comp_off         = 0UL;
+  ctx->comp_read        = 0UL;
+  ctx->cbuf_len         = 0UL;
+  ctx->cbuf_pos         = 0UL;
+  ctx->dbuf_len         = 0UL;
+  ctx->dbuf_pos         = 0UL;
+  ctx->dprod            = 0UL;
+  ctx->range_end_dprod  = ULONG_MAX;
+  ctx->first_hdr_delta  = 0UL;
+  ctx->range_frames     = 0UL;
+  ctx->overrun_frames   = 0UL;
+  ctx->t_start          = fd_tickcount();
+  ctx->t_read           = 0UL;
+  ctx->t_zstd           = 0UL;
+  ctx->t_write          = 0UL;
+
   worker_reset_write_engine( ctx );
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
   fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
@@ -1671,73 +1813,105 @@ worker_process_account_data( fd_snapin_tile_t *            ctx,
 }
 
 static int
-handle_data_frag( fd_snapin_tile_t *  ctx,
-                  ulong               in_idx,
-                  ulong               chunk,
-                  ulong               sz,
-                  fd_stem_context_t * stem ) {
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_FINISHING ) ) {
-    FD_LOG_WARNING(( "received unexpected data frag while in state %s (%lu)",
-                     fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state  ));
-    transition_malformed( ctx, stem );
-    return 0;
-  }
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
-    /* Ignore all data frags after observing an error in the stream until
-       we receive fail & init control messages to restart processing. */
-    return 0;
-  }
-  if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
-    FD_LOG_ERR(( "received data frag during invalid state %s (%lu)",
-                 fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state ));
-  }
+attempt_gate_ready( fd_snapin_tile_t * ctx );
 
-  if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz>ctx->in[ in_idx ].mtu ) ) {
-    FD_LOG_ERR(( "invalid data frag bounds (chunk=%lu chunk0=%lu wmark=%lu sz=%lu mtu=%lu)", chunk, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark, sz, ctx->in[ in_idx ].mtu ));
-  }
+/* Seam stop test.  A file-partitioned tile may only stop at a tar entry
+   boundary at or after the first decompressed byte of the frame that
+   begins its successor's range: the entry starting there is the
+   successor's first entry.  Everything before it -- including a partial
+   entry straddling the boundary -- is this tile's. */
 
-  for(;;) {
-    if( FD_UNLIKELY( sz-ctx->in[ in_idx ].pos==0UL ) ) break;
+static inline int
+fused_at_seam( fd_snapin_tile_t const * ctx ) {
+  return ctx->range_covered
+      && ctx->range_end_dprod!=ULONG_MAX
+      && fd_ssparse_at_entry_boundary( ctx->ssparse )
+      && fd_ssparse_stream_off( ctx->ssparse )>=ctx->range_end_dprod;
+}
 
-    uchar const * data = (uchar const *)fd_chunk_to_laddr_const( ctx->in[ in_idx ].wksp, chunk ) + ctx->in[ in_idx ].pos;
+/* fused_finish publishes this tile's file-partition record (which tile 0
+   cross-checks at the NEXT/DONE barrier) and self-transitions to
+   FINISHING.  The transition is what admits the FINI barrier frag that
+   before_frag has been holding. */
+
+static void
+fused_finish( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->fused_done ) ) return;
+  ctx->fused_done = 1;
+
+  ulong stop = fd_ssparse_stream_off( ctx->ssparse );
+
+  fd_snapio_seam_t * s = ctx->my_seam;
+  s->comp_lo         = ctx->range_lo;
+  s->comp_hi         = ctx->range_hi;
+  s->first_hdr_delta = ctx->first_hdr_delta;
+  /* ULONG_MAX == "this tile stopped without reaching its range end",
+     which is only legal for the last tile (it stops at end of archive). */
+  s->last_end_delta  = ( ctx->range_end_dprod==ULONG_MAX || stop<ctx->range_end_dprod )
+                     ? ULONG_MAX : stop - ctx->range_end_dprod;
+  s->frames          = ctx->range_frames;
+  s->dbytes          = ( ctx->range_end_dprod==ULONG_MAX ) ? ctx->dprod : ctx->range_end_dprod;
+  s->overrun_dbytes  = ( s->last_end_delta==ULONG_MAX ) ? 0UL : s->last_end_delta;
+  FD_COMPILER_MFENCE();
+  s->published       = ctx->generation;
+
+  FD_LOG_NOTICE(( "snapin %lu: range [%lu,%lu) done -- %lu frames, %lu decompressed bytes, "
+                  "first header +%lu, closed last entry +%lu past range end, %lu appendvecs",
+                  ctx->tile_idx, s->comp_lo, s->comp_hi, s->frames, s->dbytes,
+                  s->first_hdr_delta, s->overrun_dbytes, ctx->owned_appendvecs ));
+
+  ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+}
+
+/* fused_parse_bytes feeds data[0,sz) to this tile's parser, stopping at
+   its range seam, at end of archive, at a GUI publish, or after budget
+   bytes.  Returns the number of bytes consumed; on a malformed stream it
+   transitions to ERROR first. */
+
+static ulong
+fused_parse_bytes( fd_snapin_tile_t *  ctx,
+                   fd_stem_context_t * stem,
+                   uchar const *       base,
+                   ulong               sz,
+                   ulong               budget ) {
+  ulong pos = 0UL;
+
+  while( pos<sz && pos<budget ) {
+    if( FD_UNLIKELY( fused_at_seam( ctx ) ) ) {
+      fused_finish( ctx );
+      break;
+    }
+
+    uchar const * data = base + pos;
 
     int early_exit = 0;
     fd_ssparse_advance_result_t result[1];
-    int res = fd_ssparse_advance( ctx->ssparse, data, sz-ctx->in[ in_idx ].pos, result );
+    int res = fd_ssparse_advance( ctx->ssparse, data, sz-pos, result );
     switch( res ) {
       case FD_SSPARSE_ADVANCE_ERROR:
         FD_LOG_WARNING(( "error while parsing snapshot stream" ));
         transition_malformed( ctx, stem );
-        return 0;
+        return pos;
       case FD_SSPARSE_ADVANCE_AGAIN:
         break;
       case FD_SSPARSE_ADVANCE_APPENDVEC: {
-        /* Tar-boundary sharding: each appendvec is owned by exactly one
-           tile.  Owned: flip the passthrough parser into parsing this
-           one appendvec's accounts in-stream.  Not owned: the garbage
-           skipper consumes the body arithmetically. */
-        ulong av_idx = ctx->appendvec_seq++;
-        if( FD_UNLIKELY( is_lead( ctx ) ) ) {
-          ulong body_sz = result->appendvec.data_sz;
-          ctx->av_stats.cnt++;
-          ctx->av_stats.bytes += body_sz;
-          ctx->av_stats.max_sz = fd_ulong_max( ctx->av_stats.max_sz, body_sz );
-          if( FD_UNLIKELY( body_sz>(64UL<<20) ) )  ctx->av_stats.over_64m_cnt++;
-          if( FD_UNLIKELY( body_sz>(256UL<<20) ) ) ctx->av_stats.over_256m_bytes += body_sz;
-          ctx->av_stats.log2_hist[ fd_ulong_min( (ulong)fd_ulong_find_msb( fd_ulong_max( body_sz, 1UL ) ), 47UL ) ]++;
-        }
-        if( FD_UNLIKELY( av_idx==ctx->claimed_appendvec ) ) {
-          /* Claim the next appendvec before parsing this one: the counter is
-             already past av_idx (it handed av_idx to us), so a fresh claim can
-             never land behind our walk position.  The tar format streams the
-             whole manifest before any appendvec, so tile 0 reaches this point
-             only after its manifest parse -- other tiles absorb the early
-             appendvecs without any special case. */
-          ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->snoop_hdr->next_appendvec, 1UL );
-          ctx->owned_appendvecs++;
-          fd_ssparse_appendvec_parse( ctx->ssparse );
-          ctx->owned_bytes += result->appendvec.data_sz;
-        }
+        /* File-partitioned sharding: every entry whose header falls in
+           this tile's byte range is this tile's, so ownership needs no
+           counter and no claim -- the passthrough parser is always
+           flipped into parsing the body.  Passthrough stays enabled
+           purely so the parser reports the entry boundary, which is
+           what the seam stop test and the appendvec stats key off. */
+        ctx->appendvec_seq++;
+        ctx->owned_appendvecs++;
+        ulong body_sz = result->appendvec.data_sz;
+        ctx->av_stats.cnt++;
+        ctx->av_stats.bytes += body_sz;
+        ctx->av_stats.max_sz = fd_ulong_max( ctx->av_stats.max_sz, body_sz );
+        if( FD_UNLIKELY( body_sz>(64UL<<20) ) )  ctx->av_stats.over_64m_cnt++;
+        if( FD_UNLIKELY( body_sz>(256UL<<20) ) ) ctx->av_stats.over_256m_bytes += body_sz;
+        ctx->av_stats.log2_hist[ fd_ulong_min( (ulong)fd_ulong_find_msb( fd_ulong_max( body_sz, 1UL ) ), 47UL ) ]++;
+        fd_ssparse_appendvec_parse( ctx->ssparse );
+        ctx->owned_bytes += body_sz;
         break;
       }
       case FD_SSPARSE_ADVANCE_REGION:
@@ -1750,7 +1924,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         if( FD_UNLIKELY( ctx->flags.manifest_done ) ) {
           FD_LOG_WARNING(( "excess data after manifest" ));
           transition_malformed( ctx, stem );
-          return 0;
+          return pos;
         }
         int parser_res = fd_ssmanifest_parser_consume( ctx->manifest_parser,
                                                        result->manifest.data,
@@ -1758,13 +1932,13 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         if( FD_UNLIKELY( parser_res==FD_SSMANIFEST_PARSER_ADVANCE_ERROR ) ) {
           FD_LOG_WARNING(( "error while parsing snapshot manifest" ));
           transition_malformed( ctx, stem );
-          return 0;
+          return pos;
         }
         if( res==FD_SSPARSE_ADVANCE_MANIFEST_DONE ) {
           if( FD_UNLIKELY( fd_ssmanifest_parser_fini( ctx->manifest_parser )!=FD_SSMANIFEST_PARSER_ADVANCE_DONE ) ) {
             FD_LOG_WARNING(( "manifest stream ended before parser was done" ));
             transition_malformed( ctx, stem );
-            return 0;
+            return pos;
           }
           ctx->flags.manifest_done = 1;
         }
@@ -1783,7 +1957,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
           if( FD_UNLIKELY( res<0 ) ) {
             FD_LOG_WARNING(( "error while parsing slot deltas in status cache" ));
             transition_malformed( ctx, stem );
-            return 0;
+            return pos;
           } else if( FD_LIKELY( res==FD_SLOT_DELTA_PARSER_ADVANCE_SLOT ) ) {
             /* If we're parsing a new slot, add th new slot if we
                haven't parsed 151 slots yet.  Otherwise ignore or evict
@@ -1809,7 +1983,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
             if( FD_UNLIKELY( ctx->blockhash_groups_len>=FD_SNAPIN_MAX_SLOT_DELTA_GROUPS ) ) {
               FD_LOG_WARNING(( "blockhash groups overflow, max is %lu", FD_SNAPIN_MAX_SLOT_DELTA_GROUPS ));
               transition_malformed( ctx, stem );
-              return 0;
+              return pos;
             }
 
             blockhash_group_t * group = &ctx->blockhash_groups[ ctx->blockhash_groups_len++ ];
@@ -1837,7 +2011,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
               FD_LOG_WARNING(( "txncache entries overflow for slot %lu, max is %lu",
                                group->slot, FD_PACK_MAX_TXNCACHE_TXN_PER_SLOT ));
               transition_malformed( ctx, stem );
-              return 0;
+              return pos;
             }
             ctx->txncache_current_slot_entry_cnt++;
 
@@ -1865,7 +2039,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
           if( FD_UNLIKELY( fini_res<0 ) ) {
             FD_LOG_WARNING(( "error while finalizing slot deltas in status cache" ));
             transition_malformed( ctx, stem );
-            return 0;
+            return pos;
           }
           ctx->flags.status_cache_done = fini_res==FD_SLOT_DELTA_PARSER_ADVANCE_DONE;
         }
@@ -1875,7 +2049,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         early_exit = worker_process_account_header( ctx, result );
         if( FD_UNLIKELY( early_exit<0 ) ) {
           transition_malformed( ctx, stem );
-          return 0;
+          return pos;
         }
 
         /* TODO(parallel snapshot load): with tar-boundary sharding each
@@ -1900,7 +2074,7 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         early_exit = worker_process_account_data( ctx, result );
         if( FD_UNLIKELY( early_exit<0 ) ) {
           transition_malformed( ctx, stem );
-          return 0;
+          return pos;
         }
 
         /* Account data may span multiple input chunks (when an account
@@ -1935,11 +2109,13 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         early_exit = worker_process_account_batch( ctx, result );
         if( FD_UNLIKELY( early_exit<0 ) ) {
           transition_malformed( ctx, stem );
-          return 0;
+          return pos;
         }
         break;
       case FD_SSPARSE_ADVANCE_DONE:
-        ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+        /* Only the last tile reaches the end-of-archive zero blocks. */
+        fused_finish( ctx );
+        early_exit = 1;
         break;
       default:
         FD_LOG_ERR(( "unexpected fd_ssparse_advance result %d", res ));
@@ -1952,16 +2128,243 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
       ctx->flags.manifest_processed = 1;
     }
 
-    ctx->in[ in_idx ].pos += result->bytes_consumed;
+    pos += result->bytes_consumed;
     if( FD_LIKELY( ctx->full ) ) ctx->metrics.full_bytes_read        += result->bytes_consumed;
     else                         ctx->metrics.incremental_bytes_read += result->bytes_consumed;
 
     if( FD_UNLIKELY( early_exit ) ) break;
   }
 
-  int reprocess_frag = ctx->in[ in_idx ].pos<sz;
-  if( FD_LIKELY( !reprocess_frag ) ) ctx->in[ in_idx ].pos = 0UL;
-  return reprocess_frag;
+  /* The buffer may have run out exactly on the seam; noticing it here
+     saves decompressing a frame that would be thrown away. */
+  if( FD_UNLIKELY( fused_at_seam( ctx ) ) ) fused_finish( ctx );
+
+  return pos;
+}
+
+/* Fused intake engine ************************************************/
+
+/* fused_cbuf_refill tops up the compressed staging buffer from this
+   tile's own fd.  Returns 1 on success, 0 at end of file, -1 on error.
+   Plain buffered pread is deliberate: the recon sweep measured buffered
+   sequential reads at >=4 concurrent streams hitting the array's
+   ~13.3 GB/s ceiling, so there is nothing for io_uring to recover, and
+   each tile has its own fd (and therefore its own readahead window). */
+
+static int
+fused_cbuf_refill( fd_snapin_tile_t * ctx ) {
+  ulong rem = ctx->cbuf_len - ctx->cbuf_pos;
+  if( FD_UNLIKELY( rem && ctx->cbuf_pos ) ) memmove( ctx->cbuf, ctx->cbuf+ctx->cbuf_pos, rem );
+  ctx->cbuf_len = rem;
+  ctx->cbuf_pos = 0UL;
+
+  ulong want = fd_ulong_min( FD_SNAPIN_CBUF_SZ-rem, ctx->snap_file_sz-ctx->read_off );
+  if( FD_UNLIKELY( !want ) ) return 0;
+
+  long  t0  = fd_tickcount();
+  ulong got = fd_snapfs_pread_all( ctx->snap_fd, ctx->cbuf+rem, want, ctx->read_off );
+  ctx->t_read += (ulong)( fd_tickcount() - t0 );
+  if( FD_UNLIKELY( got==ULONG_MAX ) ) {
+    FD_LOG_WARNING(( "snapin %lu: pread failed at snapshot offset %lu (%i-%s)",
+                     ctx->tile_idx, ctx->read_off, errno, fd_io_strerror( errno ) ));
+    return -1;
+  }
+  if( FD_UNLIKELY( !got ) ) return 0;
+
+  ctx->read_off += got;
+  ctx->cbuf_len += got;
+  return 1;
+}
+
+/* fused_dbuf_fill decompresses forward into the (drained) decompressed
+   staging buffer, up to one whole zstd frame, and tracks the compressed
+   frame boundaries as it goes.  Because a frame boundary is observable
+   (zstd reports the frame end and the tile knows exactly how many
+   compressed bytes went into it), the tile confirms for free that its
+   successor's discovered range start really is a frame boundary: the
+   walk must land on it exactly.
+
+   Returns 1 if dbuf holds bytes, 0 at end of the compressed stream,
+   -1 on a malformed stream. */
+
+static int
+fused_dbuf_fill( fd_snapin_tile_t * ctx ) {
+  ctx->dbuf_len = 0UL;
+  ctx->dbuf_pos = 0UL;
+
+  while( ctx->dbuf_len<FD_SNAPIN_DBUF_SZ ) {
+    if( FD_UNLIKELY( ctx->cbuf_pos==ctx->cbuf_len ) ) {
+      int r = fused_cbuf_refill( ctx );
+      if( FD_UNLIKELY( r<0 ) ) return -1;
+      if( FD_UNLIKELY( !r  ) ) break; /* end of file */
+    }
+
+    ulong dpos = ctx->dbuf_len;
+    ulong spos = 0UL;
+    long  t0   = fd_tickcount();
+    ulong res  = ZSTD_decompressStream_simpleArgs( ctx->dctx,
+                                                   ctx->dbuf, FD_SNAPIN_DBUF_SZ, &dpos,
+                                                   ctx->cbuf+ctx->cbuf_pos, ctx->cbuf_len-ctx->cbuf_pos, &spos );
+    ctx->t_zstd += (ulong)( fd_tickcount() - t0 );
+    if( FD_UNLIKELY( ZSTD_isError( res ) ) ) {
+      FD_LOG_WARNING(( "snapin %lu: zstd error at snapshot offset %lu (%u-%s)", ctx->tile_idx, ctx->comp_off,
+                       ZSTD_getErrorCode( res ), ZSTD_getErrorName( res ) ));
+      return -1;
+    }
+
+    ulong produced  = dpos - ctx->dbuf_len;
+    ctx->dbuf_len   = dpos;
+    ctx->dprod     += produced;
+    ctx->cbuf_pos  += spos;
+    ctx->comp_off  += spos;
+    ctx->comp_read += spos;
+
+    if( FD_UNLIKELY( !res ) ) {
+      /* Frame boundary: comp_off is exactly the next frame start. */
+      if( FD_LIKELY( !ctx->range_covered ) ) {
+        ctx->range_frames++;
+        if( FD_UNLIKELY( ctx->comp_off==ctx->range_hi ) ) {
+          ctx->range_covered   = 1;
+          ctx->range_end_dprod = ctx->dprod;
+          break; /* let the parser reach the seam before reading further */
+        }
+        if( FD_UNLIKELY( ctx->comp_off>ctx->range_hi ) ) {
+          FD_LOG_WARNING(( "snapin %lu: range end %lu is not a zstd frame boundary (frame walk landed on %lu); "
+                           "malformed snapshot", ctx->tile_idx, ctx->range_hi, ctx->comp_off ));
+          return -1;
+        }
+      } else {
+        ctx->overrun_frames++;
+        if( FD_UNLIKELY( ctx->overrun_frames>FD_SNAPIN_OVERRUN_FRAME_MAX ) ) {
+          FD_LOG_WARNING(( "snapin %lu: decompressed %lu frames past its range end without closing its last tar "
+                           "entry; malformed snapshot", ctx->tile_idx, ctx->overrun_frames ));
+          return -1;
+        }
+      }
+    } else if( FD_UNLIKELY( !produced && !spos && ctx->cbuf_pos<ctx->cbuf_len ) ) {
+      FD_LOG_WARNING(( "snapin %lu: zstd made no progress with input remaining", ctx->tile_idx ));
+      return -1;
+    }
+  }
+
+  return ctx->dbuf_len ? 1 : 0;
+}
+
+/* fused_locate discovers this tile's compressed byte range and the
+   offset of the first tar entry header inside it, then seeds the parser.
+   Deliberately runs BEFORE the attempt-slot gate is polled, so the
+   other tiles' range discovery and first-frame decompression overlap
+   tile 0's (potentially slow) INIT-time accdb work.
+
+   Returns 0 on success, -1 on failure. */
+
+static int
+fused_locate( fd_snapin_tile_t * ctx ) {
+  ulong n  = ctx->tile_cnt;
+  ulong i  = ctx->tile_idx;
+  ulong sz = ctx->snap_file_sz;
+
+  /* Split by BYTES of the compressed file (equalizing I/O), then round
+     each anchor up to the next real frame start.  The search is a pure
+     function of the file, so tile i and tile i+1 derive the same
+     boundary from the same anchor with no handshake. */
+  ulong anchor_lo = ( sz/n )*i;
+  ulong anchor_hi = ( sz/n )*( i+1UL );
+
+  ulong lo = !i          ? 0UL : fd_snapfs_find_frame_start( ctx->snap_fd, sz, anchor_lo,
+                                                             ctx->scan_buf, FD_SNAPFS_SCAN_BUF_SZ,
+                                                             ctx->walk_buf, FD_SNAPFS_WALK_BUF_SZ );
+  ulong hi = ( i+1UL==n ) ? sz : fd_snapfs_find_frame_start( ctx->snap_fd, sz, anchor_hi,
+                                                             ctx->scan_buf, FD_SNAPFS_SCAN_BUF_SZ,
+                                                             ctx->walk_buf, FD_SNAPFS_WALK_BUF_SZ );
+  if( FD_UNLIKELY( lo==ULONG_MAX || hi==ULONG_MAX || lo>=hi ) ) {
+    FD_LOG_WARNING(( "snapin %lu: could not partition the snapshot (anchors %lu/%lu resolved to %lu/%lu)",
+                     i, anchor_lo, anchor_hi, lo, hi ));
+    return -1;
+  }
+
+  posix_fadvise( ctx->snap_fd, (long)lo, (long)( hi-lo ), POSIX_FADV_SEQUENTIAL );
+
+  ctx->range_lo        = lo;
+  ctx->range_hi        = hi;
+  ctx->read_off        = lo;
+  ctx->comp_off        = lo;
+  ctx->cbuf_len        = 0UL;
+  ctx->cbuf_pos        = 0UL;
+  ctx->dprod           = 0UL;
+  ctx->range_end_dprod = ULONG_MAX;
+  ctx->range_covered   = 0;
+  ctx->range_frames    = 0UL;
+  ctx->overrun_frames  = 0UL;
+
+  ulong err = ZSTD_DCtx_reset( ctx->dctx, ZSTD_reset_session_only );
+  if( FD_UNLIKELY( ZSTD_isError( err ) ) ) FD_LOG_ERR(( "ZSTD_DCtx_reset failed (%lu-%s)", err, ZSTD_getErrorName( err ) ));
+
+  int r = fused_dbuf_fill( ctx );
+  if( FD_UNLIKELY( r<=0 ) ) {
+    FD_LOG_WARNING(( "snapin %lu: could not decompress the first frame of its range", i ));
+    return -1;
+  }
+
+  if( FD_LIKELY( !i ) ) {
+    /* Tile 0 owns byte 0 of the archive, which is the `version` entry
+       header, so it parses from the front exactly as the sequential
+       loader does -- including the manifest and status cache. */
+    fd_ssparse_init( ctx->ssparse );
+    ctx->first_hdr_delta = 0UL;
+    ctx->dbuf_pos        = 0UL;
+  } else {
+    ulong off = fd_snapfs_find_tar_header( ctx->dbuf, ctx->dbuf_len );
+    if( FD_UNLIKELY( off==ULONG_MAX ) ) {
+      FD_LOG_WARNING(( "snapin %lu: no tar entry header found in the first %lu decompressed bytes of its range",
+                       i, ctx->dbuf_len ));
+      return -1;
+    }
+    fd_ssparse_init_midstream( ctx->ssparse, off );
+    ctx->first_hdr_delta = off;
+    ctx->dbuf_pos        = off;
+  }
+  fd_ssparse_batch_enable( ctx->ssparse, 1 );
+  fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, 1 );
+
+  ctx->fused_located = 1;
+  FD_LOG_NOTICE(( "snapin %lu/%lu: range [%lu,%lu) = %.2f GiB compressed, first tar header +%lu B",
+                  i, n, lo, hi, (double)( hi-lo )/(double)(1UL<<30), ctx->first_hdr_delta ));
+  return 0;
+}
+
+static void
+after_credit( fd_snapin_tile_t *  ctx,
+              fd_stem_context_t * stem,
+              int *               opt_poll_in FD_PARAM_UNUSED,
+              int *               charge_busy ) {
+  if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) return;
+  if( FD_UNLIKELY( ctx->fused_done ) ) return;
+
+  *charge_busy = 1;
+
+  if( FD_UNLIKELY( !ctx->fused_located ) ) {
+    if( FD_UNLIKELY( fused_locate( ctx ) ) ) transition_malformed( ctx, stem );
+    return;
+  }
+
+  /* No insert may race tile 0's INIT-time accdb work.  Discovery above
+     is gate-independent; parsing is not. */
+  if( FD_UNLIKELY( !attempt_gate_ready( ctx ) ) ) return;
+
+  if( FD_UNLIKELY( ctx->dbuf_pos==ctx->dbuf_len ) ) {
+    int r = fused_dbuf_fill( ctx );
+    if( FD_UNLIKELY( r<0 ) ) { transition_malformed( ctx, stem ); return; }
+    if( FD_UNLIKELY( !r ) ) {
+      FD_LOG_WARNING(( "snapin %lu: compressed stream ended before the tar entry at its range end closed",
+                       ctx->tile_idx ));
+      transition_malformed( ctx, stem );
+    }
+    return;
+  }
+
+  ctx->dbuf_pos += fused_parse_bytes( ctx, stem, ctx->dbuf+ctx->dbuf_pos,
+                                      ctx->dbuf_len-ctx->dbuf_pos, FD_SNAPIN_PARSE_CHUNK );
 }
 
 /* Tile-0 end-of-load work ********************************************/
@@ -1974,6 +2377,74 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
    cross-tile sum and hdr->slot_history/hdr->feature_snoop are already
    the single winner-gated copy. */
 
+/* MANDATORY post-hoc confirmation of the two local heuristics the fused
+   loader relies on: the discovered zstd frame boundaries and the
+   discovered first tar entry headers.  See fd_snapio_seam_t for the
+   chain.  A mismatch means the file partition either skipped or
+   duplicated a byte range, so the load is not merely suspect -- it is
+   wrong, and this hard-fails. */
+
+static void
+tile0_verify_seams( fd_snapin_tile_t * ctx ) {
+  ulong                    n    = ctx->tile_cnt;
+  fd_snapio_seam_t const * seam = ctx->snoop_hdr->seam;
+
+  ulong frames = 0UL, dbytes = 0UL, overrun = 0UL;
+  int   ok     = 1;
+
+  for( ulong i=0UL; i<n; i++ ) {
+    fd_snapio_seam_t const * s = &seam[ i ];
+    if( FD_UNLIKELY( s->published!=ctx->generation ) ) {
+      FD_LOG_WARNING(( "seam verification: tile %lu published no partition record for generation %lu (saw %lu)",
+                       i, ctx->generation, s->published ));
+      ok = 0;
+      continue;
+    }
+
+    frames  += s->frames;
+    dbytes  += s->dbytes;
+    overrun += s->overrun_dbytes;
+
+    if( FD_UNLIKELY( !i && ( s->comp_lo || s->first_hdr_delta ) ) ) {
+      FD_LOG_WARNING(( "seam verification: tile 0 starts at compressed %lu with first header +%lu, expected 0/0",
+                       s->comp_lo, s->first_hdr_delta ));
+      ok = 0;
+    }
+
+    if( i+1UL==n ) {
+      if( FD_UNLIKELY( s->comp_hi!=ctx->snap_file_sz ) ) {
+        FD_LOG_WARNING(( "seam verification: last tile ends at compressed %lu, expected file size %lu",
+                         s->comp_hi, ctx->snap_file_sz ));
+        ok = 0;
+      }
+      continue;
+    }
+
+    fd_snapio_seam_t const * t = &seam[ i+1UL ];
+    if( FD_UNLIKELY( s->comp_hi!=t->comp_lo ) ) {
+      FD_LOG_WARNING(( "seam verification: tile %lu ends at compressed %lu but tile %lu starts at %lu",
+                       i, s->comp_hi, i+1UL, t->comp_lo ));
+      ok = 0;
+    }
+    if( FD_UNLIKELY( s->last_end_delta==ULONG_MAX ) ) {
+      FD_LOG_WARNING(( "seam verification: tile %lu stopped before reaching its range end", i ));
+      ok = 0;
+    } else if( FD_UNLIKELY( s->last_end_delta!=t->first_hdr_delta ) ) {
+      FD_LOG_WARNING(( "seam verification: tile %lu closed its last tar entry +%lu past the seam but tile %lu "
+                       "started parsing at +%lu", i, s->last_end_delta, i+1UL, t->first_hdr_delta ));
+      ok = 0;
+    }
+  }
+
+  FD_LOG_NOTICE(( "seam verification: %s -- %lu tiles, %lu zstd frames, %lu decompressed bytes, "
+                  "%lu bytes of seam overrun",
+                  ok ? "PASS" : "FAIL", n, frames, dbytes, overrun ));
+
+  if( FD_UNLIKELY( !ok ) ) {
+    FD_LOG_ERR(( "fused snapshot load: file-partition seam verification FAILED; the load is not trustworthy" ));
+  }
+}
+
 static void
 tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( ctx->attempt_folded ) ) return;
@@ -1981,11 +2452,7 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
 
   fd_snapio_totals_t const * totals = &ctx->snoop_hdr->totals;
 
-  /* Eager claim: every appendvec in the stream was claimed by exactly
-     one tile, and every tile ends the attempt holding exactly one
-     unmatched claim. */
-  FD_TEST( totals->appendvecs_processed==ctx->appendvec_seq );
-  FD_TEST( ctx->snoop_hdr->next_appendvec==ctx->appendvec_seq+ctx->snoop_hdr->worker_cnt );
+  tile0_verify_seams( ctx );
 
   /* Cross-tile account totals, for the end-of-load log and nothing
      else.  totals is re-zeroed at every INIT and this runs only on a
@@ -2297,22 +2764,17 @@ attempt_gate_open( fd_snapin_tile_t * ctx ) {
   }
   fd_accdb_snapshot_writer_begin( ctx->accdb );
 
-  /* Eager claim.  The counter was re-zeroed by tile 0 before it
-     published the slot, so the claim sequence starts at 0 every
-     attempt.  From here the tile always holds exactly one outstanding
-     claim, which the appendvec walk consumes and immediately replaces.
-     Drawing it here (rather than at the INIT barrier) cannot orphan an
-     ordinal: the claim is taken before the first data frag is admitted,
-     so the tile's walk position is still 0 and every claim it can ever
-     draw is at or ahead of that position. */
-  ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->snoop_hdr->next_appendvec, 1UL );
-  ctx->gate_pending      = 0;
+  /* The old eager appendvec claim used to be drawn here.  In the
+     file-partitioned loader ownership is the byte range itself, so
+     there is nothing to claim: every entry whose header falls in the
+     range is this tile's, and hdr->next_appendvec is dead. */
+  ctx->gate_pending = 0;
 }
 
 /* Returns 1 if this attempt's write path is armed, 0 if the caller must
    hold the frag. */
 
-static inline int
+static int
 attempt_gate_ready( fd_snapin_tile_t * ctx ) {
   if( FD_LIKELY( !ctx->gate_pending ) ) return 1;
   if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->snoop_hdr->attempt.generation )!=ctx->generation ) ) {
@@ -2353,6 +2815,17 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
          handle_control_barrier) */
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
+
+      /* PROTOTYPE SHORTCUT.  The fused loader only partitions the full
+         archive.  An incremental snapshot is ~1 GB, three orders of
+         magnitude smaller, so partitioning it buys nothing and the
+         streaming pipeline would be kept for it -- but this branch
+         removed that pipeline, so refuse loudly instead of silently
+         loading nothing.  Run with --no-incremental. */
+      if( FD_UNLIKELY( !ctx->full ) ) {
+        FD_LOG_ERR(( "fused snapin: incremental snapshots are not supported by this prototype; "
+                     "pass --no-incremental (or set snapshots.incremental_snapshots = false)" ));
+      }
 
       worker_reset_attempt( ctx );
       fd_memset( &ctx->flags, 0, sizeof(ctx->flags) );
@@ -2433,6 +2906,22 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
                       ctx->bytes_written_logical,
                       ctx->bytes_written ? (double)ctx->bytes_written_logical/(double)ctx->bytes_written : 0.0,
                       ctx->wb_kick_cnt, ctx->wb_wait_cnt ));
+      /* Whole-tile cost model: every stage of the load now lives in one
+         tile, so this breakdown says which stage the next optimization
+         has to attack.  "other" is parse + accdb insert + fd_zle
+         compress + staging memcpy. */
+      {
+        double tpns    = fd_tempo_tick_per_ns( NULL );
+        double elapsed = (double)( fd_tickcount() - ctx->t_start )/tpns/1e9;
+        double rd      = (double)ctx->t_read /tpns/1e9;
+        double zs      = (double)ctx->t_zstd /tpns/1e9;
+        double wr      = (double)ctx->t_write/tpns/1e9;
+        FD_LOG_NOTICE(( "snapin %lu: time %.2fs = read %.2fs (%.0f%%) + zstd %.2fs (%.0f%%) + pwrite %.2fs (%.0f%%) "
+                        "+ other %.2fs (%.0f%%)",
+                        ctx->tile_idx, elapsed,
+                        rd, 100.0*rd/elapsed, zs, 100.0*zs/elapsed, wr, 100.0*wr/elapsed,
+                        elapsed-rd-zs-wr, 100.0*(elapsed-rd-zs-wr)/elapsed ));
+      }
       if( FD_UNLIKELY( is_lead( ctx ) ) ) log_appendvec_stats( ctx );
 
       /* Equal-slot cross-appendvec duplicates are accepted, not
@@ -2661,47 +3150,28 @@ before_frag( fd_snapin_tile_t * ctx,
 
   /* Once this lane sends the pending control, hold its later frags
      until all snapdc lanes send the same control. */
+  /* The fused loader pulls its own payload bytes off the device; the
+     control link carries no data.  Filter any stray DATA frag and
+     snapld's LOAD_COMPLETE (which is addressed to snapct). */
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA || sig==FD_SNAPSHOT_MSG_LOAD_COMPLETE ) ) return 1;
+
   if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ in_idx ] ) ) {
     FD_TEST( sig!=ctx->pending_control );
     return -1;
   }
 
-  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) {
-    /* Only accept DATA frags from the expected lane */
-    if( FD_UNLIKELY( in_idx!=ctx->expected_frame%ctx->lane_cnt ) ) return -1;
+  /* HOLD the FINI barrier until this tile has parsed its whole file
+     range.  snapld publishes LOAD_COMPLETE as soon as it has handed out
+     the byte ranges -- it does not read the archive -- so snapct's FINI
+     arrives long before the readers are finished.  Holding the frag
+     (explicitly permitted by the control protocol, see fd_ssctrl.h) is
+     what synchronizes N independent readers with snapct's sequential
+     state machine: the tile keeps working in after_credit and admits
+     FINI only once fused_finish self-transitioned it to FINISHING.
 
-    /* ... and only once this attempt's slot is published, so no insert
-       can race tile 0's INIT-time accdb work.  Controls stay
-       admissible while data is held: that is what lets a tile whose
-       INIT barrier completed for an attempt tile 0 never published
-       consume the aborting ERROR and ack the FAIL. */
-    if( FD_UNLIKELY( !attempt_gate_ready( ctx ) ) ) return -1;
-  }
-
-  return 0;
-}
-
-static inline int
-handle_lane_data_frag( fd_snapin_tile_t *  ctx,
-                       fd_stem_context_t * stem,
-                       ulong               in_idx,
-                       ulong               chunk,
-                       ulong               sz,
-                       ulong               ctl ) {
-  /* EOM marks the end of a frame */
-  int eom = !!fd_frag_meta_ctl_eom( ctl );
-
-  /* The tar parser can reach EOF before snapdc reports the end of the
-     zstd frame.  Only the empty EOM is valid (any payload after EOF is
-     malformed). */
-  int trailing_eom = ctx->state==FD_SNAPSHOT_STATE_FINISHING && eom && !sz;
-  if( FD_UNLIKELY( !trailing_eom && handle_data_frag( ctx, in_idx, chunk, sz, stem ) ) ) {
-    return 1;
-  }
-
-  if( FD_UNLIKELY( eom ) ) {
-    ctx->expected_frame++;
-  }
+     ERROR is admitted above regardless, and FAIL is admitted from the
+     ERROR state, so an aborted attempt still drains. */
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_FINI && ctx->state!=FD_SNAPSHOT_STATE_FINISHING ) ) return -1;
 
   return 0;
 }
@@ -2762,20 +3232,19 @@ returnable_frag( fd_snapin_tile_t *  ctx,
                  ulong               tsorig FD_PARAM_UNUSED,
                  ulong               tspub  FD_PARAM_UNUSED,
                  fd_stem_context_t * stem ) {
+  (void)ctl;
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
-
-  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_lane_data_frag( ctx, stem, in_idx, chunk, sz, ctl );
-  else                                           handle_control_barrier( ctx, stem, in_idx, sig, chunk, sz );
-
+  handle_control_barrier( ctx, stem, in_idx, sig, chunk, sz );
   return 0;
 }
 
 static ulong
-populate_allowed_fds( fd_topo_t      const * topo FD_PARAM_UNUSED,
-                      fd_topo_tile_t const * tile FD_PARAM_UNUSED,
+populate_allowed_fds( fd_topo_t      const * topo,
+                      fd_topo_tile_t const * tile,
                       ulong                  out_fds_cnt,
                       int *                  out_fds ) {
-  if( FD_UNLIKELY( out_fds_cnt<3UL ) ) FD_LOG_ERR(( "invalid out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<4UL ) ) FD_LOG_ERR(( "invalid out_fds_cnt %lu", out_fds_cnt ));
+  fd_snapin_tile_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
   ulong out_cnt = 0;
   out_fds[ out_cnt++ ] = 2UL; /* stderr */
@@ -2783,6 +3252,7 @@ populate_allowed_fds( fd_topo_t      const * topo FD_PARAM_UNUSED,
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd(); /* logfile */
   }
   out_fds[ out_cnt++ ] = FD_ACCDB_FD_RW; /* accounts db */
+  if( FD_LIKELY( -1!=ctx->snap_fd ) ) out_fds[ out_cnt++ ] = ctx->snap_fd; /* snapshot archive */
 
   return out_cnt;
 }
@@ -2792,8 +3262,8 @@ populate_allowed_seccomp( fd_topo_t const *      topo,
                           fd_topo_tile_t const * tile,
                           ulong                  out_cnt,
                           struct sock_filter *   out ) {
-  (void)topo; (void)tile;
-  populate_sock_filter_policy_fd_snapin_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), FD_ACCDB_FD_RW );
+  fd_snapin_tile_t * ctx = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+  populate_sock_filter_policy_fd_snapin_tile( out_cnt, out, (uint)fd_log_private_logfile_fd(), FD_ACCDB_FD_RW, (uint)ctx->snap_fd );
   return sock_filter_policy_fd_snapin_tile_instr_cnt;
 }
 
@@ -2843,6 +3313,45 @@ privileged_init( fd_topo_t const *      topo,
     ctx->wb_total_window = 0UL;
   } else {
     ctx->wb_total_window = fd_ulong_min( FD_SNAPIN_WB_WINDOW_MAX, (mem_total/100UL)*FD_SNAPIN_WB_MEM_PCT );
+  }
+
+  /* Fused loader: open the full snapshot archive here, one fd per tile,
+     while the process still has the privilege to do so.  Each tile
+     preads only its own byte range, and a private fd gives each one its
+     own kernel readahead window.
+     PROTOTYPE SHORTCUT: only the full snapshot is opened.  Incremental
+     loading is not supported on this branch (the incremental archive is
+     ~1 GB, so partitioning it buys nothing; it would keep the streaming
+     pipeline). */
+  ctx->snap_fd      = -1;
+  ctx->snap_file_sz = 0UL;
+
+  ulong full_slot = ULONG_MAX, incr_slot = ULONG_MAX;
+  int   full_zstd = 0, incr_zstd = 0;
+  char  full_path[ PATH_MAX ] = {0};
+  char  incr_path[ PATH_MAX ] = {0};
+  uchar full_hash[ FD_HASH_FOOTPRINT ] = {0};
+  uchar incr_hash[ FD_HASH_FOOTPRINT ] = {0};
+  if( FD_UNLIKELY( -1==fd_ssarchive_latest_pair( tile->snapin.snapshots_path, 0,
+                                                 &full_slot, &incr_slot,
+                                                 full_path,  incr_path,
+                                                 &full_zstd, &incr_zstd,
+                                                 full_hash,  incr_hash ) ) ) {
+    FD_LOG_ERR(( "fused snapin: no local full snapshot found under `%s`", tile->snapin.snapshots_path ));
+  }
+  FD_TEST( full_slot!=ULONG_MAX );
+  if( FD_UNLIKELY( !full_zstd ) ) FD_LOG_ERR(( "fused snapin: `%s` is not zstd compressed", full_path ));
+
+  ctx->snap_fd = open( full_path, O_RDONLY|O_CLOEXEC );
+  if( FD_UNLIKELY( -1==ctx->snap_fd ) ) FD_LOG_ERR(( "open() failed `%s` (%i-%s)", full_path, errno, fd_io_strerror( errno ) ));
+
+  off_t sz = lseek( ctx->snap_fd, 0, SEEK_END );
+  if( FD_UNLIKELY( -1==sz ) ) FD_LOG_ERR(( "lseek(SEEK_END) failed `%s` (%i-%s)", full_path, errno, fd_io_strerror( errno ) ));
+  ctx->snap_file_sz = (ulong)sz;
+  if( FD_UNLIKELY( ctx->snap_file_sz<FD_SNAPFS_FRAME_HDR_SZ ) ) FD_LOG_ERR(( "fused snapin: `%s` is too small", full_path ));
+
+  if( FD_UNLIKELY( !tile->kind_id ) ) {
+    FD_LOG_NOTICE(( "fused snapin: partitioning `%s` (%lu bytes) across the snapin tiles", full_path, ctx->snap_file_sz ));
   }
 }
 
@@ -2899,6 +3408,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->tile_cnt      = snoop_hdr->worker_cnt;
   ctx->stripe_locks  = fd_snapio_snoop_stripes( snoop_hdr );
   ctx->my_snoop      = fd_snapio_snoop_worker( snoop_hdr, ctx->tile_idx );
+  FD_TEST( ctx->tile_cnt<=FD_SNAPIO_SEAM_MAX );
+  ctx->my_seam       = &snoop_hdr->seam[ ctx->tile_idx ];
   if( FD_UNLIKELY( is_lead( ctx ) ) ) {
     for( ulong w=0UL; w<ctx->tile_cnt; w++ ) ctx->snoops[ w ] = fd_snapio_snoop_worker( snoop_hdr, w );
   }
@@ -2955,6 +3466,16 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->acc_buf   = FD_SCRATCH_ALLOC_APPEND( l, 64UL,   FD_SNAPIN_ACC_BUF_SZ   );
   ctx->zbuf      = FD_SCRATCH_ALLOC_APPEND( l, 64UL,   FD_SNAPIN_ZBUF_SZ      );
 
+  void * _dctx   = FD_SCRATCH_ALLOC_APPEND( l, 32UL,   ZSTD_estimateDStreamSize( FD_SNAPIN_ZSTD_WINDOW_SZ ) );
+  ctx->cbuf      = FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPIN_CBUF_SZ      );
+  ctx->dbuf      = FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPIN_DBUF_SZ      );
+  ctx->scan_buf  = FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPFS_SCAN_BUF_SZ  );
+  ctx->walk_buf  = FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPFS_WALK_BUF_SZ  );
+
+  ctx->dctx = ZSTD_initStaticDStream( _dctx, ZSTD_estimateDStreamSize( FD_SNAPIN_ZSTD_WINDOW_SZ ) );
+  FD_TEST( ctx->dctx );
+  FD_TEST( (void *)ctx->dctx==_dctx );
+
   ctx->alpenglow = tile->snapin.alpenglow;
   ctx->blockhash_groups_len = 0UL;
 
@@ -2970,10 +3491,12 @@ unprivileged_init( fd_topo_t const *      topo,
     fd_slot_delta_parser_init( ctx->slot_delta_parser );
   }
 
+  /* Control plane only: the fused loader reads its payload from the
+     snapshot file, so its single input link carries INIT/META/FINI/
+     NEXT/DONE/ERROR/FAIL/SHUTDOWN and nothing else. */
   for( ulong i=0UL; i<ctx->lane_cnt; i++ ) {
     fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
-    FD_TEST( 0==strcmp( in_link->name, "snapdc_in" ) );
-    FD_TEST( in_link->kind_id==i );
+    FD_TEST( 0==strcmp( in_link->name, "snapld_dc" ) );
     fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
     ctx->in[ i ].wksp   = in_wksp->wksp;
     ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].wksp, in_link->dcache );
@@ -2981,8 +3504,8 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].mtu    = in_link->mtu;
     ctx->in[ i ].pos    = 0UL;
   }
-  if( FD_UNLIKELY( !ctx->lane_cnt || ctx->lane_cnt>FD_SNAPIN_IO_LANE_MAX ) ) {
-    FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu snapshot data lanes, expected 1..%lu", ctx->tile_idx, ctx->lane_cnt, FD_SNAPIN_IO_LANE_MAX ));
+  if( FD_UNLIKELY( ctx->lane_cnt!=1UL ) ) {
+    FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu input links, expected exactly 1 (`snapld_dc`)", ctx->tile_idx, ctx->lane_cnt ));
   }
 
   worker_reset_attempt( ctx );
@@ -3033,6 +3556,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
 #define STEM_CALLBACK_SHOULD_SHUTDOWN should_shutdown
 #define STEM_CALLBACK_METRICS_WRITE   metrics_write
+#define STEM_CALLBACK_AFTER_CREDIT    after_credit
 #define STEM_CALLBACK_BEFORE_FRAG     before_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG returnable_frag
 

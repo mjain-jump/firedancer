@@ -101,6 +101,54 @@ struct __attribute__((aligned(64))) fd_snapio_totals {
 
 typedef struct fd_snapio_totals fd_snapio_totals_t;
 
+/* fd_snapio_seam_t is one tile's record of the file partition it owned,
+   published before its FINI ack and cross-checked by tile 0 at the
+   NEXT/DONE barrier.  This is the mandatory post-hoc confirmation of
+   the two local heuristics the fused loader relies on (see
+   fd_snapfs.h): a discovered zstd frame start, and a discovered first
+   tar entry header.
+
+   Confirmation chain, for tiles i and i+1:
+
+     - comp_hi[i] == comp_lo[i+1].  Tile i+1 found comp_lo[i+1] by
+       searching forward from its byte anchor; tile i reached comp_hi[i]
+       by walking REAL frames from its own confirmed start, so equality
+       proves the searched-for offset is a true frame boundary.  (Tile i
+       hard-fails immediately if its frame walk steps PAST comp_hi[i]
+       without landing on it.)
+
+     - last_end_delta[i] == first_hdr_delta[i+1].  Both are measured
+       from the same anchor -- the first decompressed byte of the frame
+       at comp_hi[i] -- so no global decompressed offset is needed.
+       Tile i parsed past its range end until its last entry closed and
+       stopped at the first entry boundary at or after that anchor;
+       tile i+1 independently scanned forward from the anchor for the
+       first plausible header.  Equality proves the seam is stitched
+       with neither a gap nor an overlap.
+
+     - first_hdr_delta[0] == 0 and comp_lo[0] == 0: tile 0 starts at
+       byte 0 of the archive, where the `version` entry header is.
+
+   Any mismatch fails the load. */
+
+struct __attribute__((aligned(64))) fd_snapio_seam {
+  ulong comp_lo;         /* compressed file offset of this tile's first frame */
+  ulong comp_hi;         /* compressed file offset one past its last owned frame */
+  ulong first_hdr_delta; /* decompressed bytes from comp_lo's frame start to this tile's first tar header */
+  ulong last_end_delta;  /* decompressed bytes from comp_hi's frame start to where this tile stopped parsing */
+  ulong frames;          /* zstd frames fully inside [comp_lo, comp_hi) */
+  ulong dbytes;          /* decompressed bytes those frames hold */
+  ulong overrun_dbytes;  /* decompressed bytes parsed past comp_hi to close the last entry */
+  ulong published;       /* generation this record belongs to */
+};
+
+typedef struct fd_snapio_seam fd_snapio_seam_t;
+
+/* Maximum fused snapin tiles.  Matches the topology's per-tile input
+   link bound, which already caps the snapin tile count elsewhere. */
+
+#define FD_SNAPIO_SEAM_MAX (128UL)
+
 /* fd_snapio_worker_t is a tile's end-of-attempt fail-partition
    staging: the accdb partitions it acquired during the current
    attempt, published (cnt stamped, fence, FAIL ack) when the attempt
@@ -195,6 +243,12 @@ struct fd_snapio_snoop_hdr {
      (feature_av[]/feature_rec[]) used only to arbitrate between
      per-tile copies are gone -- there is only ever one copy. */
   fd_feature_snoop_t feature_snoop;
+
+  /* Per-tile file-partition records, for the post-hoc seam
+     confirmation described at fd_snapio_seam_t.  Each tile writes only
+     its own entry, before its FINI ack; tile 0 reads them all at the
+     NEXT/DONE barrier, which snapct gates on all FINI acks. */
+  fd_snapio_seam_t seam[ FD_SNAPIO_SEAM_MAX ];
 };
 
 typedef struct fd_snapio_snoop_hdr fd_snapio_snoop_hdr_t;
@@ -236,6 +290,7 @@ fd_snapio_snoop_new( void * mem,
   fd_memset( &hdr->totals,       0, sizeof(fd_snapio_totals_t) );
   fd_memset( &hdr->slot_history, 0, sizeof(hdr->slot_history)  );
   fd_memset( &hdr->feature_snoop, 0, sizeof(fd_feature_snoop_t) );
+  fd_memset( hdr->seam,          0, sizeof(hdr->seam)          );
   uchar * stripes = (uchar *)hdr + fd_ulong_align_up( sizeof(fd_snapio_snoop_hdr_t), 4096UL );
   fd_memset( stripes, 0, FD_SNAPIO_STRIPE_CNT*sizeof(int) );
   uchar * workers = stripes + fd_ulong_align_up( FD_SNAPIO_STRIPE_CNT*sizeof(int), 4096UL );

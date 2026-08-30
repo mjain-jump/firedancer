@@ -1692,6 +1692,7 @@ EXAMPLES
     <gauge name="AccountIgnored" summary="Stale duplicate accounts dropped because a previously inserted account was newer. Resets if snapshot load restarts" />
     <counter name="AccountProcessed" summary="Accounts processed across all snapshots (inserted or otherwise)" />
     <counter name="AccountBatchProcessed" summary="Account batches processed across all snapshots (parallelism indicator)" />
+    <gauge name="CompressedBytesRead" summary="Compressed snapshot bytes this tile has read and decoded from its own byte range of the archive. Might decrease if snapshot load is aborted and restarted" />
 </tile>
 
 <tile name="snapwr">

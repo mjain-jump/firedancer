@@ -137,6 +137,7 @@
 | <span class="metrics-name">snapin_&#8203;account_&#8203;ignored</span> | gauge | Stale duplicate accounts dropped because a previously inserted account was newer. Resets if snapshot load restarts |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;processed</span> | counter | Accounts processed across all snapshots (inserted or otherwise) |
 | <span class="metrics-name">snapin_&#8203;account_&#8203;batch_&#8203;processed</span> | counter | Account batches processed across all snapshots (parallelism indicator) |
+| <span class="metrics-name">snapin_&#8203;compressed_&#8203;bytes_&#8203;read</span> | gauge | Compressed snapshot bytes this tile has read and decoded from its own byte range of the archive. Might decrease if snapshot load is aborted and restarted |
 
 </div>
 

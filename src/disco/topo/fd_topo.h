@@ -689,6 +689,11 @@ struct fd_topo_tile {
       char snapshots_path[ PATH_MAX ];
       int  incremental_snapshots;
       uint min_download_speed_mibs;
+      /* Fused file-partitioned loading: the snapin tiles read the
+         archive themselves, so snapld is a control-plane-only tile and
+         publishes no data frags.  Set when the topology has no snapdc
+         tiles. */
+      int  fused;
     } snapld;
 
     struct {
@@ -698,6 +703,11 @@ struct fd_topo_tile {
       ulong banks_obj_id;
       ulong snoop_obj_id; /* parallel snapshot-load topology only */
       int   alpenglow;
+      /* Fused file-partitioned loader: each snapin tile opens the
+         snapshot archive itself and reads its own byte range, so it
+         needs the archive directory (same value snapld gets). */
+      char  snapshots_path[ PATH_MAX ];
+      int   incremental_snapshots;
     } snapin;
 
     struct {
