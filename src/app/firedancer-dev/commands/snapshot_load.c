@@ -199,7 +199,13 @@ snapshot_load_topo( config_t * config ) {
   ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
 
   fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
-  fd_topob_link( topo, "snapld_dc",    "snapld_dc",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
+  /* snapld_dc must hold several WHOLE zstd frames of runway: snapdc
+     tiles own alternating 32 MiB frames, so a window of W frags admits
+     only ceil(W/512) concurrently-decompressing tiles.  The default 256
+     frags (2.1 frames) starved snapld at ~2.3 GB/s compressed with all
+     stages idle; 4096 frags (33.5 frames) saturates 8+ decompressors
+     (measured 51.6s -> 29.2s full load at N=16, knee at ~8 frames). */
+  fd_topob_link( topo, "snapld_dc",    "snapld_dc",    4096UL,                 FD_SNAPSHOT_DATA_MTU,           1UL );
   FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
   fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL )->permit_no_consumers = 1;
   fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
