@@ -611,6 +611,13 @@ fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
 }
 
 void
+fd_ssparse_prologue_seen( fd_ssparse_t * ssparse ) {
+  ssparse->flags.seen_version      = 1;
+  ssparse->flags.seen_manifest     = 1;
+  ssparse->flags.seen_status_cache = 1;
+}
+
+void
 fd_ssparse_appendvec_parse( fd_ssparse_t * ssparse ) {
   /* Only valid immediately after an FD_SSPARSE_ADVANCE_APPENDVEC
      result: the tar header has been parsed, slot/acc_vec_bytes are

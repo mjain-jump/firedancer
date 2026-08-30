@@ -154,6 +154,17 @@ void
 fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
                                          int            enabled );
 
+/* fd_ssparse_prologue_seen marks the version, manifest and status
+   cache entries as already observed.  A parser fed a ROUTED subset of
+   the tar stream (only the entries one snapin tile owns, each still a
+   complete 512 byte header + body + padding run) never sees the
+   prologue entries, which would otherwise trip both the
+   "account append vec file before manifest" check and the
+   end-of-archive completeness check.  Only call this on a parser that
+   is deliberately not being fed the prologue. */
+void
+fd_ssparse_prologue_seen( fd_ssparse_t * ssparse );
+
 /* fd_ssparse_appendvec_parse switches the parser from skipping to
    parsing the current appendvec body.  Only valid immediately after
    fd_ssparse_advance returned FD_SSPARSE_ADVANCE_APPENDVEC (with
