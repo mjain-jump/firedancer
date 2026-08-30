@@ -234,6 +234,7 @@ fd_topo_initialize( config_t * config ) {
   ulong snapsv_tile_cnt = ( config->firedancer.snapshots.server.enabled &&
                             config->firedancer.layout.enable_snapshot_production )
                           ? config->firedancer.layout.snapsv_tile_count : 0UL;
+  ulong snapld_tile_cnt = config->firedancer.layout.snapld_tile_count;
   ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
 
@@ -433,7 +434,10 @@ fd_topo_initialize( config_t * config ) {
     ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
 
     /**/                 fd_topob_link( topo, "snapct_ld",     "snapct_ld",     128UL,                                    sizeof(fd_ssctrl_init_t),      1UL );
-    /**/                 fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
+    /* One snapld_dc lane per reader tile.  The decompressors consume
+       the lanes strictly in stripe order, so the runway that matters is
+       the aggregate depth across lanes. */
+    FOR(snapld_tile_cnt) fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
     FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in",     "snapdc_in",     snapdc_in_depth,                          FD_SNAPSHOT_DATA_MTU,          1UL );
 
     /**/                 fd_topob_link( topo, "snapin_manif",  "snapin_manif",  4UL,                                      sizeof(fd_snapshot_manifest_t),1UL ); /* only 3 frags ever traverse: FULL, INCREMENTAL, DONE */
@@ -554,7 +558,7 @@ fd_topo_initialize( config_t * config ) {
 
   if( FD_LIKELY( snapshots_enabled ) ) {
     /**/                 fd_topob_tile( topo, "snapct", "snapct", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
-    /**/                 fd_topob_tile( topo, "snapld", "snapld", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
+    FOR(snapld_tile_cnt) fd_topob_tile( topo, "snapld", "snapld", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
     FOR(snapdc_tile_cnt) fd_topob_tile( topo, "snapdc", "snapdc", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
     /* N symmetric snapin tiles: there is no snapwr tile, every snapin
        tile parses, inserts and writes its own share of the snapshot
@@ -661,7 +665,7 @@ fd_topo_initialize( config_t * config ) {
       /**/            fd_topob_tile_in (    topo, "snapct",  0UL,          "metric_in", "gossip_out",    0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     }
 
-                      fd_topob_tile_in (    topo, "snapct",  0UL,          "metric_in", "snapld_dc",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    FOR(snapld_tile_cnt) fd_topob_tile_in (    topo, "snapct",  0UL,          "metric_in", "snapld_dc",     i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
                       fd_topob_tile_out(    topo, "snapct",  0UL,                       "snapct_ld",     0UL                                                );
                       fd_topob_tile_out(    topo, "snapct",  0UL,                       "snapct_repr",   0UL                                                );
     if( FD_LIKELY( config->tiles.gui.enabled ) ) {
@@ -671,10 +675,12 @@ fd_topo_initialize( config_t * config ) {
 
     FOR(snapin_tile_cnt) fd_topob_tile_out(    topo, "snapin",  i,                       "snapin_ct",    i                                                   );
     FOR(snapin_tile_cnt) fd_topob_tile_in (    topo, "snapct",  0UL,          "metric_in", "snapin_ct",    i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    /**/              fd_topob_tile_in (    topo, "snapld",  0UL,          "metric_in", "snapct_ld",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    /**/              fd_topob_tile_out(    topo, "snapld",  0UL,                       "snapld_dc",     0UL                                                );
+    FOR(snapld_tile_cnt) fd_topob_tile_in (    topo, "snapld",  i,            "metric_in", "snapct_ld",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    FOR(snapld_tile_cnt) fd_topob_tile_out(    topo, "snapld",  i,                       "snapld_dc",     i                                                  );
 
-    FOR(snapdc_tile_cnt) fd_topob_tile_in (    topo, "snapdc",  i,            "metric_in", "snapld_dc",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    for( ulong t=0UL; t<snapdc_tile_cnt; t++ ) {
+      FOR(snapld_tile_cnt) fd_topob_tile_in(   topo, "snapdc",  t,            "metric_in", "snapld_dc",     i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    }
     FOR(snapdc_tile_cnt) fd_topob_tile_out(    topo, "snapdc",  i,                      "snapdc_in",     i                                                  );
 
     /* Every snapin tile is a full reliable consumer of every snapdc

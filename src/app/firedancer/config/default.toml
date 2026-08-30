@@ -975,6 +975,15 @@ telemetry = true
     # this parallelism supported by the accounts database.
     execrp_tile_count = 10
 
+    # How many snapshot reader tiles to run.  Each reader tile owns a
+    # round-robin slice of the compressed snapshot file (stripes of a
+    # few MiB, assigned stripe_idx % snapld_tile_count) and reads it
+    # with pread into its own link, so the read/copy work and the disk
+    # queue depth scale with the tile count.  The decompressor tiles
+    # reassemble the stripes in order, so the byte stream is unchanged.
+    # Only tile 0 is used when downloading over HTTP.
+    snapld_tile_count = 1
+
     # How many snapshot decompressor tiles to run.
     snapdc_tile_count = 1
 

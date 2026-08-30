@@ -13,6 +13,10 @@
 
 #define ZSTD_WINDOW_SZ (1UL<<25UL) /* 32MiB */
 
+/* Maximum number of snapld_dc reader lanes (== max snapld tile count,
+   see layout.snapld_tile_count). */
+#define FD_SNAPDC_LD_LANE_MAX (64UL)
+
 /* The snapdc tile is a state machine that decompresses the full and
    optionally incremental snapshot byte stream that it receives from the
    snapld tile.  In the event that the snapshot is already uncompressed,
@@ -31,13 +35,20 @@ struct fd_snapdc_tile {
   ZSTD_DCtx *     zstd;
   fd_zstd_frame_t zstd_frame[1];
 
+  /* Reader lanes.  Each snapld tile publishes the stripes of the
+     compressed file that it owns (stripe_idx%lane_cnt==lane) onto its
+     own lane, marking the last frag of each stripe with EOM.  The
+     stripes are consumed strictly round robin, which reassembles the
+     original byte stream exactly. */
   struct {
     fd_wksp_t * mem;
     ulong       chunk0;
     ulong       wmark;
     ulong       mtu;
-    ulong       frag_pos;
-  } in;
+  } in[ FD_SNAPDC_LD_LANE_MAX ];
+  ulong in_cnt;
+
+  ulong frag_pos; /* read position within the frag currently being processed */
 
   struct {
     fd_wksp_t * mem;
@@ -102,6 +113,7 @@ transition_malformed( fd_snapdc_tile_t *  ctx,
 static inline void
 handle_control_frag( fd_snapdc_tile_t *  ctx,
                      fd_stem_context_t * stem,
+                     ulong               in_idx,
                      ulong               sig,
                      ulong               chunk,
                      ulong               sz ) {
@@ -126,7 +138,7 @@ handle_control_frag( fd_snapdc_tile_t *  ctx,
        slot/hash for redirect-based downloads. */
     FD_TEST( sz<=ctx->out.mtu );
     void * dst = fd_chunk_to_laddr( ctx->out.mem, ctx->out.chunk );
-    fd_memcpy( dst, fd_chunk_to_laddr_const( ctx->in.mem, chunk ), sz );
+    fd_memcpy( dst, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sz );
     fd_stem_publish( stem, 0UL, sig, ctx->out.chunk, sz, 0UL, 0UL, 0UL );
     ctx->out.chunk = fd_dcache_compact_next( ctx->out.chunk, ctx->out.mtu, ctx->out.chunk0, ctx->out.wmark );
     return;
@@ -140,12 +152,12 @@ handle_control_frag( fd_snapdc_tile_t *  ctx,
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       FD_TEST( sz==sizeof(fd_ssctrl_init_t) );
-      fd_ssctrl_init_t const * msg = fd_chunk_to_laddr_const( ctx->in.mem, chunk );
+      fd_ssctrl_init_t const * msg = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
       ctx->is_zstd = !!msg->zstd;
       ctx->dirty       = 0;
       ctx->frame_idx   = 0UL;
-      ctx->in.frag_pos = 0UL;
+      ctx->frag_pos = 0UL;
       FD_TEST( fd_zstd_frame_new( ctx->zstd_frame ) );
       if( ctx->full ) {
         ctx->metrics.full.compressed_bytes_read      = 0UL;
@@ -230,11 +242,11 @@ skip_unowned_frame( fd_snapdc_tile_t *  ctx,
                     uchar const *       data,
                     ulong               sz ) {
   FD_TEST( ctx->frame_idx%ctx->tile_count!=ctx->tile_idx );
-  FD_TEST( ctx->dirty || ctx->in.frag_pos<sz );
+  FD_TEST( ctx->dirty || ctx->frag_pos<sz );
   ctx->dirty = 1;
 
   ulong skipped = 0UL;
-  int scan_result = fd_zstd_frame_advance( ctx->zstd_frame, data+ctx->in.frag_pos, sz-ctx->in.frag_pos, &skipped );
+  int scan_result = fd_zstd_frame_advance( ctx->zstd_frame, data+ctx->frag_pos, sz-ctx->frag_pos, &skipped );
   switch( scan_result ) {
     case FD_ZSTD_FRAME_ERR: {
       transition_malformed( ctx, stem );
@@ -243,20 +255,20 @@ skip_unowned_frame( fd_snapdc_tile_t *  ctx,
     case FD_ZSTD_FRAME_MORE: {
       /* Current frame spans until the end of the frag, so we can move
          onto the next frag. */
-      FD_TEST( skipped+ctx->in.frag_pos==sz );
-      ctx->in.frag_pos = 0UL;
+      FD_TEST( skipped+ctx->frag_pos==sz );
+      ctx->frag_pos = 0UL;
       return 0;
     }
     case FD_ZSTD_FRAME_END: {
       /* A frame ends within this frag.  If the frame end coincides with
          the frag end, wait for the next frag, otherwise reprocess
          the next frame in this frag. */
-      FD_TEST( skipped && skipped<=sz-ctx->in.frag_pos );
-      ctx->in.frag_pos += skipped;
+      FD_TEST( skipped && skipped<=sz-ctx->frag_pos );
+      ctx->frag_pos += skipped;
       finish_frame( ctx );
 
-      if( FD_UNLIKELY( ctx->in.frag_pos==sz ) ) {
-        ctx->in.frag_pos = 0UL;
+      if( FD_UNLIKELY( ctx->frag_pos==sz ) ) {
+        ctx->frag_pos = 0UL;
         return 0;
       }
       return 1;
@@ -273,11 +285,11 @@ process_owned_frame( fd_snapdc_tile_t *  ctx,
                      uchar const *       data,
                      ulong               sz ) {
   FD_TEST( ctx->frame_idx%ctx->tile_count==ctx->tile_idx );
-  FD_TEST( ctx->dirty || ctx->in.frag_pos<sz );
+  FD_TEST( ctx->dirty || ctx->frag_pos<sz );
   ctx->dirty = 1;
 
   uchar * out          = fd_chunk_to_laddr( ctx->out.mem, ctx->out.chunk );
-  ulong   in_sz        = sz-ctx->in.frag_pos;
+  ulong   in_sz        = sz-ctx->frag_pos;
   ulong   in_consumed  = 0UL;
   ulong   out_produced = 0UL;
   ulong frame_res = ZSTD_decompressStream_simpleArgs(
@@ -285,7 +297,7 @@ process_owned_frame( fd_snapdc_tile_t *  ctx,
       out,
       ctx->out.mtu,
       &out_produced,
-      data+ctx->in.frag_pos,
+      data+ctx->frag_pos,
       in_sz,
       &in_consumed );
   if( FD_UNLIKELY( ZSTD_isError( frame_res ) ) ) {
@@ -296,8 +308,8 @@ process_owned_frame( fd_snapdc_tile_t *  ctx,
     return 0;
   }
 
-  ctx->in.frag_pos += in_consumed;
-  FD_TEST( ctx->in.frag_pos<=sz );
+  ctx->frag_pos += in_consumed;
+  FD_TEST( ctx->frag_pos<=sz );
 
   if( FD_LIKELY( ctx->full ) ) {
     ctx->metrics.full.compressed_bytes_read      += in_consumed;
@@ -308,12 +320,12 @@ process_owned_frame( fd_snapdc_tile_t *  ctx,
   }
 
   if( FD_UNLIKELY( frame_res && !in_consumed && !out_produced ) ) {
-    if( FD_UNLIKELY( ctx->in.frag_pos<sz ) ) {
+    if( FD_UNLIKELY( ctx->frag_pos<sz ) ) {
       /* No progress with remaining input would retry forever */
       transition_malformed( ctx, stem );
     } else {
       /* No progress with exhausted input means zstd needs the next frag */
-      ctx->in.frag_pos = 0UL;
+      ctx->frag_pos = 0UL;
     }
     return 0;
   }
@@ -329,14 +341,15 @@ process_owned_frame( fd_snapdc_tile_t *  ctx,
   /* frame_res==0 means the frame ended exactly at the output boundary;
      re-polling then reports "new frame expected" and would mark the
      stream dirty at a clean EOF. */
-  int maybe_more_output = (out_produced==ctx->out.mtu && frame_res!=0UL) || ctx->in.frag_pos<sz;
-  if( FD_LIKELY( !maybe_more_output ) ) ctx->in.frag_pos = 0UL;
+  int maybe_more_output = (out_produced==ctx->out.mtu && frame_res!=0UL) || ctx->frag_pos<sz;
+  if( FD_LIKELY( !maybe_more_output ) ) ctx->frag_pos = 0UL;
   return maybe_more_output;
 }
 
 static inline int
 handle_data_frag( fd_snapdc_tile_t *  ctx,
                   fd_stem_context_t * stem,
+                  ulong               in_idx,
                   ulong               chunk,
                   ulong               sz ) {
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) {
@@ -349,15 +362,16 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
                  fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state ));
   }
 
-  FD_TEST( chunk>=ctx->in.chunk0 && chunk<=ctx->in.wmark && sz<=ctx->in.mtu && sz>=ctx->in.frag_pos );
-  uchar const * data = fd_chunk_to_laddr_const( ctx->in.mem, chunk );
+  FD_TEST( in_idx<ctx->in_cnt );
+  FD_TEST( chunk>=ctx->in[ in_idx ].chunk0 && chunk<=ctx->in[ in_idx ].wmark && sz<=ctx->in[ in_idx ].mtu && sz>=ctx->frag_pos );
+  uchar const * data = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
 
   if( FD_UNLIKELY( !ctx->is_zstd ) ) {
     if( FD_UNLIKELY( ctx->tile_idx!=0UL ) ) return 0;
-    FD_TEST( ctx->in.frag_pos<sz );
-    uchar const * in  = data+ctx->in.frag_pos;
+    FD_TEST( ctx->frag_pos<sz );
+    uchar const * in  = data+ctx->frag_pos;
     uchar *       out = fd_chunk_to_laddr( ctx->out.mem, ctx->out.chunk );
-    ulong cpy = fd_ulong_min( sz-ctx->in.frag_pos, ctx->out.mtu );
+    ulong cpy = fd_ulong_min( sz-ctx->frag_pos, ctx->out.mtu );
     fd_memcpy( out, in, cpy );
     fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out.chunk, cpy, 0UL, 0UL, 0UL );
     ctx->out.chunk = fd_dcache_compact_next( ctx->out.chunk, cpy, ctx->out.chunk0, ctx->out.wmark );
@@ -370,10 +384,10 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
       ctx->metrics.incremental.decompressed_bytes_written += cpy;
     }
 
-    ctx->in.frag_pos += cpy;
-    FD_TEST( ctx->in.frag_pos<=sz );
-    if( FD_UNLIKELY( ctx->in.frag_pos<sz ) ) return 1;
-    ctx->in.frag_pos = 0UL;
+    ctx->frag_pos += cpy;
+    FD_TEST( ctx->frag_pos<=sz );
+    if( FD_UNLIKELY( ctx->frag_pos<sz ) ) return 1;
+    ctx->frag_pos = 0UL;
     return 0;
   }
 
@@ -386,7 +400,7 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
 
 static inline int
 returnable_frag( fd_snapdc_tile_t *  ctx,
-                 ulong               in_idx FD_PARAM_UNUSED,
+                 ulong               in_idx,
                  ulong               seq    FD_PARAM_UNUSED,
                  ulong               sig,
                  ulong               chunk,
@@ -397,8 +411,8 @@ returnable_frag( fd_snapdc_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
 
-  if( FD_LIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_data_frag( ctx, stem, chunk, sz );
-  else                                                handle_control_frag( ctx, stem, sig, chunk, sz );
+  if( FD_LIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_data_frag( ctx, stem, in_idx, chunk, sz );
+  else                                                handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
 
   return 0;
 }
@@ -449,11 +463,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->dirty       = 0;
   ctx->frame_idx   = 0UL;
-  ctx->in.frag_pos = 0UL;
+  ctx->frag_pos = 0UL;
   FD_TEST( fd_zstd_frame_new( ctx->zstd_frame ) );
   fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
 
-  if( FD_UNLIKELY( tile->in_cnt !=1UL ) ) FD_LOG_ERR(( "tile `" NAME "` has %lu ins, expected 1",  tile->in_cnt  ));
+  if( FD_UNLIKELY( !tile->in_cnt || tile->in_cnt>FD_SNAPDC_LD_LANE_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` has %lu ins, expected [1,%lu]",  tile->in_cnt, FD_SNAPDC_LD_LANE_MAX ));
   if( FD_UNLIKELY( tile->out_cnt!=1UL ) ) FD_LOG_ERR(( "tile `" NAME "` has %lu outs, expected 1", tile->out_cnt ));
 
   fd_topo_link_t const * snapin_link = &topo->links[ tile->out_link_id[ 0UL ] ];
@@ -464,12 +478,16 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->out.chunk  = ctx->out.chunk0;
   ctx->out.mtu    = snapin_link->mtu;
 
-  fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ 0UL ] ];
-  fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
-  ctx->in.mem                    = in_wksp->wksp;
-  ctx->in.chunk0                 = fd_dcache_compact_chunk0( ctx->in.mem, in_link->dcache );
-  ctx->in.wmark                  = fd_dcache_compact_wmark( ctx->in.mem, in_link->dcache, in_link->mtu );
-  ctx->in.mtu                    = in_link->mtu;
+  ctx->in_cnt = tile->in_cnt;
+  for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
+    FD_TEST( 0==strcmp( in_link->name, "snapld_dc" ) );
+    fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
+    ctx->in[ i ].mem    = in_wksp->wksp;
+    ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].mem, in_link->dcache );
+    ctx->in[ i ].wmark  = fd_dcache_compact_wmark( ctx->in[ i ].mem, in_link->dcache, in_link->mtu );
+    ctx->in[ i ].mtu    = in_link->mtu;
+  }
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )

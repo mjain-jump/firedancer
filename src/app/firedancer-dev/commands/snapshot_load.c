@@ -150,10 +150,11 @@ snapshot_load_topo( config_t * config ) {
   fd_topo_tile_t * snapct_tile = fd_topob_tile( topo, "snapct", "snapct", "metric_in", ULONG_MAX, 0, 0, 0 );
   snapct_tile->allow_shutdown = 1;
 
-  /* load tile */
+  /* load tiles: each one preads a round-robin slice of the compressed
+     file into its own snapld_dc lane */
   fd_topob_wksp( topo, "snapld" );
-  fd_topo_tile_t * snapld_tile = fd_topob_tile( topo, "snapld", "snapld", "metric_in", ULONG_MAX, 0, 0, 0 );
-  snapld_tile->allow_shutdown = 1;
+  ulong snapld_tile_cnt = config->firedancer.layout.snapld_tile_count;
+  FOR(snapld_tile_cnt) fd_topob_tile( topo, "snapld", "snapld", "metric_in", ULONG_MAX, 0, 0, 0 )->allow_shutdown = 1;
 
   /* "snapdc": Zstandard decompress tile */
   fd_topob_wksp( topo, "snapdc" );
@@ -204,8 +205,13 @@ snapshot_load_topo( config_t * config ) {
      only ceil(W/512) concurrently-decompressing tiles.  The default 256
      frags (2.1 frames) starved snapld at ~2.3 GB/s compressed with all
      stages idle; 4096 frags (33.5 frames) saturates 8+ decompressors
-     (measured 51.6s -> 29.2s full load at N=16, knee at ~8 frames). */
-  fd_topob_link( topo, "snapld_dc",    "snapld_dc",    4096UL,                 FD_SNAPSHOT_DATA_MTU,           1UL );
+     (measured 51.6s -> 29.2s full load at N=16, knee at ~8 frames).
+     The runway requirement is on the *aggregate* window, and the
+     decompressors consume the snapld_dc lanes strictly in stripe order,
+     so with several reader tiles the 4096 frags are split across the
+     lanes. */
+  ulong snapld_dc_depth = fd_ulong_max( FD_SNAPSHOT_DATA_DEPTH, 4096UL/snapld_tile_cnt );
+  FOR(snapld_tile_cnt) fd_topob_link( topo, "snapld_dc", "snapld_dc", snapld_dc_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
   FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
   fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL )->permit_no_consumers = 1;
   fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
@@ -213,12 +219,14 @@ snapshot_load_topo( config_t * config ) {
   FOR(snapin_tile_cnt) fd_topob_link( topo, "snapin_ct", "snapin_ct", 128UL, 0UL, 1UL );
   FOR(snapin_tile_cnt) fd_topob_tile_in( topo, "snapct", 0UL, "metric_in", "snapin_ct", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
 
-  fd_topob_tile_in ( topo, "snapct",  0UL, "metric_in", "snapld_dc",    0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  FOR(snapld_tile_cnt) fd_topob_tile_in( topo, "snapct", 0UL, "metric_in", "snapld_dc", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "snapct",  0UL,              "snapct_ld",    0UL                                       );
   fd_topob_tile_out( topo, "snapct",  0UL,              "snapct_repr",  0UL                                       );
-  fd_topob_tile_in ( topo, "snapld",  0UL, "metric_in", "snapct_ld",    0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-  fd_topob_tile_out( topo, "snapld",  0UL,              "snapld_dc",    0UL                                       );
-  FOR(snapdc_tile_cnt) fd_topob_tile_in ( topo, "snapdc", i,   "metric_in", "snapld_dc", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+  FOR(snapld_tile_cnt) fd_topob_tile_in ( topo, "snapld", i, "metric_in", "snapct_ld", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+  FOR(snapld_tile_cnt) fd_topob_tile_out( topo, "snapld", i,              "snapld_dc", i                                       );
+  for( ulong t=0UL; t<snapdc_tile_cnt; t++ ) {
+    FOR(snapld_tile_cnt) fd_topob_tile_in( topo, "snapdc", t, "metric_in", "snapld_dc", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+  }
   FOR(snapdc_tile_cnt) fd_topob_tile_out( topo, "snapdc", i,               "snapdc_in", i                                         );
   /* Every snapin tile is a full reliable consumer of every snapdc
      lane: it walks the whole tar stream itself and parses only the

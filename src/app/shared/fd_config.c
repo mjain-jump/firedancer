@@ -467,16 +467,24 @@ fd_config_validatef( fd_configf_t const * config ) {
   CFG_HAS_NON_ZERO( layout.snapzp_tile_count );
   CFG_HAS_NON_ZERO( layout.snapsv_tile_count );
   CFG_HAS_NON_ZERO( layout.snapsv_io_worker_count );
+  /* Every snapdc tile is a reliable consumer of every snapld_dc lane,
+     and snapct consumes all of them too (in addition to gossip_out and
+     one ack link per snapin tile). */
+  if( FD_UNLIKELY( !config->layout.snapld_tile_count || config->layout.snapld_tile_count>64U ) ) {
+    FD_LOG_ERR(( "`layout.snapld_tile_count` must be in [1,64]" ));
+  }
   if( FD_UNLIKELY( !config->layout.snapdc_tile_count || config->layout.snapdc_tile_count>FD_SNAPIN_IO_LANE_MAX ) ) {
     FD_LOG_ERR(( "`layout.snapdc_tile_count` must be in [1,%lu] (each snapshot decompressor lane is tracked by every snapshot loader tile)", FD_SNAPIN_IO_LANE_MAX ));
   }
   /* snapct reads one snapin_ct ack link per snapin tile, plus gossip_out
-     and snapld_dc, and a tile may have at most
+     and one snapld_dc lane per snapld tile, and a tile may have at most
      FD_TOPO_MAX_TILE_IN_LINKS in-links. */
-  if( FD_UNLIKELY( !config->layout.snapin_tile_count || config->layout.snapin_tile_count>FD_TOPO_MAX_TILE_IN_LINKS-2UL ) ) {
+  ulong snapct_in_max = FD_TOPO_MAX_TILE_IN_LINKS - 1UL - (ulong)config->layout.snapld_tile_count;
+  if( FD_UNLIKELY( !config->layout.snapin_tile_count || config->layout.snapin_tile_count>snapct_in_max ) ) {
     FD_LOG_ERR(( "`layout.snapin_tile_count` must be in [1,%lu] (snapct reads one ack link per snapshot loader tile "
-                 "in addition to gossip_out and snapld_dc, and a tile is limited to FD_TOPO_MAX_TILE_IN_LINKS=%lu in-links)",
-                 FD_TOPO_MAX_TILE_IN_LINKS-2UL, FD_TOPO_MAX_TILE_IN_LINKS ));
+                 "in addition to gossip_out and one snapld_dc lane per snapshot reader tile, and a tile is limited "
+                 "to FD_TOPO_MAX_TILE_IN_LINKS=%lu in-links)",
+                 snapct_in_max, FD_TOPO_MAX_TILE_IN_LINKS ));
   }
   if( FD_UNLIKELY( config->layout.sign_tile_count < 2 ) ) {
     FD_LOG_ERR(( "layout.sign_tile_count must be >= 2" ));

@@ -126,6 +126,7 @@ main( int     argc,
   config->firedancer.layout.sign_tile_count          = 2U;
   config->firedancer.layout.resolv_tile_count        = 1U;
   config->firedancer.layout.execle_tile_count        = 1U;
+  config->firedancer.layout.snapld_tile_count        = 1U;
   config->firedancer.layout.snapdc_tile_count        = 1U;
   config->firedancer.layout.snapin_tile_count        = 4U;
   config->firedancer.layout.snapzp_tile_count        = 1U;

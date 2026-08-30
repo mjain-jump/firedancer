@@ -146,6 +146,11 @@ struct fd_snapct_tile {
   int           state;
   int           malformed;
   int           load_complete;
+  /* One LOAD_COMPLETE arrives per active snapld reader tile; the load
+     is only complete once every reader has published its last frag.
+     Only lane 0 is active on the HTTP path. */
+  ulong         snapld_lane_cnt;
+  ulong         ld_complete_cnt;
   long          deadline_nanos;
   int           flush_ack;
   int           flush_ack_cnt;
@@ -631,6 +636,7 @@ init_load( fd_snapct_tile_t *  ctx,
   ctx->out_ld.chunk = fd_dcache_compact_next( ctx->out_ld.chunk, sizeof(fd_ssctrl_init_t), ctx->out_ld.chunk0, ctx->out_ld.wmark );
   ctx->flush_ack = 0;
   ctx->load_complete = 0;
+  ctx->ld_complete_cnt = 0UL;
 
   if( !file ) snapshot_output_prepare( ctx, full );
 
@@ -1288,7 +1294,8 @@ after_credit( fd_snapct_tile_t *  ctx,
       }
       if( FD_UNLIKELY( ctx->flush_ack < ctx->flush_ack_cnt ) ) break;
       if( FD_UNLIKELY( ctx->load_complete ) ) {
-        ctx->load_complete = 0;
+        ctx->load_complete   = 0;
+        ctx->ld_complete_cnt = 0UL;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_FINI;
         ctx->flush_ack = 0;
@@ -1308,7 +1315,8 @@ after_credit( fd_snapct_tile_t *  ctx,
       }
       if( FD_UNLIKELY( ctx->flush_ack < ctx->flush_ack_cnt ) ) break;
       if( FD_UNLIKELY( ctx->load_complete ) ) {
-        ctx->load_complete = 0;
+        ctx->load_complete   = 0;
+        ctx->ld_complete_cnt = 0UL;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_FINI;
         ctx->flush_ack = 0;
@@ -1331,7 +1339,8 @@ after_credit( fd_snapct_tile_t *  ctx,
       }
       if( FD_UNLIKELY( ctx->flush_ack < ctx->flush_ack_cnt ) ) break;
       if( FD_UNLIKELY( ctx->load_complete ) ) {
-        ctx->load_complete = 0;
+        ctx->load_complete   = 0;
+        ctx->ld_complete_cnt = 0UL;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_FINI;
         ctx->flush_ack = 0;
@@ -1354,7 +1363,8 @@ after_credit( fd_snapct_tile_t *  ctx,
       }
       if( FD_UNLIKELY( ctx->flush_ack < ctx->flush_ack_cnt ) ) break;
       if( FD_UNLIKELY( ctx->load_complete ) ) {
-        ctx->load_complete = 0;
+        ctx->load_complete   = 0;
+        ctx->ld_complete_cnt = 0UL;
         fd_stem_publish( stem, ctx->out_ld.idx, FD_SNAPSHOT_MSG_CTRL_FINI, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->state = FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_HTTP_FINI;
         ctx->flush_ack = 0;
@@ -1708,11 +1718,12 @@ snapld_frag( fd_snapct_tile_t *  ctx,
   }
   if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_LOAD_COMPLETE ) ) {
     int full = 0;
+    int file = 0;
     switch( ctx->state ) {
-      case FD_SNAPCT_STATE_READING_FULL_FILE:
-      case FD_SNAPCT_STATE_READING_FULL_HTTP:        full = 1; break;
-      case FD_SNAPCT_STATE_READING_INCREMENTAL_FILE:
-      case FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP: full = 0; break;
+      case FD_SNAPCT_STATE_READING_FULL_FILE:        full = 1; file = 1; break;
+      case FD_SNAPCT_STATE_READING_FULL_HTTP:        full = 1; file = 0; break;
+      case FD_SNAPCT_STATE_READING_INCREMENTAL_FILE: full = 0; file = 1; break;
+      case FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP: full = 0; file = 0; break;
       case FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET:
       case FD_SNAPCT_STATE_FLUSHING_FULL_HTTP_RESET:
       case FD_SNAPCT_STATE_FLUSHING_INCREMENTAL_FILE_RESET:
@@ -1723,6 +1734,10 @@ snapld_frag( fd_snapct_tile_t *  ctx,
         return;
     }
     if( FD_UNLIKELY( ctx->malformed ) ) return;
+    ctx->ld_complete_cnt++;
+    ulong active_lane_cnt = file ? ctx->snapld_lane_cnt : 1UL;
+    FD_TEST( ctx->ld_complete_cnt<=active_lane_cnt );
+    if( FD_UNLIKELY( ctx->ld_complete_cnt<active_lane_cnt ) ) return;
     /* Validate that all expected bytes were received. */
     ulong bytes_read  = full ? ctx->metrics.full.bytes_read  : ctx->metrics.incremental.bytes_read;
     ulong bytes_total = full ? ctx->metrics.full.bytes_total : ctx->metrics.incremental.bytes_total;
@@ -2155,6 +2170,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->state          = FD_SNAPCT_STATE_INIT;
   ctx->malformed      = 0;
   ctx->load_complete  = 0;
+  ctx->ld_complete_cnt = 0UL;
   FD_CHECK_ERR( ctx->config.wait_for_peers_timeout_nanos>0L, "snapct wait_for_peers_timeout_nanos must be positive" );
   ctx->deadline_nanos = fd_log_wallclock() + ctx->config.wait_for_peers_timeout_nanos;
   ctx->flush_ack      = 0;
@@ -2165,7 +2181,8 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_memset( ctx->http_incr_snapshot_name, 0, PATH_MAX );
 
   ctx->gossip_in_mem = NULL;
-  int has_snapld_dc = 0, ack_cnt = 0;
+  ctx->snapld_in_mem = NULL;
+  int snapld_dc_cnt = 0, ack_cnt = 0;
   FD_TEST( tile->in_cnt<=MAX_IN_LINKS );
   for( ulong i=0UL; i<(tile->in_cnt); i++ ) {
     fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
@@ -2174,16 +2191,23 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->gossip_in_mem = topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ].wksp;
     } else if( 0==strcmp( in_link->name, "snapld_dc" ) ) {
       ctx->in_kind[ i ]  = IN_KIND_SNAPLD;
-      ctx->snapld_in_mem = topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ].wksp;
-      FD_TEST( !has_snapld_dc );
-      has_snapld_dc = 1;
+      /* Every snapld_dc lane lives in the same workspace, so one base
+         pointer covers all of them. */
+      fd_wksp_t * lane_mem = topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ].wksp;
+      FD_TEST( !ctx->snapld_in_mem || ctx->snapld_in_mem==lane_mem );
+      ctx->snapld_in_mem = lane_mem;
+      snapld_dc_cnt++;
     } else if( 0==strcmp( in_link->name, "snapin_ct" ) ) {
       ctx->in_kind[ i ] = IN_KIND_ACK;
       ack_cnt++;
     }
   }
-  FD_TEST( has_snapld_dc && ack_cnt>0 );
-  ctx->flush_ack_cnt = ack_cnt + 1; /* +1 for snapld (acks via snapld_dc) */
+  FD_TEST( snapld_dc_cnt>0 && ack_cnt>0 );
+  /* Only reader tile 0 forwards control messages, so there is exactly
+     one control ack from the snapld stage regardless of how many
+     reader tiles there are. */
+  ctx->flush_ack_cnt   = ack_cnt + 1; /* +1 for snapld (acks via snapld_dc lane 0) */
+  ctx->snapld_lane_cnt = (ulong)snapld_dc_cnt;
   FD_TEST( ctx->gossip_enabled==(ctx->gossip_in_mem!=NULL) );
 
   ctx->predicted_incremental.full_slot = FD_SSPEER_SLOT_UNKNOWN;
