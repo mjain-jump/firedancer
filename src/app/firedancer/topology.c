@@ -1484,6 +1484,10 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_memcpy( tile->snapld.snapshots_path, config->paths.snapshots, PATH_MAX );
     tile->snapld.incremental_snapshots             = config->firedancer.snapshots.incremental_snapshots;
     tile->snapld.min_download_speed_mibs           = config->firedancer.snapshots.min_download_speed_mibs;
+    /* No snapdc tiles == fused file-partitioned loading, in which the
+       snapin tiles pread the archive themselves and snapld is only the
+       control plane. */
+    tile->snapld.fused                             = fd_topo_find_tile( &config->topo, "snapdc", 0UL )==ULONG_MAX;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "snapdc" ) ) ) {
 
@@ -1495,6 +1499,8 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->snapin.banks_obj_id = fd_pod_query_ulong( config->topo.props, "banks", ULONG_MAX );
     tile->snapin.snoop_obj_id = fd_pod_query_ulong( config->topo.props, "snapio_snoop", ULONG_MAX );
     tile->snapin.alpenglow = config->firedancer.development.alpenglow;
+    fd_memcpy( tile->snapin.snapshots_path, config->paths.snapshots, PATH_MAX );
+    tile->snapin.incremental_snapshots = config->firedancer.snapshots.incremental_snapshots;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "repair" ) ) ) {
     /* rotor (alpenglow) reuses the repair tile config */
