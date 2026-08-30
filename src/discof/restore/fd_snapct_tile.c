@@ -612,6 +612,15 @@ init_load( fd_snapct_tile_t *  ctx,
   if( file ) out->file_sz = full ? ctx->local_in.full_snapshot_size : ctx->local_in.incremental_snapshot_size;
   else       out->file_sz = 0UL;
 
+  /* On the file path the size is already known here, so record it now
+     rather than waiting for the reader's META to come back: with
+     several reader tiles a data frag from one lane can be consumed
+     before the META that the lead reader publishes on its own lane. */
+  if( file ) {
+    if( full ) ctx->metrics.full.bytes_total        = out->file_sz;
+    else       ctx->metrics.incremental.bytes_total = out->file_sz;
+  }
+
   if( !file ) {
     out->addr = ctx->peer.addr;
     if( full ) {
