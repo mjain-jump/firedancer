@@ -604,14 +604,12 @@ returnable_frag( fd_snapld_tile_t *  ctx,
       if( ctx->load_file ) {
         ctx->stripe_idx = ctx->reader_idx;
         stripe_begin( ctx, ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd );
+      } else if( FD_UNLIKELY( !ctx->is_lead ) ) {
+        /* Only the lead reader downloads over HTTP; the other readers
+           have nothing to do for this attempt beyond keeping the
+           control plane in lockstep. */
+        ctx->state = FD_SNAPSHOT_STATE_FINISHING;
       } else {
-        if( FD_UNLIKELY( !ctx->is_lead ) ) {
-          /* Only the lead reader downloads over HTTP; the other readers
-             have nothing to do for this attempt. */
-          ctx->state = FD_SNAPSHOT_STATE_FINISHING;
-          forward_msg = 0;
-          break;
-        }
         if( FD_UNLIKELY( fd_sshttp_init( ctx->sshttp, msg_in->addr, msg_in->hostname, msg_in->is_https, msg_in->path, msg_in->path_len, 4UL, now ) ) ) {
           transition_malformed( ctx, stem );
           forward_msg = 0;
