@@ -13,8 +13,11 @@
 
 /* Maximum number of workspaces that may be present in a topology. */
 #define FD_TOPO_MAX_WKSPS         (256UL)
-/* Maximum number of links that may be present in a topology. */
-#define FD_TOPO_MAX_LINKS         (256UL)
+/* Maximum number of links that may be present in a topology.  The
+   routed snapshot intake needs snapdc_tile_cnt x snapin_tile_cnt links
+   (see fd_snapdc_tile.c), which is the largest link count any topology
+   asks for by a wide margin. */
+#define FD_TOPO_MAX_LINKS         (512UL)
 /* Maximum number of tiles that may be present in a topology. */
 #define FD_TOPO_MAX_TILES         (256UL)
 /* Maximum number of objects that may be present in a topology. */

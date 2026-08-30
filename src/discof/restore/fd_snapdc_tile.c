@@ -5,6 +5,10 @@
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../util/archive/fd_tar.h"
 
+#if FD_HAS_AVX512
+#include <x86intrin.h>
+#endif
+
 #include "generated/fd_snapdc_tile_seccomp.h"
 
 #define ZSTD_STATIC_LINKING_ONLY
@@ -198,6 +202,30 @@ route_reset_attempt( fd_snapdc_tile_t * ctx ) {
   ctx->have_carry = ctx->tile_idx==0UL;
 }
 
+/* Streaming copy into a routed dcache.  The destination line is always
+   cold (a ring 24 links x depth wide, and the consumer is another core),
+   so an ordinary store pays a read-for-ownership fetch of a line that is
+   about to be overwritten in full -- 50% wasted DRAM read traffic on the
+   single hottest thing this tile does (measured at 40% of snapdc's
+   cycles).  Non-temporal stores skip it.  fd_chunk_to_laddr is 64 byte
+   aligned so the destination is always aligned; the source is not. */
+
+static inline void
+route_copy( uchar *       dst,
+            uchar const * src,
+            ulong         sz ) {
+#if FD_HAS_AVX512
+  ulong i = 0UL;
+  for( ; i+64UL<=sz; i+=64UL ) {
+    _mm512_stream_si512( (void *)(dst+i), _mm512_loadu_si512( (void const *)(src+i) ) );
+  }
+  _mm_sfence();
+  if( FD_UNLIKELY( i<sz ) ) fd_memcpy( dst+i, src+i, sz-i );
+#else
+  fd_memcpy( dst, src, sz );
+#endif
+}
+
 /* Copies sz bytes into target's dcache and publishes them.  sz==0
    publishes the frame-end marker, which costs no dcache space. */
 
@@ -210,7 +238,7 @@ route_publish( fd_snapdc_tile_t *  ctx,
                int                 eom ) {
   fd_snapdc_out_t * o = &ctx->out[ target ];
   FD_TEST( target<ctx->target_cnt && sz<=o->mtu );
-  if( FD_LIKELY( sz ) ) fd_memcpy( fd_chunk_to_laddr( o->mem, o->chunk ), data, sz );
+  if( FD_LIKELY( sz ) ) route_copy( fd_chunk_to_laddr( o->mem, o->chunk ), data, sz );
   fd_stem_publish( stem, target, FD_SNAPSHOT_MSG_DATA, o->chunk, sz,
                    fd_frag_meta_ctl( 0UL, 0, eom, 0 ), 0UL, 0UL );
   if( FD_LIKELY( sz ) ) o->chunk = fd_dcache_compact_next( o->chunk, sz, o->chunk0, o->wmark );
@@ -404,7 +432,7 @@ route_emit_one( fd_snapdc_tile_t *  ctx,
 static void
 after_credit( fd_snapdc_tile_t *  ctx,
               fd_stem_context_t * stem,
-              int *               opt_poll_in FD_PARAM_UNUSED,
+              int *               opt_poll_in,
               int *               charge_busy ) {
   if( FD_LIKELY( !ctx->emit_pending ) ) return;
   if( FD_UNLIKELY( ctx->state!=FD_SNAPSHOT_STATE_PROCESSING ) ) {
@@ -419,6 +447,14 @@ after_credit( fd_snapdc_tile_t *  ctx,
   if( FD_UNLIKELY( !ctx->have_carry ) ) return;
 
   *charge_busy = 1;
+  /* Routing the staged bytes is bounded work that cannot be interrupted
+     (the staging buffer is single and the hand-off identifies the frame
+     in it), so there is no point polling an input we would only hold and
+     re-poll: that round trip is pure stem-loop overhead.  Inputs are
+     polled again as soon as the buffer drains -- and are still polled
+     while waiting for the hand-off above, which is what lets the
+     hand-off and the controls arrive. */
+  *opt_poll_in = 0;
 
   if( FD_UNLIKELY( !ctx->scanned ) ) {
     if( FD_UNLIKELY( !route_scan( ctx ) ) ) {
