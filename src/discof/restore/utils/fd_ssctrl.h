@@ -119,6 +119,37 @@
 /* snapld -> snapct (via snapld_dc) */
 #define FD_SNAPSHOT_MSG_LOAD_COMPLETE         (10UL) /* snapld finished reading/downloading all data */
 
+/* snapdc -> snapdc (via snapdc_cr), routing mode only */
+#define FD_SNAPSHOT_MSG_ROUTE_CARRY           (11UL) /* Fragment represents a fd_ssctrl_route_carry_t message */
+
+/* Parameters for the routed snapshot data links (snapdc_rt).  Each
+   snapin tile gets a private link per snapdc tile carrying only the tar
+   entries it owns, so the runway per link is 1/snapin_tile_cnt of the
+   stream.  512 frags is 32 MiB, one whole zstd frame and more than the
+   largest observed appendvec (30.1 MB), so a single huge entry routed
+   to one tile never has to be paced against the link depth. */
+#define FD_SNAPSHOT_ROUTE_DEPTH                (512UL)
+
+#define FD_SSCTRL_CARRY_EOF                    (1UL) /* the tar end-of-archive marker was already routed */
+#define FD_SSCTRL_CARRY_ABORT                  (2UL) /* upstream snapdc tile failed; do not wait for data */
+
+/* Walk state handed from the snapdc tile that owns zstd frame k-1 to
+   the tile that owns frame k.  Discovering tar entry boundaries is
+   inherently sequential in the decompressed stream, but it is also
+   cheap (one 512 byte header per ~3 MiB of payload), so the expensive
+   part -- decompression -- still runs fully in parallel and only the
+   walk is chained.  Every frame boundary is 512 byte aligned (Agave
+   emits fixed 32 MiB frames), so a tar header is never split across
+   frames and the whole hand-off is these five words. */
+typedef struct fd_ssctrl_route_carry {
+  ulong generation; /* attempt counter, so a retry discards the previous attempt's in-flight hand-offs */
+  ulong frame_idx;  /* the zstd frame this carry is INTO */
+  ulong run_left;   /* bytes of the straddling tar entry run still to come */
+  ulong run_target; /* snapin tile that owns that straddling run */
+  ulong av_ord;     /* stream ordinal of the next appendvec header */
+  ulong flags;      /* FD_SSCTRL_CARRY_* */
+} fd_ssctrl_route_carry_t;
+
 /* Sent by snapct to tell snapld whether to load a local file or
    download from a particular external peer. */
 typedef struct fd_ssctrl_init {
@@ -194,6 +225,7 @@ fd_ssctrl_msg_ctrl_str( ulong sig ) {
     case FD_SNAPSHOT_MSG_CTRL_ERROR:            return "error";
     case FD_SNAPSHOT_MSG_CTRL_FINI:             return "fini";
     case FD_SNAPSHOT_MSG_LOAD_COMPLETE:         return "load_complete";
+    case FD_SNAPSHOT_MSG_ROUTE_CARRY:           return "route_carry";
     default:                                    return "unknown";
   }
 }

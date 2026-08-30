@@ -123,11 +123,14 @@ test_env_new( ulong tile_idx,
   env->ctx->in.chunk0   = 0UL;
   env->ctx->in.wmark    = sizeof(env->in)>>FD_CHUNK_LG_SZ;
   env->ctx->in.mtu      = FD_SNAPSHOT_DATA_MTU;
-  env->ctx->out.mem     = (fd_wksp_t *)env->out;
-  env->ctx->out.chunk0  = 0UL;
-  env->ctx->out.wmark   = sizeof(env->out)>>FD_CHUNK_LG_SZ;
-  env->ctx->out.chunk   = 0UL;
-  env->ctx->out.mtu     = FD_SNAPSHOT_DATA_MTU;
+  env->ctx->out[0].mem     = (fd_wksp_t *)env->out;
+  env->ctx->out[0].chunk0  = 0UL;
+  env->ctx->out[0].wmark   = sizeof(env->out)>>FD_CHUNK_LG_SZ;
+  env->ctx->out[0].chunk   = 0UL;
+  env->ctx->out[0].mtu     = FD_SNAPSHOT_DATA_MTU;
+  /* Broadcast mode: one out link, no tar-entry routing. */
+  env->ctx->route       = 0;
+  env->ctx->target_cnt  = 1UL;
   FD_TEST( env->ctx->zstd );
   FD_TEST( tile_count && tile_count<=FD_TOPO_MAX_TILE_IN_LINKS );
   FD_TEST( tile_idx<tile_count );
@@ -379,7 +382,7 @@ test_exact_mtu_and_zero_input_drain( void ) {
   assert_output( 0UL, payload, FD_SNAPSHOT_DATA_MTU, 1 );
 
   capture_reset( env );
-  env->ctx->out.mtu = 64UL;
+  env->ctx->out[0].mtu = 64UL;
   test_decompress_script = 1;
   test_decompress_phase  = 0;
   uchar one_byte = 0U;
@@ -451,7 +454,7 @@ test_raw_tile_zero( void ) {
       test_env_t * env = test_env_new( tile_idx, tile_count );
       begin_load( env, 1, 0 );
       capture_reset( env );
-      env->ctx->out.mtu = 64UL;
+      env->ctx->out[0].mtu = 64UL;
       send_data( env, raw, sizeof(raw) );
       if( !tile_idx ) {
         FD_TEST( test_pub_cnt==5UL );
@@ -665,7 +668,7 @@ test_incremental_metrics( void ) {
   env = test_env_new( 0UL, 2UL );
   begin_load( env, 0, 0 );
   capture_reset( env );
-  env->ctx->out.mtu = 64UL;
+  env->ctx->out[0].mtu = 64UL;
   send_data( env, raw, sizeof(raw) );
   FD_TEST( env->ctx->metrics.incremental.compressed_bytes_read==sizeof(raw) );
   FD_TEST( env->ctx->metrics.incremental.decompressed_bytes_written==sizeof(raw) );
