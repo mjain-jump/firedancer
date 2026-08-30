@@ -119,16 +119,19 @@ test_env_new( ulong tile_idx,
   env->ctx->tile_idx    = tile_idx;
   env->ctx->tile_count  = tile_count;
   env->ctx->zstd        = ZSTD_createDCtx();
-  env->ctx->in.mem      = (fd_wksp_t *)env->in;
-  env->ctx->in.chunk0   = 0UL;
-  env->ctx->in.wmark    = sizeof(env->in)>>FD_CHUNK_LG_SZ;
-  env->ctx->in.mtu      = FD_SNAPSHOT_DATA_MTU;
+  env->ctx->in_cnt      = 1UL;
+  env->ctx->in[0].mem      = (fd_wksp_t *)env->in;
+  env->ctx->in[0].chunk0   = 0UL;
+  env->ctx->in[0].wmark    = sizeof(env->in)>>FD_CHUNK_LG_SZ;
+  env->ctx->in[0].mtu      = FD_SNAPSHOT_DATA_MTU;
   env->ctx->out.mem     = (fd_wksp_t *)env->out;
   env->ctx->out.chunk0  = 0UL;
   env->ctx->out.wmark   = sizeof(env->out)>>FD_CHUNK_LG_SZ;
   env->ctx->out.chunk   = 0UL;
   env->ctx->out.mtu     = FD_SNAPSHOT_DATA_MTU;
   FD_TEST( env->ctx->zstd );
+  clear_control_barrier( env->ctx );
+  reset_lane_rotation( env->ctx, 1UL );
   FD_TEST( tile_count && tile_count<=FD_TOPO_MAX_TILE_IN_LINKS );
   FD_TEST( tile_idx<tile_count );
 
@@ -157,7 +160,7 @@ static ulong
 send_data( test_env_t * env,
            void const * data,
            ulong        data_sz ) {
-  FD_TEST( data_sz<=env->ctx->in.mtu );
+  FD_TEST( data_sz<=env->ctx->in[0].mtu );
   if( data_sz ) fd_memcpy( env->in, data, data_sz );
   ulong call_cnt = 0UL;
   do {
@@ -549,7 +552,7 @@ test_retry_resets_frame_state( void ) {
   begin_load( env, 1, 1 );
   FD_TEST( !env->ctx->dirty );
   FD_TEST( !env->ctx->frame_idx );
-  FD_TEST( !env->ctx->in.frag_pos );
+  FD_TEST( !env->ctx->frag_pos );
   FD_TEST( !env->ctx->zstd_frame->header_sz );
   FD_TEST( !env->ctx->zstd_frame->block_header_sz );
   FD_TEST( !env->ctx->zstd_frame->bytes_remaining );

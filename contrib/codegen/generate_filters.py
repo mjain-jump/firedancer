@@ -52,6 +52,7 @@ SYSCALL_ARGS = {
     "futex":           ( "long",  "int",   "int", "long", "long",   "int"  ),
     "getdents64":      (  "int", "long",   "int",   None,   None,    None  ),
     "getsockopt":      (  "int",  "int",   "int", "long", "long",    None  ),
+    "fadvise64":       (  "int", "long",  "long",  "int",   None,    None  ),
     "ioctl":           (  "int",  "int",  "long",   None,   None,    None  ),
     "io_uring_enter":  (  "int",  "int",   "int",  "int", "long",   "int"  ),
     "io_uring_register": ("int",  "int",  "long",  "int",   None,    None  ),

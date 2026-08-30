@@ -2203,10 +2203,10 @@ unprivileged_init( fd_topo_t const *      topo,
     }
   }
   FD_TEST( snapld_dc_cnt>0 && ack_cnt>0 );
-  /* Only reader tile 0 forwards control messages, so there is exactly
-     one control ack from the snapld stage regardless of how many
-     reader tiles there are. */
-  ctx->flush_ack_cnt   = ack_cnt + 1; /* +1 for snapld (acks via snapld_dc lane 0) */
+  /* Every snapld reader tile forwards every control message on its own
+     lane, so each control message is acked once per reader tile plus
+     once per snapin tile. */
+  ctx->flush_ack_cnt   = ack_cnt + snapld_dc_cnt;
   ctx->snapld_lane_cnt = (ulong)snapld_dc_cnt;
   FD_TEST( ctx->gossip_enabled==(ctx->gossip_in_mem!=NULL) );
 

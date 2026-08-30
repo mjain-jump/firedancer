@@ -24,11 +24,21 @@ read: (or (eq (arg 0) in_full_fd)
           (eq (arg 0) in_incr_fd)
           (eq (arg 0) sockfd))
 
-# snapshot: Uses lseek to reset position in input file
-lseek: (and (or (eq (arg 0) in_full_fd)
-                (eq (arg 0) in_incr_fd))
-            (eq (arg 1) 0)
-            (eq (arg 2) "SEEK_SET"))
+# snapshot: the local file path reads its stripes of the snapshot with
+# pread, so several reader tiles can share the file without a shared
+# file position.
+#
+# arg 0 is the file descriptor that we want to read from
+pread64: (or (eq (arg 0) in_full_fd)
+             (eq (arg 0) in_incr_fd))
+
+# snapshot: each reader hints its next stripe to the kernel with
+# POSIX_FADV_WILLNEED so the device sees a queue depth of one request
+# per reader tile.
+#
+# arg 0 is the file descriptor that we want to prefetch from
+fadvise64: (or (eq (arg 0) in_full_fd)
+               (eq (arg 0) in_incr_fd))
 
 # snapshot: establish connections for snapshot download.
 socket: (and (eq (arg 0) "AF_INET")

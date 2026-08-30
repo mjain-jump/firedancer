@@ -530,8 +530,8 @@ snapshot_load_cmd_fn( args_t *   args,
   fd_topo_fill( topo );
 
   fd_topo_tile_t * snapct_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapct", 0UL ) ];
-  fd_topo_tile_t * snapld_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapld", 0UL ) ];
   fd_topo_tile_t * snapin_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", 0UL ) ];
+  ulong snapld_tile_cnt = config->firedancer.layout.snapld_tile_count;
   ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
 
@@ -542,7 +542,11 @@ snapshot_load_cmd_fn( args_t *   args,
   fd_topo_run_single_process( topo, 2, config->uid, config->gid, fdctl_tile_run );
 
   ulong volatile * const snapct_metrics = fd_metrics_tile( snapct_tile->metrics );
-  ulong volatile * const snapld_metrics = fd_metrics_tile( snapld_tile->metrics );
+  ulong volatile *       snapld_all_metrics[ FD_TOPO_MAX_TILE_IN_LINKS ];
+  for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+    fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapld", i ) ];
+    snapld_all_metrics[ i ] = fd_metrics_tile( tile->metrics );
+  }
   ulong volatile * const snapin_metrics = fd_metrics_tile( snapin_tile->metrics );
   ulong volatile *       snapin_all_metrics[ FD_TOPO_MAX_TILE_IN_LINKS ];
   for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
@@ -557,7 +561,7 @@ snapshot_load_cmd_fn( args_t *   args,
 
   ulong total_off_old    = 0UL;
   ulong decomp_off_old   = 0UL;
-  ulong snapld_wait_old  = 0UL;
+  ulong snapld_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
   ulong snapdc_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
   ulong snapin_wait_old[ FD_TOPO_MAX_TILE_IN_LINKS ] = {0};
   ulong acc_cnt_old      = 0UL;
@@ -581,7 +585,10 @@ snapshot_load_cmd_fn( args_t *   args,
   long next = start+1000L*1000L*1000L;
   for(;;) {
     ulong snapct_status = FD_VOLATILE_CONST( snapct_metrics[ MIDX( GAUGE, TILE, STATUS ) ] );
-    ulong snapld_status = FD_VOLATILE_CONST( snapld_metrics[ MIDX( GAUGE, TILE, STATUS ) ] );
+    ulong snapld_status = 2UL;
+    for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+      if( FD_VOLATILE_CONST( snapld_all_metrics[ i ][ MIDX( GAUGE, TILE, STATUS ) ] )!=2UL ) snapld_status = 1UL;
+    }
     int snapin_shutdown = 1;
     for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
       snapin_shutdown &= FD_VOLATILE_CONST( snapin_all_metrics[ i ][ MIDX( GAUGE, TILE, STATUS ) ] )==2UL;
@@ -611,8 +618,11 @@ snapshot_load_cmd_fn( args_t *   args,
                        + snapdc_metrics[ i ][ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
     }
     /* Waiting on either neighbor counts as not busy */
-    ulong snapld_wait  = snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
-                       + snapld_metrics[ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
+    ulong snapld_wait[ FD_TOPO_MAX_TILE_IN_LINKS ];
+    for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+      snapld_wait[ i ] = snapld_all_metrics[ i ][ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) ]
+                       + snapld_all_metrics[ i ][ MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_BACKPRESSURE_PREFRAG ) ];
+    }
     ulong snapin_wait[ FD_TOPO_MAX_TILE_IN_LINKS ];
     ulong acc_cnt     = 0UL;
     for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
@@ -667,8 +677,16 @@ snapshot_load_cmd_fn( args_t *   args,
       }
       snapin_busy_avg /= (double)snapin_tile_cnt;
 
+      double snapld_busy[ FD_TOPO_MAX_TILE_IN_LINKS ];
+      double snapld_busy_avg = 0.0;
+      for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+        snapld_busy[ i ] = clamp_pct( 100.0-( ( (double)( snapld_wait[ i ]-snapld_wait_old[ i ] )*ns_per_tick )/1e7 ) );
+        snapld_busy_avg += snapld_busy[ i ];
+      }
+      snapld_busy_avg /= (double)snapld_tile_cnt;
+
       double busy[ 3 ] = {
-        clamp_pct( 100.0-( ( (double)( snapld_wait-snapld_wait_old )*ns_per_tick )/1e7 ) ),
+        snapld_busy_avg,
         snapdc_busy_avg,
         snapin_busy_avg,
       };
@@ -685,12 +703,19 @@ snapshot_load_cmd_fn( args_t *   args,
               c_dim, c_norm, (double)( decomp_off-decomp_off_old )/1e9, c_dim, c_norm,
               c_dim, c_norm, (double)fd_ulong_sat_sub( acc_cnt, acc_cnt_old )/1e6, c_dim, c_norm );
 
-      static char const * tile_key[ 3 ] = { "ld", "dc(avg)", "in(avg)" };
+      static char const * tile_key[ 3 ] = { "ld(avg)", "dc(avg)", "in(avg)" };
       printf( "  %sbusy%s", c_dim, c_norm );
       for( ulong i=0UL; i<3UL; i++ ) {
         printf( " %s%s%s %s%3.0f%s%%%s",
                 c_dim, tile_key[ i ], c_norm,
                 sev_color( color, busy[ i ] ), busy[ i ], c_dim, c_norm );
+      }
+      if( snapld_tile_cnt>1UL ) {
+        for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+          printf( " %sld%lu%s %s%3.0f%s%%%s",
+                  c_dim, i, c_norm,
+                  sev_color( color, snapld_busy[ i ] ), snapld_busy[ i ], c_dim, c_norm );
+        }
       }
       for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
         printf( " %sdc%lu%s %s%3.0f%s%%%s",
@@ -707,7 +732,9 @@ snapshot_load_cmd_fn( args_t *   args,
     }
     total_off_old    = total_off;
     decomp_off_old   = decomp_off;
-    snapld_wait_old  = snapld_wait;
+    for( ulong i=0UL; i<snapld_tile_cnt; i++ ) {
+      snapld_wait_old[ i ] = snapld_wait[ i ];
+    }
     for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
       snapdc_wait_old[ i ] = snapdc_wait[ i ];
     }

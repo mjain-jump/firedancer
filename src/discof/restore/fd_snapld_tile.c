@@ -26,7 +26,34 @@
 
 /* The snapld tile is responsible for loading data from the local file
    or from an HTTP/TCP connection and sending it to the snapdc tile
-   for later decompression. */
+   for later decompression.
+
+   Several snapld tiles may run in parallel on the local file path (see
+   layout.snapld_tile_count).  The compressed file is cut into fixed
+   size stripes and reader tile r owns the stripes with
+   stripe_idx%reader_cnt==r, which it preads into its own snapld_dc
+   lane.  The last frag of every stripe carries the EOM bit, and the
+   snapdc tiles consume the lanes strictly round robin, switching lane
+   on EOM -- so the byte stream the decompressors see is bit for bit
+   the sequential file, while the read/copy work and the disk queue
+   depth scale with the tile count.  A single reader tile is a single
+   sequential pread stream, i.e. equivalent to the old read() loop.
+
+   Reader tile 0 is the lead: it owns the control plane (it is the only
+   one that forwards control messages downstream and the only one that
+   publishes META), and it is the only active reader when the snapshot
+   is being downloaded over HTTP.  Every active reader publishes
+   LOAD_COMPLETE when it runs out of stripes; that doubles as the
+   end-of-lane marker for snapdc and as the completion count for
+   snapct. */
+
+/* Bytes per stripe, as a count of link frags.  Big enough that each
+   reader stays sequential across ~16 MiB (so kernel readahead and the
+   one-stripe-ahead POSIX_FADV_WILLNEED hint have time to work), small
+   enough that the readers stay within reader_cnt stripes of each other
+   (snapdc consumes the stripes in order, so a lane has to be buffered
+   until its turn comes). */
+#define FD_SNAPLD_STRIPE_FRAGS (256UL)
 
 typedef struct fd_snapld_tile {
 
@@ -42,6 +69,17 @@ typedef struct fd_snapld_tile {
   int   is_redirect;
   ulong gossip_slot;
   ulong file_sz;
+
+  /* Striped reader state, local file path only. */
+  int   is_lead;    /* reader 0 owns the control plane */
+  ulong reader_idx;
+  ulong reader_cnt;
+  ulong stripe_sz;
+  ulong stripe_idx; /* index of the stripe currently being read */
+  ulong read_off;   /* next byte offset to pread from the file */
+  ulong stripe_end; /* end offset of the current stripe */
+  ulong bytes_read; /* bytes this reader has published this attempt */
+  long  read_start_nanos;
 
   ulong  bytes_in_batch;
   double download_speed_mibs;
@@ -202,6 +240,17 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->state            = FD_SNAPSHOT_STATE_IDLE;
 
+  ctx->reader_idx = tile->kind_id;
+  ctx->reader_cnt = fd_topo_tile_name_cnt( topo, NAME );
+  FD_TEST( ctx->reader_cnt && ctx->reader_idx<ctx->reader_cnt );
+  ctx->is_lead    = ctx->reader_idx==0UL;
+
+  ctx->stripe_idx       = 0UL;
+  ctx->read_off         = 0UL;
+  ctx->stripe_end       = 0UL;
+  ctx->bytes_read       = 0UL;
+  ctx->read_start_nanos = 0L;
+
   ctx->download_speed_mibs = 0.0;
   ctx->bytes_in_batch      = 0UL;
   ctx->start_batch         = 0L;
@@ -223,6 +272,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->out_dc.wmark  = fd_dcache_compact_wmark ( ctx->out_dc.mem, out_link->dcache, out_link->mtu );
   ctx->out_dc.chunk  = ctx->out_dc.chunk0;
   ctx->out_dc.mtu    = out_link->mtu;
+  ctx->stripe_sz     = FD_SNAPLD_STRIPE_FRAGS*ctx->out_dc.mtu;
 
   FD_TEST( sizeof(fd_ssctrl_meta_t)<=ctx->out_dc.mtu );
 
@@ -286,6 +336,28 @@ check_download_progress( fd_snapld_tile_t *  ctx,
   return 0;
 }
 
+/* Positions the reader at the start of stripe ctx->stripe_idx, or
+   marks it exhausted (read_off==stripe_end) if that stripe is past the
+   end of the file.  Also hints the reader's next stripe to the kernel,
+   which is what gives the device a queue depth of reader_cnt. */
+static void
+stripe_begin( fd_snapld_tile_t * ctx,
+              int                fd ) {
+  ulong start = ctx->stripe_idx*ctx->stripe_sz;
+  if( FD_UNLIKELY( start>=ctx->file_sz ) ) {
+    ctx->read_off   = ctx->file_sz;
+    ctx->stripe_end = ctx->file_sz;
+    return;
+  }
+  ctx->read_off   = start;
+  ctx->stripe_end = fd_ulong_min( start+ctx->stripe_sz, ctx->file_sz );
+
+  ulong ra_off = (ctx->stripe_idx+ctx->reader_cnt)*ctx->stripe_sz;
+  if( FD_LIKELY( ra_off<ctx->file_sz ) ) {
+    posix_fadvise( fd, (long)ra_off, (long)fd_ulong_min( ctx->stripe_sz, ctx->file_sz-ra_off ), POSIX_FADV_WILLNEED );
+  }
+}
+
 static void
 after_credit( fd_snapld_tile_t *  ctx,
               fd_stem_context_t * stem,
@@ -299,35 +371,60 @@ after_credit( fd_snapld_tile_t *  ctx,
   uchar * out = fd_chunk_to_laddr( ctx->out_dc.mem, ctx->out_dc.chunk );
 
   if( ctx->load_file ) {
+    int fd = ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd;
+
     if( FD_UNLIKELY( !ctx->sent_meta ) ) {
-      FD_TEST( sizeof(fd_ssctrl_meta_t)<=ctx->out_dc.mtu );
-      fd_ssctrl_meta_t * meta = (fd_ssctrl_meta_t *)out;
-      meta->total_sz         = ctx->file_sz;
-      meta->resolved_slot    = ULONG_MAX;
-      fd_memset( meta->resolved_hash, 0, FD_HASH_FOOTPRINT );
-      meta->resolved_name[0] = '\0';
       ctx->sent_meta = 1;
-      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_META, ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), 0UL, 0UL, 0UL );
-      ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), ctx->out_dc.chunk0, ctx->out_dc.wmark );
+      if( FD_LIKELY( ctx->is_lead ) ) {
+        FD_TEST( sizeof(fd_ssctrl_meta_t)<=ctx->out_dc.mtu );
+        fd_ssctrl_meta_t * meta = (fd_ssctrl_meta_t *)out;
+        meta->total_sz         = ctx->file_sz;
+        meta->resolved_slot    = ULONG_MAX;
+        fd_memset( meta->resolved_hash, 0, FD_HASH_FOOTPRINT );
+        meta->resolved_name[0] = '\0';
+        fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_META, ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), 0UL, 0UL, 0UL );
+        ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, sizeof(fd_ssctrl_meta_t), ctx->out_dc.chunk0, ctx->out_dc.wmark );
+        return;
+      }
+    }
+
+    if( FD_UNLIKELY( ctx->read_off>=ctx->stripe_end ) ) {
+      /* No stripes of the file left for this reader. */
+      double elapsed = (double)fd_long_max( fd_log_wallclock()-ctx->read_start_nanos, 1L )/1e9;
+      FD_LOG_NOTICE(( "snapld %lu/%lu: finished reading %s snapshot from local file, %lu bytes in %.3f s (%.2f GB/s)",
+                      ctx->reader_idx, ctx->reader_cnt, ctx->load_full ? "full" : "incremental",
+                      ctx->bytes_read, elapsed, (double)ctx->bytes_read/elapsed/1e9 ));
+      ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, 0UL, 0UL, 0UL );
       return;
     }
-    long result = read( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, out, ctx->out_dc.mtu );
+
+    ulong req    = fd_ulong_min( ctx->out_dc.mtu, ctx->stripe_end-ctx->read_off );
+    long  result = pread( fd, out, req, (long)ctx->read_off );
     if( FD_UNLIKELY( result<=0L ) ) {
-      if( result==0L ) {
-        FD_LOG_INFO(( "finished reading %s snapshot from local file", ctx->load_full ? "full" : "incremental" ));
-        ctx->state = FD_SNAPSHOT_STATE_FINISHING;
-        fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, 0UL, 0UL, 0UL );
-      } else if( FD_UNLIKELY( errno!=EAGAIN && errno!=EINTR ) ) {
-        FD_LOG_WARNING(( "read() failed on %s snapshot file (%i-%s)", ctx->load_full ? "full" : "incremental", errno, fd_io_strerror( errno ) ));
+      if( FD_UNLIKELY( result==0L ) ) {
+        FD_LOG_WARNING(( "unexpected end of %s snapshot file at offset %lu of %lu",
+                         ctx->load_full ? "full" : "incremental", ctx->read_off, ctx->file_sz ));
         transition_malformed( ctx, stem );
-        return; /* verbose return */
+      } else if( FD_UNLIKELY( errno!=EAGAIN && errno!=EINTR ) ) {
+        FD_LOG_WARNING(( "pread() failed on %s snapshot file (%i-%s)", ctx->load_full ? "full" : "incremental", errno, fd_io_strerror( errno ) ));
+        transition_malformed( ctx, stem );
       }
-    } else {
-      fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, (ulong)result, 0UL, 0UL, 0UL );
-      ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, (ulong)result, ctx->out_dc.chunk0, ctx->out_dc.wmark );
-      *charge_busy = 1;
       return; /* verbose return */
     }
+
+    ctx->read_off   += (ulong)result;
+    ctx->bytes_read += (ulong)result;
+    int   eom     = ctx->read_off==ctx->stripe_end;
+    ulong out_ctl = fd_frag_meta_ctl( 0UL, 0, eom, 0 );
+    fd_stem_publish( stem, 0UL, FD_SNAPSHOT_MSG_DATA, ctx->out_dc.chunk, (ulong)result, out_ctl, 0UL, 0UL );
+    ctx->out_dc.chunk = fd_dcache_compact_next( ctx->out_dc.chunk, (ulong)result, ctx->out_dc.chunk0, ctx->out_dc.wmark );
+    if( FD_UNLIKELY( eom ) ) {
+      ctx->stripe_idx += ctx->reader_cnt;
+      stripe_begin( ctx, fd );
+    }
+    *charge_busy = 1;
+    return; /* verbose return */
   } else {
     int   downloading = 0;
     ulong data_len    = ctx->out_dc.mtu;
@@ -499,20 +596,32 @@ returnable_frag( fd_snapld_tile_t *  ctx,
       ctx->is_redirect = msg_in->is_redirect;
       ctx->file_sz     = msg_in->file_sz;
 
-      ctx->window_deadline = LONG_MAX;
-      ctx->bytes_in_window = 0UL;
-      long now = fd_log_wallclock();
+      ctx->window_deadline  = LONG_MAX;
+      ctx->bytes_in_window  = 0UL;
+      ctx->bytes_read       = 0UL;
+      ctx->read_start_nanos = fd_log_wallclock();
+      long now = ctx->read_start_nanos;
       if( ctx->load_file ) {
-        if( FD_UNLIKELY( 0!=lseek( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, 0, SEEK_SET ) ) )
-          FD_LOG_ERR(( "lseek(0) failed on %s snapshot file (%i-%s)",
-                       ctx->load_full ? "full" : "incremental", errno, fd_io_strerror( errno ) ));
+        ctx->stripe_idx = ctx->reader_idx;
+        stripe_begin( ctx, ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd );
       } else {
+        if( FD_UNLIKELY( !ctx->is_lead ) ) {
+          /* Only the lead reader downloads over HTTP; the other readers
+             have nothing to do for this attempt. */
+          ctx->state = FD_SNAPSHOT_STATE_FINISHING;
+          forward_msg = 0;
+          break;
+        }
         if( FD_UNLIKELY( fd_sshttp_init( ctx->sshttp, msg_in->addr, msg_in->hostname, msg_in->is_https, msg_in->path, msg_in->path_len, 4UL, now ) ) ) {
           transition_malformed( ctx, stem );
           forward_msg = 0;
           break;
         }
       }
+      /* Every reader forwards every control message: the downstream
+         tiles barrier control messages across the lanes, which is what
+         guarantees that all data published before a control message has
+         been consumed before the control message takes effect. */
       fd_ssctrl_init_t * msg_out = fd_chunk_to_laddr( ctx->out_dc.mem, ctx->out_dc.chunk );
       fd_memcpy( msg_out, msg_in, sz );
       fd_stem_publish( stem, 0UL, sig, ctx->out_dc.chunk, sz, 0UL, 0UL, 0UL );
@@ -561,7 +670,9 @@ returnable_frag( fd_snapld_tile_t *  ctx,
     }
   }
 
-  /* Forward the control message down the pipeline */
+  /* Forward the control message down the pipeline.  Every reader
+     forwards on its own lane; snapdc barriers them and snapct counts
+     one ack per reader. */
   if( FD_LIKELY( forward_msg ) ) {
     fd_stem_publish( stem, 0UL, sig, 0UL, 0UL, 0UL, 0UL, 0UL );
   }

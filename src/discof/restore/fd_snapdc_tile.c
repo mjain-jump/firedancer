@@ -50,6 +50,19 @@ struct fd_snapdc_tile {
 
   ulong frag_pos; /* read position within the frag currently being processed */
 
+  /* Stripe rotation over the reader lanes.  lane_cnt is in_cnt on the
+     local file path and 1 on the HTTP path (only reader 0 downloads). */
+  ulong lane_cnt;
+  ulong lane;                                  /* lane the next stripe comes from */
+  uchar lane_done[ FD_SNAPDC_LD_LANE_MAX ];    /* reader has published LOAD_COMPLETE */
+
+  /* Control messages are barriered across all in_cnt lanes: every
+     reader forwards every control message, so a control frag at the
+     head of every lane means all data published before it has been
+     consumed. */
+  ulong pending_control;
+  uchar control_seen[ FD_SNAPDC_LD_LANE_MAX ];
+
   struct {
     fd_wksp_t * mem;
     ulong       chunk0;
@@ -111,6 +124,30 @@ transition_malformed( fd_snapdc_tile_t *  ctx,
 }
 
 static inline void
+clear_control_barrier( fd_snapdc_tile_t * ctx ) {
+  ctx->pending_control = ULONG_MAX;
+  fd_memset( ctx->control_seen, 0, sizeof(ctx->control_seen) );
+}
+
+static inline void
+reset_lane_rotation( fd_snapdc_tile_t * ctx,
+                     ulong              lane_cnt ) {
+  ctx->lane_cnt = lane_cnt;
+  ctx->lane     = 0UL;
+  fd_memset( ctx->lane_done, 0, sizeof(ctx->lane_done) );
+}
+
+/* Rotates to the next lane that still has stripes coming. */
+static inline void
+lane_next( fd_snapdc_tile_t * ctx ) {
+  for( ulong i=0UL; i<ctx->lane_cnt; i++ ) {
+    ctx->lane = (ctx->lane+1UL)%ctx->lane_cnt;
+    if( FD_LIKELY( !ctx->lane_done[ ctx->lane ] ) ) return;
+  }
+  /* Every reader is done; no more data frags will arrive. */
+}
+
+static inline void
 handle_control_frag( fd_snapdc_tile_t *  ctx,
                      fd_stem_context_t * stem,
                      ulong               in_idx,
@@ -158,6 +195,7 @@ handle_control_frag( fd_snapdc_tile_t *  ctx,
       ctx->dirty       = 0;
       ctx->frame_idx   = 0UL;
       ctx->frag_pos = 0UL;
+      reset_lane_rotation( ctx, msg->file ? ctx->in_cnt : 1UL );
       FD_TEST( fd_zstd_frame_new( ctx->zstd_frame ) );
       if( ctx->full ) {
         ctx->metrics.full.compressed_bytes_read      = 0UL;
@@ -203,6 +241,7 @@ handle_control_frag( fd_snapdc_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_FAIL: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
       ctx->state = FD_SNAPSHOT_STATE_IDLE;
+      reset_lane_rotation( ctx, ctx->in_cnt );
       break;
     }
 
@@ -362,7 +401,7 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
                  fd_ssctrl_state_str( (ulong)ctx->state ), (ulong)ctx->state ));
   }
 
-  FD_TEST( in_idx<ctx->in_cnt );
+  FD_TEST( in_idx<ctx->in_cnt && !ctx->lane_done[ in_idx ] );
   FD_TEST( chunk>=ctx->in[ in_idx ].chunk0 && chunk<=ctx->in[ in_idx ].wmark && sz<=ctx->in[ in_idx ].mtu && sz>=ctx->frag_pos );
   uchar const * data = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
 
@@ -399,21 +438,105 @@ handle_data_frag( fd_snapdc_tile_t *  ctx,
 }
 
 static inline int
+all_controls_seen( fd_snapdc_tile_t const * ctx ) {
+  int all_seen = 1;
+  for( ulong i=0UL; i<ctx->in_cnt; i++ ) all_seen &= !!ctx->control_seen[ i ];
+  return all_seen;
+}
+
+static inline int
+before_frag( fd_snapdc_tile_t * ctx,
+             ulong              in_idx,
+             ulong              seq    FD_PARAM_UNUSED,
+             ulong              sig ) {
+  /* A single reader tile is a single ordered stream, so none of the
+     lane bookkeeping below applies. */
+  if( FD_LIKELY( ctx->in_cnt==1UL ) ) return 0;
+
+  /* In ERROR state the stream is abandoned: drop everything in flight
+     until the FAIL that resets the pipeline. */
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_ERROR ) ) return sig!=FD_SNAPSHOT_MSG_CTRL_FAIL;
+
+  /* An error can be raised by any reader at any point and must not
+     wait for the other lanes. */
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_ERROR ) ) return 0;
+
+  /* Once this lane has delivered the pending control message, hold its
+     later frags until every lane has delivered the same one. */
+  if( FD_UNLIKELY( ctx->pending_control!=ULONG_MAX && ctx->control_seen[ in_idx ] ) ) return -1;
+
+  /* Stripes (and the end-of-lane markers that terminate them) are
+     consumed strictly round robin, which is what makes the
+     concatenation of the lanes the original compressed byte stream. */
+  if( FD_LIKELY( sig==FD_SNAPSHOT_MSG_DATA || sig==FD_SNAPSHOT_MSG_LOAD_COMPLETE ) ) {
+    if( FD_UNLIKELY( in_idx!=ctx->lane ) ) return -1;
+  }
+
+  return 0;
+}
+
+static inline void
+handle_control_barrier( fd_snapdc_tile_t *  ctx,
+                        fd_stem_context_t * stem,
+                        ulong               in_idx,
+                        ulong               sig,
+                        ulong               chunk,
+                        ulong               sz ) {
+  /* META is published by the lead reader only, and an error must be
+     acted on immediately; neither is barriered.  before_frag holds
+     both behind an in-flight barrier. */
+  if( FD_UNLIKELY( ctx->in_cnt==1UL ||
+                   sig==FD_SNAPSHOT_MSG_CTRL_ERROR ||
+                   sig==FD_SNAPSHOT_MSG_META ) ) {
+    handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
+    return;
+  }
+
+  if( FD_UNLIKELY( sig!=ctx->pending_control ) ) {
+    FD_TEST( ctx->pending_control==ULONG_MAX || sig==FD_SNAPSHOT_MSG_CTRL_FAIL );
+    clear_control_barrier( ctx );
+    ctx->pending_control = sig;
+  }
+
+  FD_TEST( !ctx->control_seen[ in_idx ] );
+  ctx->control_seen[ in_idx ] = 1U;
+  if( FD_LIKELY( !all_controls_seen( ctx ) ) ) return;
+
+  clear_control_barrier( ctx );
+  handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
+}
+
+static inline int
 returnable_frag( fd_snapdc_tile_t *  ctx,
                  ulong               in_idx,
                  ulong               seq    FD_PARAM_UNUSED,
                  ulong               sig,
                  ulong               chunk,
                  ulong               sz,
-                 ulong               ctl    FD_PARAM_UNUSED,
+                 ulong               ctl,
                  ulong               tsorig FD_PARAM_UNUSED,
                  ulong               tspub  FD_PARAM_UNUSED,
                  fd_stem_context_t * stem ) {
   FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
 
-  if( FD_LIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) return handle_data_frag( ctx, stem, in_idx, chunk, sz );
-  else                                                handle_control_frag( ctx, stem, in_idx, sig, chunk, sz );
+  if( FD_LIKELY( sig==FD_SNAPSHOT_MSG_DATA ) ) {
+    if( FD_UNLIKELY( handle_data_frag( ctx, stem, in_idx, chunk, sz ) ) ) return 1;
+    /* The reader marks the last frag of each of its stripes, which is
+       where the decompressor moves on to the next lane. */
+    if( FD_UNLIKELY( fd_frag_meta_ctl_eom( ctl ) ) ) lane_next( ctx );
+    return 0;
+  }
 
+  if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_LOAD_COMPLETE ) ) {
+    /* This reader has published its last stripe; drop its lane from the
+       rotation. */
+    FD_TEST( in_idx<ctx->lane_cnt );
+    ctx->lane_done[ in_idx ] = 1U;
+    lane_next( ctx );
+    return 0;
+  }
+
+  handle_control_barrier( ctx, stem, in_idx, sig, chunk, sz );
   return 0;
 }
 
@@ -488,6 +611,8 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].wmark  = fd_dcache_compact_wmark( ctx->in[ i ].mem, in_link->dcache, in_link->mtu );
     ctx->in[ i ].mtu    = in_link->mtu;
   }
+  clear_control_barrier( ctx );
+  reset_lane_rotation( ctx, ctx->in_cnt );
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
   if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )
@@ -506,6 +631,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
 #define STEM_CALLBACK_SHOULD_SHUTDOWN should_shutdown
 #define STEM_CALLBACK_METRICS_WRITE   metrics_write
+#define STEM_CALLBACK_BEFORE_FRAG     before_frag
 #define STEM_CALLBACK_RETURNABLE_FRAG returnable_frag
 
 #include "../../disco/stem/fd_stem.c"

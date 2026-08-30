@@ -276,6 +276,7 @@ static void
 test_load_complete_signal( void ) {
   fd_snapct_tile_t ctx[1];
   memset( ctx, 0, sizeof(fd_snapct_tile_t) );
+  ctx->snapld_lane_cnt = 1UL;
 
   /* snapld_frag never dereferences stem in the paths below. */
 
@@ -285,7 +286,8 @@ test_load_complete_signal( void ) {
   ctx->metrics.full.bytes_total = 1000UL;
   snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
   FD_TEST( ctx->load_complete==1 );
-  ctx->load_complete = 0;
+  ctx->load_complete   = 0;
+  ctx->ld_complete_cnt = 0UL;
 
   /* READING_INCREMENTAL_HTTP with matching bytes sets load_complete */
   ctx->state                           = FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP;
@@ -293,7 +295,32 @@ test_load_complete_signal( void ) {
   ctx->metrics.incremental.bytes_total = 500UL;
   snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
   FD_TEST( ctx->load_complete==1 );
-  ctx->load_complete = 0;
+  ctx->load_complete   = 0;
+  ctx->ld_complete_cnt = 0UL;
+
+  /* A load is only complete once every reader tile reports in. */
+  ctx->snapld_lane_cnt          = 3UL;
+  ctx->state                    = FD_SNAPCT_STATE_READING_FULL_FILE;
+  ctx->metrics.full.bytes_read  = 1000UL;
+  ctx->metrics.full.bytes_total = 1000UL;
+  snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
+  FD_TEST( ctx->load_complete==0 );
+  snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
+  FD_TEST( ctx->load_complete==0 );
+  snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
+  FD_TEST( ctx->load_complete==1 );
+  ctx->load_complete   = 0;
+  ctx->ld_complete_cnt = 0UL;
+
+  /* Only reader 0 is active on the HTTP path. */
+  ctx->state                           = FD_SNAPCT_STATE_READING_INCREMENTAL_HTTP;
+  ctx->metrics.incremental.bytes_read  = 500UL;
+  ctx->metrics.incremental.bytes_total = 500UL;
+  snapld_frag( ctx, FD_SNAPSHOT_MSG_LOAD_COMPLETE, 0UL, 0UL, NULL );
+  FD_TEST( ctx->load_complete==1 );
+  ctx->load_complete   = 0;
+  ctx->ld_complete_cnt = 0UL;
+  ctx->snapld_lane_cnt = 1UL;
 
   /* Ignored during reset states */
   ctx->state = FD_SNAPCT_STATE_FLUSHING_FULL_FILE_RESET;
