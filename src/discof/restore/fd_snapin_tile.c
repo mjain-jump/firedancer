@@ -1514,6 +1514,7 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
   ulong sz  = ctx->write_buf_used;
   ulong off = ctx->flush_off;
   long  t0  = fd_tickcount();
+  long  m0  = (long)ctx->t_map; /* worker_store's mmap/madvise time is booked to t_map, not t_write */
   if( FD_LIKELY( ctx->write_mode!=FD_SNAPIN_WRITE_MODE_PWRITE ) ) {
     worker_store( ctx, off, ctx->write_buf, sz );
     ctx->bytes_written += sz;
@@ -1529,7 +1530,7 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
       ctx->bytes_written += (ulong)res;
     }
   }
-  ctx->t_write        += (ulong)( fd_tickcount() - t0 );
+  ctx->t_write        += (ulong)( fd_tickcount() - t0 - ( (long)ctx->t_map - m0 ) );
   ctx->flush_off      += sz;
   ctx->write_buf_used  = 0UL;
 
@@ -1547,8 +1548,9 @@ worker_buffer_write( fd_snapin_tile_t * ctx,
        rather than a syscall.  Timed at the same granularity as the
        other modes' flush so the FINI breakdown stays comparable. */
     long t0 = fd_tickcount();
+    long m0 = (long)ctx->t_map;
     worker_store( ctx, file_off, data, sz );
-    ctx->t_write       += (ulong)( fd_tickcount() - t0 );
+    ctx->t_write       += (ulong)( fd_tickcount() - t0 - ( (long)ctx->t_map - m0 ) );
     ctx->bytes_written += sz;
     return;
   }
