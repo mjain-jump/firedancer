@@ -182,9 +182,40 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_tile( topo, "diag", "diag", "metric_in", ULONG_MAX, 0, 0, 0 );
   fd_topo_tile_t * accdb_tile = fd_topob_tile( topo, "accdb", "accdb", "metric_in", ULONG_MAX, 0, 0, 0 );
 
+  /* Route the account payloads instead of broadcasting them: snapdc
+     parses the tar entry boundaries inside its own frames and publishes
+     each entry only on the private link of the snapin tile that owns it
+     (see the fd_snapdc_tile.c header).  A snapin tile then receives
+     ~1/snapin_tile_cnt of the frags instead of all of them, which is the
+     only lever available -- fd_frag_meta_t's sz field is 16 bits, so
+     frags cannot be made bigger.
+
+     Costs snapdc_tile_cnt x snapin_tile_cnt links, so it is gated on
+     fitting inside FD_TOPO_MAX_LINKS and FD_TOPO_MAX_TILE_OUT_LINKS
+     (snapdc needs one out per snapin tile plus the walk hand-off). */
+  int route = ( snapdc_tile_cnt*snapin_tile_cnt + 64UL <= FD_TOPO_MAX_LINKS ) &&
+              ( snapin_tile_cnt + 1UL <= FD_TOPO_MAX_TILE_OUT_LINKS );
+  {
+    char const * e = getenv( "FD_BENCH_ROUTE" );
+    if( e ) route = !!strtoul( e, NULL, 0 );
+  }
+  if( FD_UNLIKELY( route && ( snapdc_tile_cnt*snapin_tile_cnt + 64UL > FD_TOPO_MAX_LINKS ||
+                              snapin_tile_cnt + 1UL > FD_TOPO_MAX_TILE_OUT_LINKS ) ) ) {
+    FD_LOG_ERR(( "routed snapshot intake needs %lu links and %lu snapdc outs, over the %lu / %lu topology limits",
+                 snapdc_tile_cnt*snapin_tile_cnt, snapin_tile_cnt+1UL,
+                 (ulong)FD_TOPO_MAX_LINKS, (ulong)FD_TOPO_MAX_TILE_OUT_LINKS ));
+  }
+  FD_LOG_NOTICE(( "snapshot intake: %s (snapdc=%lu snapin=%lu)",
+                  route ? "routed per-appendvec" : "broadcast", snapdc_tile_cnt, snapin_tile_cnt ));
+
   fd_topob_wksp( topo, "snapct_ld"    );
   fd_topob_wksp( topo, "snapld_dc"    );
-  fd_topob_wksp( topo, "snapdc_in"    );
+  if( FD_LIKELY( route ) ) {
+    /**/                            fd_topob_wksp( topo, "snapdc_rt" );
+    if( snapdc_tile_cnt>1UL )       fd_topob_wksp( topo, "snapdc_cr" );
+  } else {
+    /**/                            fd_topob_wksp( topo, "snapdc_in" );
+  }
 
   fd_topob_wksp( topo, "snapin_manif" );
   fd_topob_wksp( topo, "snapct_repr"  );
@@ -197,6 +228,20 @@ snapshot_load_topo( config_t * config ) {
      keep going through one tile's write stall instead of convoying
      behind it.  1024 frags is ~64 MiB per lane. */
   ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
+  ulong snapdc_in_mtu   = FD_SNAPSHOT_DATA_MTU;
+  ulong snapld_dc_depth = 4096UL;
+  ulong snapld_dc_mtu   = FD_SNAPSHOT_DATA_MTU;
+  {
+    /* LOCAL bench knobs for the data-stream frag runway.  Note the frag
+       SIZE is not tunable: fd_frag_meta_t stores sz in 16 bits, so
+       FD_SNAPSHOT_DATA_MTU (65408) is already at the architectural
+       ceiling and per-frag overhead can only be amortized by sending a
+       tile fewer frags, not bigger ones. */
+    char const * e;
+    if( (e=getenv( "FD_BENCH_LDDC_DEPTH" )) ) snapld_dc_depth = strtoul( e, NULL, 0 );
+    if( (e=getenv( "FD_BENCH_DCIN_DEPTH" )) ) snapdc_in_depth = strtoul( e, NULL, 0 );
+    FD_TEST( fd_ulong_is_pow2( snapld_dc_depth ) && fd_ulong_is_pow2( snapdc_in_depth ) );
+  }
 
   fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
   /* snapld_dc must hold several WHOLE zstd frames of runway: snapdc
@@ -205,8 +250,23 @@ snapshot_load_topo( config_t * config ) {
      frags (2.1 frames) starved snapld at ~2.3 GB/s compressed with all
      stages idle; 4096 frags (33.5 frames) saturates 8+ decompressors
      (measured 51.6s -> 29.2s full load at N=16, knee at ~8 frames). */
-  fd_topob_link( topo, "snapld_dc",    "snapld_dc",    4096UL,                 FD_SNAPSHOT_DATA_MTU,           1UL );
-  FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
+  fd_topob_link( topo, "snapld_dc",    "snapld_dc",    snapld_dc_depth,        snapld_dc_mtu,                  1UL );
+  if( FD_LIKELY( route ) ) {
+    /* snapdc i -> snapin t is link kind_id i*snapin_tile_cnt+t, so
+       snapin t's in_idx is the producing snapdc tile index and the
+       expected-frame lane rotation is unchanged. */
+    for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
+      for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
+        fd_topob_link( topo, "snapdc_rt", "snapdc_rt", FD_SNAPSHOT_ROUTE_DEPTH, snapdc_in_mtu, 1UL );
+      }
+    }
+    /* Walk hand-off ring, snapdc i -> snapdc (i+1)%snapdc_tile_cnt. */
+    if( FD_LIKELY( snapdc_tile_cnt>1UL ) ) {
+      FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_cr", "snapdc_cr", 512UL, sizeof(fd_ssctrl_route_carry_t), 1UL );
+    }
+  } else {
+    FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, snapdc_in_mtu, 1UL );
+  }
   fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL )->permit_no_consumers = 1;
   fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
 
@@ -219,13 +279,37 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_tile_in ( topo, "snapld",  0UL, "metric_in", "snapct_ld",    0UL, FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "snapld",  0UL,              "snapld_dc",    0UL                                       );
   FOR(snapdc_tile_cnt) fd_topob_tile_in ( topo, "snapdc", i,   "metric_in", "snapld_dc", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-  FOR(snapdc_tile_cnt) fd_topob_tile_out( topo, "snapdc", i,               "snapdc_in", i                                         );
-  /* Every snapin tile is a full reliable consumer of every snapdc
-     lane: it walks the whole tar stream itself and parses only the
-     appendvecs it owns. */
-  for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
-    FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
-    fd_topob_tile_out( topo, "snapin", t, "snapin_ct", t );
+  if( FD_LIKELY( route ) ) {
+    for( ulong i=0UL; i<snapdc_tile_cnt; i++ ) {
+      /* Walk hand-off in before the routed outs so in_idx 0 stays the
+         data stream, and out order is [ targets..., hand-off ]. */
+      if( FD_LIKELY( snapdc_tile_cnt>1UL ) ) {
+        fd_topob_tile_in( topo, "snapdc", i, "metric_in", "snapdc_cr", (i+snapdc_tile_cnt-1UL)%snapdc_tile_cnt, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+      }
+      for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
+        fd_topob_tile_out( topo, "snapdc", i, "snapdc_rt", i*snapin_tile_cnt+t );
+      }
+      if( FD_LIKELY( snapdc_tile_cnt>1UL ) ) fd_topob_tile_out( topo, "snapdc", i, "snapdc_cr", i );
+    }
+    /* Each snapin tile consumes one private link per snapdc tile,
+       carrying only the tar entries it owns.  in_idx == the producing
+       snapdc tile index, so the expected-frame lane rotation (which
+       reassembles entries that straddle a frame boundary) is unchanged;
+       every frame ends with a zero-length EOM frag on each link so the
+       rotation advances even through frames that held nothing. */
+    for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
+      FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_rt", i*snapin_tile_cnt+t, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+      fd_topob_tile_out( topo, "snapin", t, "snapin_ct", t );
+    }
+  } else {
+    FOR(snapdc_tile_cnt) fd_topob_tile_out( topo, "snapdc", i,               "snapdc_in", i                                         );
+    /* Every snapin tile is a full reliable consumer of every snapdc
+       lane: it walks the whole tar stream itself and parses only the
+       appendvecs it owns. */
+    for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
+      FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+      fd_topob_tile_out( topo, "snapin", t, "snapin_ct", t );
+    }
   }
   fd_topob_tile_out( topo, "snapin",  0UL,              "snapin_manif", 0UL                                       );
 

@@ -210,6 +210,7 @@ struct fd_snapin_tile {
   uint full           : 1;  /* loading a full snapshot? */
   uint init_completed : 1;  /* tile 0: did INIT complete for this attempt? */
   uint gate_pending   : 1;  /* waiting for this attempt's slot before admitting data? */
+  uint route          : 1;  /* routed intake: this tile only receives the entries it owns */
 
   ulong tile_idx;           /* == tile->kind_id */
   ulong tile_cnt;
@@ -433,6 +434,7 @@ struct fd_snapin_tile {
     ulong accounts_loaded;
     ulong accounts_replaced;
     ulong accounts_ignored;
+    ulong appendvecs_processed;
   } totals_fold;
 
   /* Tile 0: rollback of a failed attempt, deferred from the FAIL
@@ -1414,6 +1416,11 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   fd_ssparse_init( ctx->ssparse );
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
   fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, 1 );
+  /* Routed intake: this tile is fed only the tar entries it owns, so a
+     non-lead tile never sees the version / manifest / status cache
+     entries that the parser otherwise insists on before any appendvec
+     and again at end of archive. */
+  if( FD_UNLIKELY( ctx->route && !is_lead( ctx ) ) ) fd_ssparse_prologue_seen( ctx->ssparse );
   /* claimed_appendvec is deliberately NOT reset here: a fresh claim is
      drawn for every attempt when the attempt-slot gate opens, so there
      is no unclaimed sentinel to restore.
@@ -1726,14 +1733,19 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
           if( FD_UNLIKELY( body_sz>(256UL<<20) ) ) ctx->av_stats.over_256m_bytes += body_sz;
           ctx->av_stats.log2_hist[ fd_ulong_min( (ulong)fd_ulong_find_msb( fd_ulong_max( body_sz, 1UL ) ), 47UL ) ]++;
         }
-        if( FD_UNLIKELY( av_idx==ctx->claimed_appendvec ) ) {
+        /* Routed intake: snapdc already addressed this appendvec to us
+           (appendvec_ordinal % snapin_tile_cnt), so every appendvec that
+           reaches this tile is ours and there is nothing to claim.  The
+           dynamic claim only had meaning while every tile walked the
+           whole stream. */
+        if( FD_LIKELY( ctx->route ? 1 : av_idx==ctx->claimed_appendvec ) ) {
           /* Claim the next appendvec before parsing this one: the counter is
              already past av_idx (it handed av_idx to us), so a fresh claim can
              never land behind our walk position.  The tar format streams the
              whole manifest before any appendvec, so tile 0 reaches this point
              only after its manifest parse -- other tiles absorb the early
              appendvecs without any special case. */
-          ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->snoop_hdr->next_appendvec, 1UL );
+          if( FD_UNLIKELY( !ctx->route ) ) ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->snoop_hdr->next_appendvec, 1UL );
           ctx->owned_appendvecs++;
           fd_ssparse_appendvec_parse( ctx->ssparse );
           ctx->owned_bytes += result->appendvec.data_sz;
@@ -1981,11 +1993,20 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
 
   fd_snapio_totals_t const * totals = &ctx->snoop_hdr->totals;
 
-  /* Eager claim: every appendvec in the stream was claimed by exactly
-     one tile, and every tile ends the attempt holding exactly one
-     unmatched claim. */
-  FD_TEST( totals->appendvecs_processed==ctx->appendvec_seq );
-  FD_TEST( ctx->snoop_hdr->next_appendvec==ctx->appendvec_seq+ctx->snoop_hdr->worker_cnt );
+  if( FD_LIKELY( ctx->route ) ) {
+    /* Routed intake: ownership is static, so the invariant is that the
+       tiles between them processed every appendvec in the stream exactly
+       once.  There is no cross-tile counter to compare against here
+       (snapdc owns the stream ordinal), so this is reported rather than
+       asserted -- see the appendvecs= line at DONE. */
+    ctx->totals_fold.appendvecs_processed = totals->appendvecs_processed;
+  } else {
+    /* Eager claim: every appendvec in the stream was claimed by exactly
+       one tile, and every tile ends the attempt holding exactly one
+       unmatched claim. */
+    FD_TEST( totals->appendvecs_processed==ctx->appendvec_seq );
+    FD_TEST( ctx->snoop_hdr->next_appendvec==ctx->appendvec_seq+ctx->snoop_hdr->worker_cnt );
+  }
 
   /* Cross-tile account totals, for the end-of-load log and nothing
      else.  totals is re-zeroed at every INIT and this runs only on a
@@ -2554,8 +2575,9 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       fd_feature_snoop_finalize( &ctx->bank->f.features, ctx->bank_slot, &ctx->epoch_schedule, ctx->feature_snoop );
 
-      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu (lamports-diff=%lu), worker bytes written=%lu "
+      FD_LOG_NOTICE(( "parallel loader: intake=%s appendvecs processed=%lu, equal-slot cross-appendvec dups=%lu (lamports-diff=%lu), worker bytes written=%lu "
                       "(logical=%lu, fd_zle ratio=%.3fx, saved=%lu)",
+                      ctx->route ? "routed" : "broadcast", ctx->totals_fold.appendvecs_processed,
                       ctx->worker_fold.eq_slot_dups, ctx->worker_fold.eq_slot_lamports_diff,
                       ctx->worker_fold.bytes_written, ctx->worker_fold.bytes_written_logical,
                       ctx->worker_fold.bytes_written ? (double)ctx->worker_fold.bytes_written_logical/(double)ctx->worker_fold.bytes_written : 0.0,
@@ -2970,16 +2992,32 @@ unprivileged_init( fd_topo_t const *      topo,
     fd_slot_delta_parser_init( ctx->slot_delta_parser );
   }
 
+  ctx->route = !strcmp( topo->links[ tile->in_link_id[ 0UL ] ].name, "snapdc_rt" );
   for( ulong i=0UL; i<ctx->lane_cnt; i++ ) {
     fd_topo_link_t const * in_link = &topo->links[ tile->in_link_id[ i ] ];
-    FD_TEST( 0==strcmp( in_link->name, "snapdc_in" ) );
-    FD_TEST( in_link->kind_id==i );
+    if( FD_LIKELY( ctx->route ) ) {
+      /* One private link per (snapdc tile, this tile); in_idx is the
+         producing snapdc tile index, which is what the expected-frame
+         lane rotation indexes by. */
+      FD_TEST( 0==strcmp( in_link->name, "snapdc_rt" ) );
+      FD_TEST( in_link->kind_id==i*ctx->tile_cnt+ctx->tile_idx );
+    } else {
+      FD_TEST( 0==strcmp( in_link->name, "snapdc_in" ) );
+      FD_TEST( in_link->kind_id==i );
+    }
     fd_topo_wksp_t const * in_wksp = &topo->workspaces[ topo->objs[ in_link->dcache_obj_id ].wksp_id ];
     ctx->in[ i ].wksp   = in_wksp->wksp;
     ctx->in[ i ].chunk0 = fd_dcache_compact_chunk0( ctx->in[ i ].wksp, in_link->dcache );
     ctx->in[ i ].wmark  = fd_dcache_compact_wmark( ctx->in[ i ].wksp, in_link->dcache, in_link->mtu );
     ctx->in[ i ].mtu    = in_link->mtu;
     ctx->in[ i ].pos    = 0UL;
+    /* zbuf holds a whole ACCOUNT_BATCH's compressed payloads, and the
+       parser only batches accounts that fit entirely inside one input
+       frag, so the batch's uncompressed total is bounded by the link
+       mtu (see the FD_SNAPIN_ZBUF_SZ comment). */
+    if( FD_UNLIKELY( in_link->mtu+FD_SSPARSE_ACC_BATCH_MAX*FD_ZLE_OVERHEAD > FD_SNAPIN_ZBUF_SZ ) ) {
+      FD_LOG_ERR(( "snapshot data link mtu %lu too large for the %lu byte zle scratch", in_link->mtu, (ulong)FD_SNAPIN_ZBUF_SZ ));
+    }
   }
   if( FD_UNLIKELY( !ctx->lane_cnt || ctx->lane_cnt>FD_SNAPIN_IO_LANE_MAX ) ) {
     FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu snapshot data lanes, expected 1..%lu", ctx->tile_idx, ctx->lane_cnt, FD_SNAPIN_IO_LANE_MAX ));
