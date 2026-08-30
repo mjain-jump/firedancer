@@ -56,6 +56,20 @@ typedef struct fd_ssparse fd_ssparse_t;
    batch. */
 #define FD_SSPARSE_ACC_BATCH_MAX (8UL)
 
+/* FD_SSPARSE_ACC_BATCH_BYTES_MAX bounds the TOTAL account body bytes a
+   batch may span (the first account of a batch is always admitted, so a
+   single account larger than this becomes a batch of one).
+
+   Callers size a scratch buffer from this: fd_snapin_tile compresses
+   every body of a batch up front, because a record cannot be placed
+   until its compressed length is known, so it needs
+   BATCH_BYTES_MAX + ACC_BATCH_MAX*FD_ZLE_OVERHEAD of scratch.  Before
+   file-partitioned loading the bound came for free from the data link
+   MTU (64 KiB), because the parser only ever saw one link frag at a
+   time; a fused tile feeds it a whole 32 MiB zstd frame instead, where
+   eight maximum-size accounts (80 MiB) can land in one batch. */
+#define FD_SSPARSE_ACC_BATCH_BYTES_MAX (4UL<<20)
+
 struct fd_ssparse_advance_result {
   ulong bytes_consumed;
 
@@ -121,6 +135,41 @@ FD_PROTOTYPES_BEGIN
 
 fd_ssparse_t *
 fd_ssparse_init( fd_ssparse_t * ssparse );
+
+/* fd_ssparse_init_midstream initializes the parser to start at an
+   arbitrary tar entry boundary `stream_off` inside the decompressed
+   snapshot stream, for file-partitioned parallel loading where each
+   worker owns a byte range of the archive rather than the whole thing.
+
+   The version, manifest and status cache are declared already seen: a
+   mid-stream worker never observes them (they live at the very front of
+   the stream, entirely inside worker 0's range), and the sequential
+   parser otherwise hard-fails on an `accounts/` entry before the
+   manifest, and on end-of-archive before all three.
+
+   stream_off must be 512 byte aligned: all tar padding arithmetic is
+   relative to it. */
+
+fd_ssparse_t *
+fd_ssparse_init_midstream( fd_ssparse_t * ssparse,
+                           ulong          stream_off );
+
+/* fd_ssparse_stream_off returns the parser's position in the
+   decompressed stream: bytes consumed since init, plus the mid-stream
+   seed offset. */
+
+FD_FN_PURE ulong
+fd_ssparse_stream_off( fd_ssparse_t const * ssparse );
+
+/* fd_ssparse_at_entry_boundary returns 1 if the parser sits exactly at
+   the first byte of a tar entry header, with none of it consumed yet.
+   fd_ssparse_stream_off is then that entry's header offset.  This is
+   the only position at which a file-partitioned worker may stop: the
+   entry it would read next belongs to the worker that owns the range
+   the header falls in. */
+
+FD_FN_PURE int
+fd_ssparse_at_entry_boundary( fd_ssparse_t const * ssparse );
 
 /* fd_ssparse_advance parses a snapshot stream chunk.
 

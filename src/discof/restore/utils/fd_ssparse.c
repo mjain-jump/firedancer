@@ -26,6 +26,29 @@ fd_ssparse_init( fd_ssparse_t * ssparse ) {
   return ssparse;
 }
 
+fd_ssparse_t *
+fd_ssparse_init_midstream( fd_ssparse_t * ssparse,
+                           ulong          stream_off ) {
+  FD_TEST( !(stream_off & 511UL) );
+  memset( ssparse, 0, sizeof(fd_ssparse_t) );
+  ssparse->state                    = FD_SSPARSE_STATE_TAR_HEADER;
+  ssparse->bytes_consumed           = stream_off;
+  ssparse->flags.seen_version       = 1;
+  ssparse->flags.seen_manifest      = 1;
+  ssparse->flags.seen_status_cache  = 1;
+  return ssparse;
+}
+
+FD_FN_PURE ulong
+fd_ssparse_stream_off( fd_ssparse_t const * ssparse ) {
+  return ssparse->bytes_consumed;
+}
+
+FD_FN_PURE int
+fd_ssparse_at_entry_boundary( fd_ssparse_t const * ssparse ) {
+  return ssparse->state==FD_SSPARSE_STATE_TAR_HEADER && !ssparse->tar.header_bytes_consumed;
+}
+
 static int
 parse_tar_header_name( char const * name,
                        ulong *      id,
@@ -361,7 +384,8 @@ advance_account_batch( fd_ssparse_t *                ssparse,
 
   /* Skip over accounts until we reached EOF or batch is full */
   result->account_batch.batch_cnt = 0;
-  ulong off = 0UL;
+  ulong off  = 0UL;
+  ulong body = 0UL; /* account body bytes accumulated into this batch */
   for( ulong idx=0UL; idx<FD_SSPARSE_ACC_BATCH_MAX && off+136UL<=avail; idx++ ) {
     uchar const * acc_hdr     = (uchar *)data+off;
 
@@ -382,11 +406,18 @@ advance_account_batch( fd_ssparse_t *                ssparse,
       FD_LOG_WARNING(( "invalid account header executable %u", acc_hdr[ 96UL ] ));
       return FD_SSPARSE_ADVANCE_ERROR;
     }
+    /* Bound the batch's total body bytes so the caller's per-batch
+       scratch stays finite (see FD_SSPARSE_ACC_BATCH_BYTES_MAX).  The
+       first account is always admitted: it is bounded by
+       FD_RUNTIME_ACC_SZ_MAX on its own. */
+    if( FD_UNLIKELY( idx && body+acc_data_sz>FD_SSPARSE_ACC_BATCH_BYTES_MAX ) ) break;
+
     ulong         next_off    = off+136UL+acc_data_sz;
     ulong         pad_sz      = fd_ulong_align_up( ssparse->tar.file_bytes_consumed+next_off, 8UL ) -
                                                  ( ssparse->tar.file_bytes_consumed+next_off );
     next_off += pad_sz;
     if( FD_UNLIKELY( next_off>avail ) ) break; /* account is fragmented */
+    body += acc_data_sz;
     result->account_batch.batch_cnt        = idx+1UL;
     result->account_batch.batch[ idx ]     = acc_hdr;
     ssparse->account.header_bytes_consumed = 136UL;
