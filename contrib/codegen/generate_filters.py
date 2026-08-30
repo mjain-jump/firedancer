@@ -58,6 +58,8 @@ SYSCALL_ARGS = {
     "kill":            (  "int",  "int",    None,   None,   None,    None  ),
     "lseek":           (  "int", "long",   "int",   None,   None,    None  ),
     "madvise":         ( "long", "long",   "int",   None,   None,    None  ),
+    "mmap":            ( "long", "long",   "int",  "int",   "int",  "long" ),
+    "munmap":          ( "long", "long",    None,   None,   None,    None  ),
     "newfstatat":      (  "int", "long",  "long",  "int",   None,    None  ),
     "poll":            ( "long",  "int",   "int",   None,   None,    None  ),
     "ppoll":           ( "long",  "int",  "long", "long", "long",    None  ),

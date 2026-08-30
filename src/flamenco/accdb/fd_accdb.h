@@ -838,6 +838,18 @@ void
 fd_accdb_background( fd_accdb_t * accdb,
                      int *        charge_busy );
 
+/* fd_accdb_partition_sz returns the size in bytes of one partition of
+   the accounts database file, i.e. the granularity at which the file is
+   fallocate()d and at which write heads rotate.  A flat file offset o
+   therefore belongs to partition o/partition_sz, and that partition
+   covers the file range [ (o/partition_sz)*partition_sz,
+   ((o/partition_sz)+1)*partition_sz ).  Callers that map the file
+   (rather than pwrite it) need this to place and bound their mappings.
+   Always a multiple of the page size. */
+
+ulong
+fd_accdb_partition_sz( fd_accdb_t const * accdb );
+
 /* fd_accdb_shmetrics returns a pointer to the shared metrics counters
    for the given accdb instance.  The returned pointer remains valid
    for the lifetime of the underlying shmem. */

@@ -5047,6 +5047,11 @@ fd_accdb_background( fd_accdb_t * accdb,
   }
 }
 
+ulong
+fd_accdb_partition_sz( fd_accdb_t const * accdb ) {
+  return accdb->shmem->partition_sz;
+}
+
 fd_accdb_shmem_metrics_t const *
 fd_accdb_shmetrics( fd_accdb_t * accdb ) {
   return accdb->shmem->shmetrics;

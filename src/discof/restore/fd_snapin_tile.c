@@ -28,6 +28,15 @@
 #include "../../flamenco/accdb/fd_zle.h"
 #include "../../disco/events/generated/fd_event_gen.h"
 
+/* sys/mman.h ahead of the generated policy: the policy names PROT_*,
+   MAP_* and MADV_* symbolically, and the generated header interpolates
+   those names into C expressions. */
+#include <sys/mman.h>
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE (23)
+#endif
+
 #include "generated/fd_snapin_tile_seccomp.h"
 
 #define ZSTD_STATIC_LINKING_ONLY
@@ -35,6 +44,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define NAME "snapin"
@@ -78,8 +88,9 @@
    insertion is safe unchanged.
 
    Owned accounts are inserted through the striped-lock accdb writer and
-   their packed disk records pwrite()n at the tile's own explicit
-   offsets through a staging buffer, exactly as before.
+   their packed disk records land at the tile's own explicit offsets in
+   the accounts database, by default as stores into an mmap of the
+   tile's current partition (see FD_SNAPIN_WRITE_MODE below).
 
    Controls (INIT/FINI/...) still ride a link from snapld, which in this
    topology is a control-plane-only tile: it publishes no data frags.  A
@@ -203,6 +214,56 @@ FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SSPARSE_ACC_BATCH_BYTES_MAX + FD_SSPAR
    Effectively disabled; re-derive from projected compressed volume vs
    vm.dirty limits if account data ever stops compressing. */
 #define FD_SNAPIN_WB_MIN_WORKERS  (ULONG_MAX)
+
+/* Mapped partition writes (the "mmw" write engine) *******************
+
+   The fused loader's N tiles all append into disjoint partitions of ONE
+   accounts.db inode.  With pwrite(2) that is not actually parallel: XFS
+   takes the inode's i_rwsem EXCLUSIVELY around every buffered write
+   (xfs_file_buffered_write -> xfs_ilock_iocb), so at N=64 the tiles
+   queue up behind each other for a lock that has nothing to do with the
+   ranges they touch, which are provably disjoint.  Measured on the
+   reference host at N=64: 9.9-13.2 s of a 19.3 s tile was spent inside
+   pwrite, and that term did not shrink as N grew.
+
+   A tile therefore mmap()s its current partition MAP_SHARED and memcpy's
+   its records into the mapping instead.  Store-to-mapping takes no inode
+   lock at all: the write fault takes XFS's MMAPLOCK *shared*, so the
+   tiles fault concurrently.  Everything downstream is unchanged --- the
+   bytes land in the same page-cache pages of the same file, so the
+   kernel's dirty accounting and writeback behave exactly as before (the
+   fault path calls balance_dirty_pages_ratelimited too), preads of the
+   same file see the stores immediately (one page cache, no aliasing),
+   and no msync is needed because a snapshot load does not need
+   durability before fd_accdb_snapshot_load_end.
+
+   Mapping lifetime is per acquired partition, not per file: a tile maps
+   the partition containing its write head on first touch and unmaps it
+   when the head rotates away (or at FINI/FAIL).  Partition granularity
+   keeps the mapping inside a range that the accdb has already
+   fallocate()d, bounds address-space use to partition_sz per tile, and
+   needs no cooperation from the allocator.  A flush is normally
+   contained in one partition (the staging buffer is forced out whenever
+   the allocator hands back a non-contiguous offset), but the split loop
+   in worker_buffer_flush does not rely on that.
+
+   FD_SNAPIN_WRITE_MODE selects the engine so that a single binary can
+   A/B it:
+
+     0  pwrite(2) at explicit offsets (the previous behavior)
+     1  mmap + memcpy from the staging buffer                  (default)
+     2  mmap + memcpy direct, staging buffer bypassed
+
+   FD_SNAPIN_MMW_PREFAULT_MB, when nonzero, additionally batches the
+   write faults: before touching a page the tile madvise()s the next
+   PREFAULT_MB of its partition with MADV_POPULATE_WRITE, so the ~50 M
+   4 KiB write faults of a full load are taken in a few hundred kernel
+   loops instead of one trap each (the host has THP off for file
+   mappings, so there is no larger folio to get them for free). */
+
+#define FD_SNAPIN_WRITE_MODE_PWRITE  (0)
+#define FD_SNAPIN_WRITE_MODE_MAP     (1)
+#define FD_SNAPIN_WRITE_MODE_MAP_DIR (2)
 
 /* Rate limit for the attempt-slot gate diagnostic.  The gate holds the
    tile's data lanes (it does not spin inside a frag handler), so an
@@ -438,7 +499,8 @@ struct fd_snapin_tile {
   long  t_start;
   ulong t_read;              /* pread of the compressed range */
   ulong t_zstd;              /* ZSTD_decompressStream */
-  ulong t_write;             /* pwrite of packed account records */
+  ulong t_write;             /* pwrite / memcpy-to-mapping of packed account records */
+  ulong t_map;               /* mmap + munmap + MADV_POPULATE_WRITE of the partition windows */
 
   /* Sharded parse state (per attempt). */
   ulong appendvec_seq;      /* appendvecs whose header this tile parsed */
@@ -464,9 +526,22 @@ struct fd_snapin_tile {
   uchar * write_buf;
   ulong   write_buf_used;
   ulong   flush_off;        /* file offset of write_buf[0] */
-  ulong   bytes_written;         /* compressed bytes actually pwritten */
+  ulong   bytes_written;         /* compressed bytes actually written */
   ulong   bytes_written_logical; /* uncompressed account data those bytes hold */
   fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
+
+  /* Mapped-partition write window (see FD_SNAPIN_WRITE_MODE above).
+     map_base maps exactly [map_off, map_off+partition_sz) of the
+     accounts file, i.e. the whole partition the write head is in;
+     prefault_wm is how far into that mapping MADV_POPULATE_WRITE has
+     already been applied. */
+  int     write_mode;
+  ulong   partition_sz;
+  uchar * map_base;
+  ulong   map_off;
+  ulong   prefault_sz;      /* MADV_POPULATE_WRITE batch, 0 = disabled */
+  ulong   prefault_wm;
+  ulong   map_cnt;          /* mmap calls (== partitions this tile touched) */
 
   /* fd_zle scratch (see FD_SNAPIN_ACC_BUF_SZ / FD_SNAPIN_ZBUF_SZ). */
   uchar * acc_buf;
@@ -1251,8 +1326,68 @@ validate_capitalization( fd_snapin_tile_t * ctx ) {
 
 /* Write engine ********************************************************/
 
+/* Mapped partition window.  worker_map_release drops the current
+   mapping; worker_map_for makes the partition containing file offset
+   `off` the mapped one and returns where in the mapping `off` lands.
+   Both are no-ops in pwrite mode, which never maps anything. */
+
+static void
+worker_map_release( fd_snapin_tile_t * ctx ) {
+  if( FD_LIKELY( !ctx->map_base ) ) return;
+  long t0 = fd_tickcount();
+  /* munmap does not write anything back; the dirty pages stay in the
+     page cache and the kernel drains them on its own schedule, exactly
+     as they would after a pwrite. */
+  if( FD_UNLIKELY( -1==munmap( ctx->map_base, ctx->partition_sz ) ) ) {
+    FD_LOG_ERR(( "munmap(accounts.db partition at %lu) failed (%d-%s)", ctx->map_off, errno, fd_io_strerror( errno ) ));
+  }
+  ctx->t_map      += (ulong)( fd_tickcount() - t0 );
+  ctx->map_base    = NULL;
+  ctx->map_off     = 0UL;
+  ctx->prefault_wm = 0UL;
+}
+
+static uchar *
+worker_map_for( fd_snapin_tile_t * ctx,
+                ulong              off ) {
+  ulong base = ( off/ctx->partition_sz )*ctx->partition_sz;
+  if( FD_UNLIKELY( !ctx->map_base || base!=ctx->map_off ) ) {
+    worker_map_release( ctx );
+    long   t0 = fd_tickcount();
+    /* PROT_READ is not needed by the loader (it only stores), but x86
+       has no write-without-read protection anyway and the readback gate
+       is happier if a mapping is ever reused for reads. */
+    void * m  = mmap( NULL, ctx->partition_sz, PROT_READ|PROT_WRITE, MAP_SHARED, FD_ACCDB_FD_RW, (long)base );
+    if( FD_UNLIKELY( m==MAP_FAILED ) ) {
+      FD_LOG_ERR(( "mmap(accounts.db, %lu bytes at %lu) failed (%d-%s)", ctx->partition_sz, base, errno, fd_io_strerror( errno ) ));
+    }
+    ctx->t_map      += (ulong)( fd_tickcount() - t0 );
+    ctx->map_base    = m;
+    ctx->map_off     = base;
+    ctx->prefault_wm = 0UL;
+    ctx->map_cnt++;
+  }
+
+  /* Batch the write faults ahead of the head, if asked to. */
+  ulong map_pos = off-ctx->map_off;
+  if( FD_UNLIKELY( ctx->prefault_sz && map_pos>=ctx->prefault_wm ) ) {
+    ulong wm  = fd_ulong_align_dn( map_pos, ctx->prefault_sz );
+    ulong sz  = fd_ulong_min( ctx->prefault_sz, ctx->partition_sz-wm );
+    long  t0  = fd_tickcount();
+    if( FD_UNLIKELY( -1==madvise( ctx->map_base+wm, sz, MADV_POPULATE_WRITE ) ) ) {
+      FD_LOG_WARNING(( "madvise(MADV_POPULATE_WRITE) failed (%d-%s); disabling prefault", errno, fd_io_strerror( errno ) ));
+      ctx->prefault_sz = 0UL;
+    }
+    ctx->t_map      += (ulong)( fd_tickcount() - t0 );
+    ctx->prefault_wm = wm+sz;
+  }
+
+  return ctx->map_base + map_pos;
+}
+
 static void
 worker_reset_write_engine( fd_snapin_tile_t * ctx ) {
+  worker_map_release( ctx );
   ctx->write_buf_used      = 0UL;
   ctx->flush_off           = 0UL;
   ctx->bytes_written       = 0UL;
@@ -1343,10 +1478,34 @@ worker_wb_track( fd_snapin_tile_t * ctx,
   }
 }
 
-/* Staging buffer: buffered pwrites into the tile's own accdb
-   partitions.  flush_off is explicit because per-tile offsets are only
-   sequential within a partition; worker_buffer_write flushes whenever
-   the allocator rotates. */
+/* worker_store copies sz bytes to file offset off through the tile's
+   partition mapping, splitting at partition boundaries.  A caller's
+   range never straddles one in practice (accounts do not straddle
+   partitions and the staging buffer is forced out whenever the
+   allocator hands back a non-contiguous offset), but nothing here
+   depends on that. */
+
+static void
+worker_store( fd_snapin_tile_t * ctx,
+              ulong              off,
+              uchar const *      data,
+              ulong              sz ) {
+  while( sz ) {
+    uchar * dst   = worker_map_for( ctx, off );
+    ulong   avail = ctx->map_off+ctx->partition_sz - off;
+    ulong   n     = fd_ulong_min( sz, avail );
+    fd_memcpy( dst, data, n );
+    off  += n;
+    data += n;
+    sz   -= n;
+  }
+}
+
+/* Staging buffer: buffered writes into the tile's own accdb partitions.
+   flush_off is explicit because per-tile offsets are only sequential
+   within a partition; worker_buffer_write flushes whenever the
+   allocator rotates.  In FD_SNAPIN_WRITE_MODE_MAP_DIR the buffer is
+   bypassed entirely and stays empty, so the flush is a no-op. */
 
 static void
 worker_buffer_flush( fd_snapin_tile_t * ctx ) {
@@ -1354,16 +1513,21 @@ worker_buffer_flush( fd_snapin_tile_t * ctx ) {
 
   ulong sz  = ctx->write_buf_used;
   ulong off = ctx->flush_off;
-  ulong bytes_written = 0UL;
   long  t0  = fd_tickcount();
-  while( bytes_written<sz ) {
-    long res = pwrite( FD_ACCDB_FD_RW, ctx->write_buf+bytes_written, sz-bytes_written, (long)(off+bytes_written) );
-    if( FD_UNLIKELY( -1L==res ) ) {
-      if( FD_LIKELY( errno==EINTR ) ) continue;
-      FD_LOG_ERR(( "error writing to disk (%d-%s)", errno, fd_io_strerror( errno ) ));
+  if( FD_LIKELY( ctx->write_mode!=FD_SNAPIN_WRITE_MODE_PWRITE ) ) {
+    worker_store( ctx, off, ctx->write_buf, sz );
+    ctx->bytes_written += sz;
+  } else {
+    ulong bytes_written = 0UL;
+    while( bytes_written<sz ) {
+      long res = pwrite( FD_ACCDB_FD_RW, ctx->write_buf+bytes_written, sz-bytes_written, (long)(off+bytes_written) );
+      if( FD_UNLIKELY( -1L==res ) ) {
+        if( FD_LIKELY( errno==EINTR ) ) continue;
+        FD_LOG_ERR(( "error writing to disk (%d-%s)", errno, fd_io_strerror( errno ) ));
+      }
+      bytes_written      += (ulong)res;
+      ctx->bytes_written += (ulong)res;
     }
-    bytes_written      += (ulong)res;
-    ctx->bytes_written += (ulong)res;
   }
   ctx->t_write        += (ulong)( fd_tickcount() - t0 );
   ctx->flush_off      += sz;
@@ -1377,6 +1541,18 @@ worker_buffer_write( fd_snapin_tile_t * ctx,
                      ulong              file_off,
                      uchar const *      data,
                      ulong              sz ) {
+  if( FD_UNLIKELY( ctx->write_mode==FD_SNAPIN_WRITE_MODE_MAP_DIR ) ) {
+    /* Straight into the mapping: the page cache IS the staging buffer,
+       so the intermediate copy buys nothing once the write is a store
+       rather than a syscall.  Timed at the same granularity as the
+       other modes' flush so the FINI breakdown stays comparable. */
+    long t0 = fd_tickcount();
+    worker_store( ctx, file_off, data, sz );
+    ctx->t_write       += (ulong)( fd_tickcount() - t0 );
+    ctx->bytes_written += sz;
+    return;
+  }
+
   /* Force a flush whenever the next offset is not the natural append
      point (first write, or the allocator rotated to a new partition). */
   if( FD_UNLIKELY( file_off!=ctx->flush_off+ctx->write_buf_used ) ) {
@@ -1548,6 +1724,8 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->t_read           = 0UL;
   ctx->t_zstd           = 0UL;
   ctx->t_write          = 0UL;
+  ctx->t_map            = 0UL;
+  ctx->map_cnt          = 0UL;
 
   worker_reset_write_engine( ctx );
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
@@ -2897,6 +3075,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
          before acking: tile 0's readback gate and load_end at the DONE
          barrier run only after all FINI acks. */
       worker_buffer_flush( ctx );
+      worker_map_release( ctx );
       fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
       fd_accdb_snapshot_writer_end( ctx->accdb );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
@@ -2916,11 +3095,15 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         double rd      = (double)ctx->t_read /tpns/1e9;
         double zs      = (double)ctx->t_zstd /tpns/1e9;
         double wr      = (double)ctx->t_write/tpns/1e9;
-        FD_LOG_NOTICE(( "snapin %lu: time %.2fs = read %.2fs (%.0f%%) + zstd %.2fs (%.0f%%) + pwrite %.2fs (%.0f%%) "
-                        "+ other %.2fs (%.0f%%)",
+        double mp      = (double)ctx->t_map  /tpns/1e9;
+        FD_LOG_NOTICE(( "snapin %lu: time %.2fs = read %.2fs (%.0f%%) + zstd %.2fs (%.0f%%) + %s %.2fs (%.0f%%) "
+                        "+ map %.2fs (%.0f%%) + other %.2fs (%.0f%%) [mode=%d maps=%lu]",
                         ctx->tile_idx, elapsed,
-                        rd, 100.0*rd/elapsed, zs, 100.0*zs/elapsed, wr, 100.0*wr/elapsed,
-                        elapsed-rd-zs-wr, 100.0*(elapsed-rd-zs-wr)/elapsed ));
+                        rd, 100.0*rd/elapsed, zs, 100.0*zs/elapsed,
+                        ctx->write_mode==FD_SNAPIN_WRITE_MODE_PWRITE ? "pwrite" : "memcpy",
+                        wr, 100.0*wr/elapsed, mp, 100.0*mp/elapsed,
+                        elapsed-rd-zs-wr-mp, 100.0*(elapsed-rd-zs-wr-mp)/elapsed,
+                        ctx->write_mode, ctx->map_cnt ));
       }
       if( FD_UNLIKELY( is_lead( ctx ) ) ) log_appendvec_stats( ctx );
 
@@ -3428,6 +3611,37 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( is_lead( ctx ) ) ) {
     FD_LOG_NOTICE(( "snapin: write-behind window %lu MiB aggregate, %lu MiB per tile (%lu tiles)",
                     ctx->wb_total_window>>20, ctx->wb_window>>20, ctx->tile_cnt ));
+  }
+
+  /* Mapped-partition write engine.  PROTOTYPE: selected by environment
+     so one binary can A/B the three engines; a production version would
+     take this from the config (or simply always map). */
+  ctx->partition_sz = fd_accdb_partition_sz( ctx->accdb );
+  FD_TEST( ctx->partition_sz && !(ctx->partition_sz & 4095UL) );
+  ctx->map_base     = NULL;
+  ctx->map_off      = 0UL;
+  ctx->prefault_wm  = 0UL;
+  ctx->map_cnt      = 0UL;
+  {
+    char const * s = getenv( "FD_SNAPIN_WRITE_MODE" );
+    ctx->write_mode = s ? atoi( s ) : FD_SNAPIN_WRITE_MODE_MAP;
+    if( FD_UNLIKELY( ctx->write_mode<0 || ctx->write_mode>FD_SNAPIN_WRITE_MODE_MAP_DIR ) ) {
+      FD_LOG_ERR(( "FD_SNAPIN_WRITE_MODE=%d is not one of 0 (pwrite), 1 (mmap+staging), 2 (mmap direct)", ctx->write_mode ));
+    }
+    char const * p = getenv( "FD_SNAPIN_MMW_PREFAULT_MB" );
+    ulong prefault_mb = p ? fd_cstr_to_ulong( p ) : 0UL;
+    ctx->prefault_sz  = prefault_mb<<20;
+    if( FD_UNLIKELY( ctx->prefault_sz && ctx->partition_sz%ctx->prefault_sz ) ) {
+      FD_LOG_ERR(( "FD_SNAPIN_MMW_PREFAULT_MB=%lu does not divide the %lu byte accdb partition", prefault_mb, ctx->partition_sz ));
+    }
+  }
+  if( FD_UNLIKELY( is_lead( ctx ) ) ) {
+    FD_LOG_NOTICE(( "snapin: write engine mode %d (%s), accdb partition %lu MiB, write-fault prefault %lu MiB",
+                    ctx->write_mode,
+                    ctx->write_mode==FD_SNAPIN_WRITE_MODE_PWRITE  ? "pwrite at explicit offsets" :
+                    ctx->write_mode==FD_SNAPIN_WRITE_MODE_MAP     ? "mmap'd partition, staged memcpy" :
+                                                                    "mmap'd partition, direct memcpy",
+                    ctx->partition_sz>>20, ctx->prefault_sz>>20 ));
   }
 
   /* Every tile updates the root stake delegations from its snoop

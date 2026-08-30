@@ -37,8 +37,46 @@ fallocate: (and (eq (arg 0) accounts_fd)
 # Parallel snapshot loader tiles write the packed account records
 # directly into their own partitions of the accounts file.
 #
+# Only used by FD_SNAPIN_WRITE_MODE=0; the default engine maps the
+# partition instead (see below).
+#
 # arg 0 is the file descriptor to write to.
 pwrite64: (eq (arg 0) accounts_fd)
+
+# accounts database: map the tile's own partition to write records into
+#
+# The default snapshot write engine stores its packed account records
+# into an mmap of the accdb partition its private write head is in,
+# instead of pwrite()ing them: N tiles pwriting one inode serialize on
+# the filesystem's exclusive per-inode write lock even though their
+# byte ranges are disjoint, while write faults on a shared mapping take
+# it shared.  One mapping at a time per tile, remapped when the write
+# head rotates to a fresh partition.
+#
+# arg 4 is the file descriptor being mapped, arg 2 the protection and
+# arg 3 the flags: nothing else in this tile calls mmap after the
+# sandbox is installed, so the accounts file is the only mappable
+# object and the mapping must be exactly a shared read-write one.
+mmap: (and (eq (arg 4) accounts_fd)
+           (and (eq (arg 2) "PROT_READ|PROT_WRITE")
+                (eq (arg 3) "MAP_SHARED")))
+
+# accounts database: drop the mapping of a partition the write head
+# rotated away from, and at the end of the load
+#
+# munmap takes no file descriptor, so there is nothing to restrict it
+# to; it can only ever affect the calling process's own address space,
+# and the tile only unmaps what it mapped above.
+munmap
+
+# accounts database: take the mapping's write faults in batches
+#
+# MADV_POPULATE_WRITE faults in a run of the mapping in one kernel
+# loop instead of one trap per 4 KiB page.  Only reachable when
+# FD_SNAPIN_MMW_PREFAULT_MB is set.
+#
+# arg 2 is the advice.
+madvise: (eq (arg 2) "MADV_POPULATE_WRITE")
 
 # accounts database: tile 0 samples records back from the
 # accounts file at load end to verify the index and file agree.
