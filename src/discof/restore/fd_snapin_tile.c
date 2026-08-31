@@ -29,10 +29,11 @@
 #include "../../flamenco/accdb/fd_zle.h"
 #include "../../disco/events/generated/fd_event_gen.h"
 
-/* sys/mman.h ahead of the generated policy: the policy names PROT_*,
-   MAP_* and MADV_* symbolically, and the generated header interpolates
-   those names into C expressions. */
+/* sys/mman.h and fcntl.h ahead of the generated policy: the policy
+   names PROT_*, MAP_*, MADV_* and POSIX_FADV_* symbolically, and the
+   generated header interpolates those names into C expressions. */
 #include <sys/mman.h>
+#include <fcntl.h>
 
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE (23)
@@ -44,7 +45,6 @@
 #include <zstd.h>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 

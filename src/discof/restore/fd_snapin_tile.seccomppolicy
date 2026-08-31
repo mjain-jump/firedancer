@@ -109,3 +109,14 @@ sync_file_range: (eq (arg 0) accounts_fd)
 #
 # arg 0 is the file descriptor to read from.
 pread64: (eq (arg 0) snapshot_fd)
+
+# snapshot archive: declare the tile's own byte range sequential
+#
+# Each tile announces its exclusive [lo,hi) of the archive as
+# POSIX_FADV_SEQUENTIAL once, when the range is resolved, so the kernel
+# reads ahead across it instead of treating the N interleaved streams as
+# random access.
+#
+# arg 0 is the file descriptor and arg 3 the advice.
+fadvise64: (and (eq (arg 0) snapshot_fd)
+                (eq (arg 3) "POSIX_FADV_SEQUENTIAL"))
