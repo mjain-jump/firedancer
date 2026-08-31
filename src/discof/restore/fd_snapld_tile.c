@@ -518,6 +518,19 @@ returnable_frag( fd_snapld_tile_t *  ctx,
 
       ctx->window_deadline = LONG_MAX;
       ctx->bytes_in_window = 0UL;
+      /* PROTOTYPE LIMITATION (fused file-partitioned loading).  The
+         snapin tiles pread their own byte ranges out of a local archive
+         file they opened themselves, so a downloaded snapshot cannot
+         reach them: there is nothing on the other end of the HTTP
+         stream.  Refuse here, where snapct's source choice first
+         becomes visible, instead of loading nothing. */
+      if( FD_UNLIKELY( ctx->fused && !ctx->load_file ) ) {
+        FD_LOG_ERR(( "the fused snapshot loader requires a local snapshot archive, but snapct chose to "
+                     "download the %s snapshot.  Place a full snapshot in the snapshots directory and "
+                     "raise [snapshots.sources] max_local_full_effective_age so it is accepted",
+                     ctx->load_full ? "full" : "incremental" ));
+      }
+
       long now = fd_log_wallclock();
       if( ctx->load_file ) {
         if( FD_UNLIKELY( 0!=lseek( ctx->load_full ? ctx->local_full_fd : ctx->local_incr_fd, 0, SEEK_SET ) ) )

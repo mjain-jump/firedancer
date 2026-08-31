@@ -234,7 +234,9 @@ fd_topo_initialize( config_t * config ) {
   ulong snapsv_tile_cnt = ( config->firedancer.snapshots.server.enabled &&
                             config->firedancer.layout.enable_snapshot_production )
                           ? config->firedancer.layout.snapsv_tile_count : 0UL;
-  ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
+  /* The fused snapshot loader has no snapdc tiles: every snapin tile
+     preads and decompresses its own compressed byte range of the
+     archive.  [layout.snapdc_tile_count] is ignored here. */
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
 
   ulong gossvf_tile_cnt = config->firedancer.layout.gossvf_tile_count;
@@ -259,6 +261,25 @@ fd_topo_initialize( config_t * config ) {
     FD_CHECK_ERR( !config->firedancer.snapshots.incremental_snapshot_interval_slots ||
                   config->firedancer.snapshots.max_incremental_snapshots_to_keep,
                   "[snapshots.max_incremental_snapshots_to_keep] must be nonzero when incremental snapshot production is enabled" );
+  }
+
+  /* PROTOTYPE LIMITATIONS of the fused snapshot loader.  A fused snapin
+     tile preads its own compressed byte range out of one local archive
+     file that it opens itself in privileged_init, so:
+
+       - there is no way to feed it a stream, and therefore no way to
+         load a snapshot that has to be downloaded first.  snapct still
+         resolves sources, and refuses at INIT time if it picked an HTTP
+         source (see fd_snapld_tile.c); if there is no usable local full
+         snapshot at all the snapin tiles refuse at boot.
+
+       - only the full snapshot is partitioned.  An incremental is ~1 GB
+         against the full's ~112 GB, so partitioning it buys nothing and
+         it would need the streaming pipeline back; refuse up front
+         rather than after spending a full load. */
+  if( FD_UNLIKELY( snapshots_enabled && config->firedancer.snapshots.incremental_snapshots ) ) {
+    FD_LOG_ERR(( "the fused snapshot loader does not support incremental snapshots; "
+                 "set [snapshots] incremental_snapshots = false" ));
   }
 
   fd_topo_t * topo = fd_topob_new( &config->topo, config->name );
@@ -378,11 +399,9 @@ fd_topo_initialize( config_t * config ) {
   if( FD_LIKELY( snapshots_enabled ) ) {
     fd_topob_wksp( topo, "snapct"      );
     fd_topob_wksp( topo, "snapld"      );
-    fd_topob_wksp( topo, "snapdc"      );
     fd_topob_wksp( topo, "snapin"      );
     fd_topob_wksp( topo, "snapct_ld"   );
     fd_topob_wksp( topo, "snapld_dc"   );
-    fd_topob_wksp( topo, "snapdc_in"   );
     fd_topob_wksp( topo, "snapin_ct"   );
     fd_topob_wksp( topo, "snapio_snoop" );
 
@@ -425,16 +444,12 @@ fd_topo_initialize( config_t * config ) {
   if( FD_LIKELY( snapshots_enabled ) ) {
     /* TODO: Revisit the depths of all the snapshot links */
 
-    /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH when
-       more than one snapin tile is attached.  A tile's fseq is its
-       scan position, so this depth is the runway that lets the other
-       tiles keep going through one tile's write stall instead of
-       convoying behind it.  1024 frags is ~64 MiB per lane. */
-    ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
-
     /**/                 fd_topob_link( topo, "snapct_ld",     "snapct_ld",     128UL,                                    sizeof(fd_ssctrl_init_t),      1UL );
-    /**/                 fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
-    FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in",     "snapdc_in",     snapdc_in_depth,                          FD_SNAPSHOT_DATA_MTU,          1UL );
+    /* snapld_dc carries CONTROL FRAGS ONLY under the fused loader
+       (INIT, META, FINI, NEXT/DONE, ERROR/FAIL, SHUTDOWN,
+       LOAD_COMPLETE): a handful of frags per load, so the deep dcache
+       runway the streaming pipeline needed is gone with it. */
+    /**/                 fd_topob_link( topo, "snapld_dc",     "snapld_dc",     128UL,                                    FD_SNAPSHOT_DATA_MTU,          1UL );
 
     /**/                 fd_topob_link( topo, "snapin_manif",  "snapin_manif",  4UL,                                      sizeof(fd_snapshot_manifest_t),1UL ); /* only 3 frags ever traverse: FULL, INCREMENTAL, DONE */
     /**/                 fd_topob_link( topo, "snapct_repr",   "snapct_repr",   128UL,                                    0UL,                           1UL )->permit_no_consumers = 1; /* TODO: wire in repair later */
@@ -555,10 +570,10 @@ fd_topo_initialize( config_t * config ) {
   if( FD_LIKELY( snapshots_enabled ) ) {
     /**/                 fd_topob_tile( topo, "snapct", "snapct", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
     /**/                 fd_topob_tile( topo, "snapld", "snapld", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
-    FOR(snapdc_tile_cnt) fd_topob_tile( topo, "snapdc", "snapdc", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
-    /* N symmetric snapin tiles: there is no snapwr tile, every snapin
-       tile parses, inserts and writes its own share of the snapshot
-       to the accounts database file. */
+    /* N symmetric FUSED snapin tiles: there is no snapdc tile and no
+       snapwr tile.  Every snapin tile preads, decompresses, parses,
+       inserts and writes its own compressed byte range of the archive
+       into its own partitions of the accounts database file. */
     FOR(snapin_tile_cnt) fd_topob_tile( topo, "snapin", "snapin", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0 )->allow_shutdown = 1;
   }
   if( snapmk_enabled ) {
@@ -674,15 +689,14 @@ fd_topo_initialize( config_t * config ) {
     /**/              fd_topob_tile_in (    topo, "snapld",  0UL,          "metric_in", "snapct_ld",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     /**/              fd_topob_tile_out(    topo, "snapld",  0UL,                       "snapld_dc",     0UL                                                );
 
-    FOR(snapdc_tile_cnt) fd_topob_tile_in (    topo, "snapdc",  i,            "metric_in", "snapld_dc",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    FOR(snapdc_tile_cnt) fd_topob_tile_out(    topo, "snapdc",  i,                      "snapdc_in",     i                                                  );
-
-    /* Every snapin tile is a full reliable consumer of every snapdc
-       lane: it walks the whole tar stream itself and parses only the
-       appendvecs it owns (there is no snapwr tile -- every snapin
-       tile writes its own share of the accounts database file). */
+    /* Every snapin tile is a reliable consumer of snapld_dc for the
+       control barriers (INIT/META/FINI/...) and reads its own
+       compressed byte range of the archive with pread(2).  No payload
+       link exists: not one snapshot byte crosses a link, and there is
+       no snapwr tile -- every snapin tile writes its own share of the
+       accounts database file. */
     for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
-      FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+      fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapld_dc", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     }
     if( FD_LIKELY( config->tiles.gui.enabled ) ) {
       /**/            fd_topob_tile_out(    topo, "snapin", 0UL,                        "snapin_gui",    0UL                                                );
