@@ -72,12 +72,13 @@
    ring and feeds the bytes straight into its own fd_ssparse instance.
 
    Tar seams.  A range boundary lands mid-entry essentially always, so
-   tile i>0 scans its first decompressed frame forward for the first
-   confirmed tar entry header and seeds its parser there
-   (fd_ssparse_init_midstream); the partial entry before it belongs to
-   tile i-1, which parses PAST its own range end until that entry closes
-   -- at most two extra frames, since the largest appendvec on mainnet
-   (30.1 MiB) is smaller than one frame.  Both local discoveries are
+   tile i>0 scans its range forward for the first confirmed tar entry
+   header and seeds its parser there (fd_ssparse_init_midstream); the
+   partial entry before it belongs to tile i-1, which parses PAST its own
+   range end until that entry closes.  Neither the scan nor the overrun
+   is bounded by one frame: mainnet archives do carry appendvecs larger
+   than a 32 MiB frame (37.7 MiB observed in an incremental), so both are
+   bounded by explicit frame budgets instead.  Both local discoveries are
    heuristics over attacker-controlled bytes, so both are confirmed
    after the fact at the NEXT/DONE barrier from the per-tile records in
    the shared object (fd_snapio_seam_t); any mismatch fails the load.
@@ -173,6 +174,15 @@
    runaway read. */
 
 #define FD_SNAPIN_OVERRUN_FRAME_MAX (16UL)
+
+/* Frames a tile may decompress while searching its range for the first
+   tar entry header.  One frame is NOT enough: mainnet archives do carry
+   appendvecs larger than a frame (37.7 MiB observed in an incremental),
+   and a range that starts inside one sees only body bytes for its whole
+   first frame.  The predecessor absorbs the difference as seam overrun,
+   which is why this stays well under FD_SNAPIN_OVERRUN_FRAME_MAX. */
+
+#define FD_SNAPIN_HDR_SCAN_FRAME_MAX (4UL)
 
 FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SSPARSE_ACC_BATCH_BYTES_MAX + FD_SSPARSE_ACC_BATCH_MAX*FD_ZLE_OVERHEAD, zbuf_batch );
 
@@ -2503,14 +2513,30 @@ fused_locate( fd_snapin_tile_t * ctx ) {
     ctx->first_hdr_delta = 0UL;
     ctx->dbuf_pos        = 0UL;
   } else {
-    ulong off = fd_snapfs_find_tar_header( ctx->dbuf, ctx->dbuf_len );
+    /* Scan forward for the first confirmed tar entry header.  An
+       appendvec can be larger than one frame, so the search may have to
+       walk several frames before it sees a header at all; `base` tracks
+       the decompressed distance from the range anchor to dbuf[0]. */
+    ulong base = 0UL;
+    ulong off  = ULONG_MAX;
+    for( ulong f=0UL; f<FD_SNAPIN_HDR_SCAN_FRAME_MAX; f++ ) {
+      off = fd_snapfs_find_tar_header( ctx->dbuf, ctx->dbuf_len );
+      if( FD_LIKELY( off!=ULONG_MAX ) ) break;
+      base += ctx->dbuf_len;
+      int rr = fused_dbuf_fill( ctx );
+      if( FD_UNLIKELY( rr<=0 ) ) {
+        FD_LOG_WARNING(( "snapin %lu: compressed stream ended %lu decompressed bytes into its range without a "
+                         "tar entry header", i, base ));
+        return -1;
+      }
+    }
     if( FD_UNLIKELY( off==ULONG_MAX ) ) {
       FD_LOG_WARNING(( "snapin %lu: no tar entry header found in the first %lu decompressed bytes of its range",
-                       i, ctx->dbuf_len ));
+                       i, base+ctx->dbuf_len ));
       return -1;
     }
-    fd_ssparse_init_midstream( ctx->ssparse, off );
-    ctx->first_hdr_delta = off;
+    fd_ssparse_init_midstream( ctx->ssparse, base+off );
+    ctx->first_hdr_delta = base+off;
     ctx->dbuf_pos        = off;
   }
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
