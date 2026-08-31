@@ -9,6 +9,7 @@
 #include "utils/fd_snapfs.h"
 #include "utils/fd_ssarchive.h"
 #include "../../util/fd_hash32.h"
+#include "../../util/pod/fd_pod_format.h"
 
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/metrics/fd_metrics.h"
@@ -264,6 +265,14 @@ FD_STATIC_ASSERT( FD_SNAPIN_ZBUF_SZ >= FD_SSPARSE_ACC_BATCH_BYTES_MAX + FD_SSPAR
 #define FD_SNAPIN_WRITE_MODE_PWRITE  (0)
 #define FD_SNAPIN_WRITE_MODE_MAP     (1)
 #define FD_SNAPIN_WRITE_MODE_MAP_DIR (2)
+
+/* Default prefault window, in MiB.  MADV_POPULATE_WRITE is not an
+   optimization for the mapped engine, it is a precondition, so this
+   must be nonzero: the full validator gives its tiles no environment
+   (run.c execve()s with a NULL envp, and the sandbox clears the
+   environment), so the default is the only value it will ever see. */
+
+#define FD_SNAPIN_MMW_PREFAULT_MB_DEFAULT (64UL)
 
 /* Rate limit for the attempt-slot gate diagnostic.  The gate holds the
    tile's data lanes (it does not spin inside a frag handler), so an
@@ -3442,6 +3451,24 @@ populate_allowed_fds( fd_topo_t      const * topo,
   return out_cnt;
 }
 
+/* The mapped write engine is the only thing in any tile that mmap()s
+   after the sandbox closes, and fd_sandbox sets RLIMIT_AS to
+   rlimit_address_space -- which defaults to 0, i.e. no new mappings at
+   all, so every mmap() would fail with ENOMEM.  Bound it instead: the
+   tile's own joined workspaces (fd_topo_mlock_max_tile is an upper
+   bound over all tiles), plus exactly one accdb partition, plus slack
+   for the executable, libc and the guarded stack. */
+
+#define FD_SNAPIN_RLIMIT_AS_SLACK (4UL<<30)
+
+static ulong
+rlimit_address_space_fn( fd_topo_t const *      topo,
+                         fd_topo_tile_t const * tile ) {
+  ulong partition_sz = fd_pod_queryf_ulong( topo->props, 0UL, "obj.%lu.partition_sz", tile->snapin.accdb_obj_id );
+  FD_TEST( partition_sz );
+  return fd_topo_mlock_max_tile( topo ) + partition_sz + FD_SNAPIN_RLIMIT_AS_SLACK;
+}
+
 static ulong
 populate_allowed_seccomp( fd_topo_t const *      topo,
                           fd_topo_tile_t const * tile,
@@ -3630,11 +3657,27 @@ unprivileged_init( fd_topo_t const *      topo,
     if( FD_UNLIKELY( ctx->write_mode<0 || ctx->write_mode>FD_SNAPIN_WRITE_MODE_MAP_DIR ) ) {
       FD_LOG_ERR(( "FD_SNAPIN_WRITE_MODE=%d is not one of 0 (pwrite), 1 (mmap+staging), 2 (mmap direct)", ctx->write_mode ));
     }
+    /* The prefault window must DEFAULT to a working value, not to
+       "off": the mapped write engine without MADV_POPULATE_WRITE is
+       5.1x SLOWER than pwrite (50 M individual 4 KiB write faults on
+       one inode), and under the full validator there is no environment
+       at all to turn it on with -- run.c execve()s each tile with a
+       NULL envp and fd_sandbox_enter() clears the environment anyway.
+       64 MiB is the measured optimum on a 32 GiB partition; anything
+       >= 32 MiB amortizes the trap, below that the tile re-enters the
+       populate path too often. */
     char const * p = getenv( "FD_SNAPIN_MMW_PREFAULT_MB" );
-    ulong prefault_mb = p ? fd_cstr_to_ulong( p ) : 0UL;
-    ctx->prefault_sz  = prefault_mb<<20;
+    ulong prefault_mb = p ? fd_cstr_to_ulong( p ) : FD_SNAPIN_MMW_PREFAULT_MB_DEFAULT;
+    ctx->prefault_sz  = fd_ulong_min( prefault_mb<<20, ctx->partition_sz );
     if( FD_UNLIKELY( ctx->prefault_sz && ctx->partition_sz%ctx->prefault_sz ) ) {
-      FD_LOG_ERR(( "FD_SNAPIN_MMW_PREFAULT_MB=%lu does not divide the %lu byte accdb partition", prefault_mb, ctx->partition_sz ));
+      if( FD_UNLIKELY( p ) ) {
+        FD_LOG_ERR(( "FD_SNAPIN_MMW_PREFAULT_MB=%lu does not divide the %lu byte accdb partition", prefault_mb, ctx->partition_sz ));
+      }
+      FD_LOG_WARNING(( "the default %lu MiB write-fault prefault window does not divide the %lu byte accdb "
+                       "partition; disabling prefault, which makes the mapped write engine much slower than "
+                       "pwrite -- set FD_SNAPIN_WRITE_MODE=0 or a dividing FD_SNAPIN_MMW_PREFAULT_MB",
+                       prefault_mb, ctx->partition_sz ));
+      ctx->prefault_sz = 0UL;
     }
   }
   if( FD_UNLIKELY( is_lead( ctx ) ) ) {
@@ -3785,6 +3828,7 @@ max_event_sz( fd_topo_tile_t const * tile FD_PARAM_UNUSED ) {
 
 fd_topo_run_tile_t fd_tile_snapin = {
   .name                     = NAME,
+  .rlimit_address_space_fn  = rlimit_address_space_fn,
   .populate_allowed_fds     = populate_allowed_fds,
   .populate_allowed_seccomp = populate_allowed_seccomp,
   .scratch_align            = scratch_align,
