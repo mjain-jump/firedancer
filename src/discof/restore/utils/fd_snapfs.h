@@ -183,6 +183,23 @@ fd_snapfs_frame_next( fd_snapfs_rdr_t * rdr,
   }
 }
 
+/* fd_snapfs_frame_content_sz returns the Frame_Content_Size declared in
+   the header of the frame at off, or ULONG_MAX if off does not carry a
+   frame header of the shape Agave's snapshot writer emits.  Because that
+   writer always sets FCS_flag=0b10 (see FD_SNAPFS_FRAME_HDR_SZ above),
+   every frame declares its decompressed size in its header and the
+   decompressed layout of the archive is readable without decompressing
+   anything. */
+
+static inline ulong
+fd_snapfs_frame_content_sz( fd_snapfs_rdr_t * rdr,
+                            ulong             off ) {
+  uchar const * p = fd_snapfs_peek( rdr, off, FD_SNAPFS_FRAME_HDR_SZ );
+  if( FD_UNLIKELY( !p ) ) return ULONG_MAX;
+  if( FD_UNLIKELY( !( p[0]==0x28 && p[1]==0xB5 && p[2]==0x2F && p[3]==0xFD && p[4]==0x80 ) ) ) return ULONG_MAX;
+  return (ulong)p[6] | ((ulong)p[7]<<8) | ((ulong)p[8]<<16) | ((ulong)p[9]<<24);
+}
+
 /* fd_snapfs_frame_start_ok confirms a candidate frame start with a
    depth-deep block walk: every walk must land on another frame header
    (or exactly on end of file). */
@@ -318,6 +335,100 @@ fd_snapfs_find_tar_header( uchar const * buf,
       p = nxt;
     }
     if( FD_LIKELY( ok ) ) return c;
+  }
+  return ULONG_MAX;
+}
+
+/* The archive's HEADER REGION -- `version`, `snapshots/status_cache`
+   and `snapshots/<slot>/<slot>` (the manifest) -- precedes every
+   `accounts/` entry, and only ONE worker can own it: it is the worker
+   that feeds the manifest and status cache parsers, and a worker whose
+   range starts inside the manifest finds no tar entry header at all
+   (fd_snapfs_find_tar_header only accepts `accounts/` names, by
+   design -- see the comment on fd_snapfs_tar_hdr_ok).  An even byte
+   split of a ~112 GB full archive gives worker 0 GiBs and the ~217 MiB
+   header region is never a constraint, but an even split of a ~1 GB
+   incremental gives worker 0 tens of MB against a ~200 MiB header
+   region, and it is.  The two helpers below let every worker derive the
+   end of that region locally, so the split stays a pure function of the
+   file and no handshake is needed.
+
+   Both walks are bounded: the header region is at most a handful of
+   entries and, decompressed, a few hundred MiB. */
+
+#define FD_SNAPFS_HEAD_ENTRY_MAX (16UL)
+#define FD_SNAPFS_HEAD_FRAME_MAX (64UL)
+
+/* fd_snapfs_head_region_end walks the tar entry header chain from the
+   start of the archive's DECOMPRESSED stream -- buf[0,len) must begin at
+   decompressed offset 0 -- and returns the decompressed offset at which
+   the header region ends, i.e. one past the last entry whose name is not
+   `accounts/`.  Returns ULONG_MAX if the stream does not look like tar
+   at all, or if the chain runs longer than FD_SNAPFS_HEAD_ENTRY_MAX
+   entries without leaving the buffer.
+
+   The chain leaving the buffer is the NORMAL exit, not a failure: only
+   the headers have to be readable, and the manifest -- the last
+   non-`accounts/` entry Agave writes -- has a ~190 MB body that no
+   single-frame buffer can hold.  So the walk reads five headers out of
+   the first 32 MiB frame (version, snapshots/, status_cache,
+   snapshots/<slot>, manifest) and returns where the manifest's body
+   ends.
+
+   The result is therefore a LOWER BOUND on the offset of the first
+   `accounts/` entry, exact whenever the manifest is the last
+   header-region entry.  If it were ever short, the worker whose range
+   started there would find no tar entry header and the load would fail
+   loudly; nothing silently loads the wrong bytes. */
+
+static inline ulong
+fd_snapfs_head_region_end( uchar const * buf,
+                           ulong         len ) {
+  ulong off = 0UL;
+  for( ulong i=0UL; i<FD_SNAPFS_HEAD_ENTRY_MAX; i++ ) {
+    if( FD_UNLIKELY( off+FD_TAR_BLOCK_SZ>len ) ) return i ? off : ULONG_MAX;
+    fd_tar_meta_t const * meta = (fd_tar_meta_t const *)( buf+off );
+    if( FD_UNLIKELY( memcmp( meta->magic, FD_TAR_MAGIC, FD_TAR_MAGIC_SZ ) ) ) return ULONG_MAX;
+    if( FD_UNLIKELY( !strncmp( meta->name, "accounts/", 9UL ) ) ) return off;
+    ulong sz = fd_tar_meta_get_size( meta );
+    if( FD_UNLIKELY( sz==ULONG_MAX || sz>(1UL<<40) ) ) return ULONG_MAX;
+    if( FD_UNLIKELY( !fd_tar_meta_is_reg( meta ) ) ) sz = 0UL; /* directory entries carry no body */
+    off += FD_TAR_BLOCK_SZ + fd_ulong_align_up( sz, FD_TAR_BLOCK_SZ );
+  }
+  return ULONG_MAX;
+}
+
+/* fd_snapfs_frame_at_or_after walks the archive's frames from byte 0 --
+   in the compressed domain only, reading the 10 byte frame headers and
+   3 byte block headers, decompressing nothing -- and returns the
+   compressed offset of the first frame whose DECOMPRESSED start is at
+   or after dprod.  Returns ULONG_MAX if the walk hits a malformed
+   header, reaches end of file, or needs more than
+   FD_SNAPFS_HEAD_FRAME_MAX frames.
+
+   Every frame it lands on is confirmed by construction (the block walk
+   that found it validated every block header in the previous frame), so
+   the returned offset is a real frame start and a valid decode entry
+   point. */
+
+static inline ulong
+fd_snapfs_frame_at_or_after( int     fd,
+                             ulong   file_sz,
+                             ulong   dprod,
+                             uchar * walk_buf,
+                             ulong   walk_buf_sz ) {
+  fd_snapfs_rdr_t rdr[1];
+  fd_snapfs_rdr_init( rdr, fd, file_sz, walk_buf, walk_buf_sz );
+
+  ulong comp = 0UL, decomp = 0UL;
+  for( ulong i=0UL; i<FD_SNAPFS_HEAD_FRAME_MAX; i++ ) {
+    if( FD_LIKELY( decomp>=dprod ) ) return comp;
+    ulong fcs = fd_snapfs_frame_content_sz( rdr, comp );
+    if( FD_UNLIKELY( fcs==ULONG_MAX || !fcs ) ) return ULONG_MAX;
+    ulong nxt = fd_snapfs_frame_next( rdr, comp );
+    if( FD_UNLIKELY( nxt==ULONG_MAX || nxt<=comp || nxt>=file_sz ) ) return ULONG_MAX;
+    comp    = nxt;
+    decomp += fcs;
   }
   return ULONG_MAX;
 }
