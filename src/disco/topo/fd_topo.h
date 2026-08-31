@@ -869,6 +869,10 @@ typedef struct {
   void  (*unprivileged_init       )( fd_topo_t const * topo, fd_topo_tile_t const * tile );
   void  (*run                     )( fd_topo_t * topo, fd_topo_tile_t * tile );
   ulong (*rlimit_file_cnt_fn      )( fd_topo_t const * topo, fd_topo_tile_t const * tile );
+  /* Overrides rlimit_address_space for tiles whose address space
+     depends on the topology rather than on a constant, e.g. because
+     they map a region of a file whose size is configured. */
+  ulong (*rlimit_address_space_fn  )( fd_topo_t const * topo, fd_topo_tile_t const * tile );
 } fd_topo_run_tile_t;
 
 struct fd_topo_obj_callbacks {

@@ -101,6 +101,11 @@ fd_topo_run_tile( fd_topo_t *          topo,
     rlimit_file_cnt = tile_run->rlimit_file_cnt_fn( topo, tile );
   }
 
+  ulong rlimit_address_space = tile_run->rlimit_address_space;
+  if( tile_run->rlimit_address_space_fn ) {
+    rlimit_address_space = tile_run->rlimit_address_space_fn( topo, tile );
+  }
+
   if( FD_LIKELY( sandbox ) ) {
     int dumpable = core_dump_level == FD_TOPO_CORE_DUMP_LEVEL_DISABLED ? 0 : 1;
     fd_sandbox_enter( uid,
@@ -111,7 +116,7 @@ fd_topo_run_tile( fd_topo_t *          topo,
                       keep_controlling_terminal,
                       dumpable,
                       rlimit_file_cnt,
-                      tile_run->rlimit_address_space,
+                      rlimit_address_space,
                       tile_run->rlimit_data,
                       tile_run->rlimit_nproc,
                       allow_fds_cnt+allow_fds_offset,
