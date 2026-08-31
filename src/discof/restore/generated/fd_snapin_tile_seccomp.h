@@ -31,11 +31,11 @@
 #define FD_SECCOMP_ARG_LO(x) ((uint)(((ulong)(uint)(int)(x)      ) & 0xffffffffUL))
 #define FD_SECCOMP_ARG_HI(x) ((uint)(((ulong)(x) >> 32) & 0xffffffffUL))
 
-static const uint sock_filter_policy_fd_snapin_tile_instr_cnt = 71;
+static const uint sock_filter_policy_fd_snapin_tile_instr_cnt = 75;
 
-static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct sock_filter out[ static 71 ], uint logfile_fd, uint accounts_fd, uint snapshot_fd ) {
-  FD_TEST( out_cnt >= 71 );
-  struct sock_filter filter[71] = {
+static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct sock_filter out[ static 75 ], uint logfile_fd, uint accounts_fd, uint snapshot_fd, uint incremental_fd ) {
+  FD_TEST( out_cnt >= 75 );
+  struct sock_filter filter[75] = {
     /* validate architecture */
     BPF_STMT( BPF_LD | BPF_W | BPF_ABS, ( offsetof( struct seccomp_data, arch ) )),
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ARCH_NR, 0, /* RET_KILL_PROCESS */ 13 ),
@@ -64,7 +64,7 @@ static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct so
     /* check pread64 */
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_pread64, /* check_pread64 */ 47, 0 ),
     /* check fadvise64 */
-    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_fadvise64, /* check_fadvise64 */ 50, 0 ),
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, SYS_fadvise64, /* check_fadvise64 */ 52, 0 ),
 //  RET_KILL_PROCESS:
     /* default deny */
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS ),
@@ -162,7 +162,11 @@ static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct so
 //  check_pread64:
     /* arg 0 low 32 bits */
     BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(0)),
-    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(snapshot_fd)), /* pread64_ALLOW */ 1, /* pread64_KILL */ 0 ),
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(snapshot_fd)), /* pread64_ALLOW */ 3, /* or_5 */ 0 ),
+//  or_5:
+    /* arg 0 low 32 bits */
+    BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(0)),
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(incremental_fd)), /* pread64_ALLOW */ 1, /* pread64_KILL */ 0 ),
 //  pread64_KILL:
     BPF_STMT( BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS ),
 //  pread64_ALLOW:
@@ -170,8 +174,12 @@ static void populate_sock_filter_policy_fd_snapin_tile( ulong out_cnt, struct so
 //  check_fadvise64:
     /* arg 0 low 32 bits */
     BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(0)),
-    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(snapshot_fd)), /* and_5 */ 0, /* fadvise64_KILL */ 2 ),
-//  and_5:
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(snapshot_fd)), /* and_6 */ 2, /* or_7 */ 0 ),
+//  or_7:
+    /* arg 0 low 32 bits */
+    BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(0)),
+    BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, ((uint)(incremental_fd)), /* and_6 */ 0, /* fadvise64_KILL */ 2 ),
+//  and_6:
     /* arg 3 low 32 bits */
     BPF_STMT( BPF_LD | BPF_W | BPF_ABS, FD_SECCOMP_ARG_LO_OFFSET(3)),
     BPF_JUMP( BPF_JMP | BPF_JEQ | BPF_K, FD_SECCOMP_ARG_LO(POSIX_FADV_SEQUENTIAL), /* fadvise64_ALLOW */ 1, /* fadvise64_KILL */ 0 ),

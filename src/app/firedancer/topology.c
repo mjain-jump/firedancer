@@ -263,24 +263,15 @@ fd_topo_initialize( config_t * config ) {
                   "[snapshots.max_incremental_snapshots_to_keep] must be nonzero when incremental snapshot production is enabled" );
   }
 
-  /* PROTOTYPE LIMITATIONS of the fused snapshot loader.  A fused snapin
-     tile preads its own compressed byte range out of one local archive
-     file that it opens itself in privileged_init, so:
-
-       - there is no way to feed it a stream, and therefore no way to
-         load a snapshot that has to be downloaded first.  snapct still
-         resolves sources, and refuses at INIT time if it picked an HTTP
-         source (see fd_snapld_tile.c); if there is no usable local full
-         snapshot at all the snapin tiles refuse at boot.
-
-       - only the full snapshot is partitioned.  An incremental is ~1 GB
-         against the full's ~112 GB, so partitioning it buys nothing and
-         it would need the streaming pipeline back; refuse up front
-         rather than after spending a full load. */
-  if( FD_UNLIKELY( snapshots_enabled && config->firedancer.snapshots.incremental_snapshots ) ) {
-    FD_LOG_ERR(( "the fused snapshot loader does not support incremental snapshots; "
-                 "set [snapshots] incremental_snapshots = false" ));
-  }
+  /* PROTOTYPE LIMITATION of the fused snapshot loader.  A fused snapin
+     tile preads its own compressed byte range out of local archive
+     files that it opens itself in privileged_init -- the full snapshot,
+     and the incremental one when incremental loading is enabled -- so
+     there is no way to feed it a stream, and therefore no way to load a
+     snapshot that has to be downloaded first.  snapct still resolves
+     sources, and refuses at INIT time if it picked an HTTP source (see
+     fd_snapld_tile.c); if there is no usable local full snapshot at all
+     the snapin tiles refuse at boot. */
 
   fd_topo_t * topo = fd_topob_new( &config->topo, config->name );
 

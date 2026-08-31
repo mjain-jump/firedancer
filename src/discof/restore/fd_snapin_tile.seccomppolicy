@@ -5,7 +5,7 @@
 #              tiles may need to pull accounts into the cache from disk,
 #              or purge out of cache to the disk to make forward
 #              progress.
-uint logfile_fd, uint accounts_fd, uint snapshot_fd
+uint logfile_fd, uint accounts_fd, uint snapshot_fd, uint incremental_fd
 
 # logging: all log messages are written to a file and/or pipe
 #
@@ -104,19 +104,26 @@ sync_file_range: (eq (arg 0) accounts_fd)
 # snapshot archive: the fused file-partitioned loader reads its own
 # compressed byte range of the snapshot straight off the device.
 #
-# Each snapin tile holds its own read-only fd on the archive and preads
-# from it; nothing else in the tile issues pread64.
+# Each snapin tile holds its own read-only fd on each archive -- the
+# full one, and the incremental one when incremental loading is on and a
+# local incremental exists -- and preads from whichever archive the
+# current load phase partitions.  Nothing else in the tile issues
+# pread64.  incremental_fd is (uint)-1 when no incremental was opened,
+# which matches no descriptor.
 #
 # arg 0 is the file descriptor to read from.
-pread64: (eq (arg 0) snapshot_fd)
+pread64: (or (eq (arg 0) snapshot_fd)
+             (eq (arg 0) incremental_fd))
 
 # snapshot archive: declare the tile's own byte range sequential
 #
 # Each tile announces its exclusive [lo,hi) of the archive as
 # POSIX_FADV_SEQUENTIAL once, when the range is resolved, so the kernel
 # reads ahead across it instead of treating the N interleaved streams as
-# random access.
+# random access.  Once per archive, so twice across a full plus
+# incremental load.
 #
 # arg 0 is the file descriptor and arg 3 the advice.
-fadvise64: (and (eq (arg 0) snapshot_fd)
+fadvise64: (and (or (eq (arg 0) snapshot_fd)
+                    (eq (arg 0) incremental_fd))
                 (eq (arg 3) "POSIX_FADV_SEQUENTIAL"))
