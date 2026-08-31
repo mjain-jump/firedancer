@@ -546,7 +546,11 @@ fd_topo_print_log( int         stdout,
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     fd_topo_tile_t * tile = &topo->tiles[ i ];
 
-    char in[ 256 ] = {0};
+    /* Large enough for FD_TOPO_MAX_TILE_IN_LINKS entries: snapct reads
+       one ack link per snapshot loader tile, so with a wide fused
+       snapshot loader this list runs to dozens of entries and 256 bytes
+       aborted the boot from inside the topology printer. */
+    char in[ 1024 ] = {0};
     char * cur_in = in;
     ulong remaining_in = sizeof( in ) - 1;
 
