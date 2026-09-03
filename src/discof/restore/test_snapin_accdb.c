@@ -32,7 +32,6 @@ typedef struct {
   fd_snapio_snoop_hdr_t *  snoop;
   fd_snapin_tile_t *       worker;
   void *                   join_mem [ TEST_WORKER_MAX ];
-  uchar *                  write_buf[ TEST_WORKER_MAX ];
   fd_accdb_fork_id_t       root;
 } test_env_t;
 
@@ -159,9 +158,7 @@ test_env_init( test_env_t * env,
     ctx->whead.attempt_partitions    = ctx->my_snoop->fail_partitions;
     ctx->whead.attempt_partition_max = FD_SNAPIO_FAIL_PARTITION_MAX;
 
-    env->write_buf[ i ] = aligned_alloc( 4096UL, FD_SNAPIN_WRITE_BUF_SZ );
-    FD_TEST( env->write_buf[ i ] );
-    writer_init( &ctx->writer, FD_ACCDB_FD_RW, env->write_buf[ i ] );
+    writer_init( &ctx->writer, FD_ACCDB_FD_RW );
   }
 
   env->root = fd_accdb_attach_child( env->worker[ 0 ].accdb, (fd_accdb_fork_id_t){ .val = USHORT_MAX } );
@@ -297,7 +294,6 @@ test_env_fini( test_env_t *          env,
   for( ulong i=0UL; i<TEST_ACCOUNT_CNT; i++ ) read_account( env, &accounts[ i ] );
 
   for( ulong i=0UL; i<env->worker_cnt; i++ ) {
-    free( env->write_buf[ i ] );
     free( env->join_mem[ i ] );
   }
   free( env->worker );
