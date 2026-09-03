@@ -169,7 +169,7 @@ test_stem_publish( fd_stem_context_t * stem,
 
 #include <stdlib.h>
 
-static uchar test_writer_buf[ FD_SNAPIN_WRITE_BUF_SZ ] __attribute__((aligned(4096)));
+static snapin_writer_t test_writer[1];
 
 /* Mocks ***************************************************************/
 
@@ -316,7 +316,6 @@ typedef struct {
   ulong                   tile_cnt;
   ulong                   lane_cnt;
   uchar *                 in_mem;    /* tile_cnt*lane_cnt frag buffers */
-  uchar *                 write_buf; /* tile_cnt staging buffers */
   fd_stake_delegations_t * stake_delegations;
   fd_bank_t *              bank;
   fd_snapin_tile_t        ctx[ TEST_TILE_MAX ];
@@ -369,9 +368,6 @@ test_cluster_new( ulong tile_cnt,
   FD_TEST( cl->in_mem );
   fd_memset( cl->in_mem, 0, tile_cnt*lane_cnt*TEST_FRAG_SZ );
 
-  cl->write_buf = aligned_alloc( 4096UL, tile_cnt*FD_SNAPIN_WRITE_BUF_SZ );
-  FD_TEST( cl->write_buf );
-
   /* log_snoop_checksums walks the root stake delegation pool; a zeroed
      struct (pool_idx_wmk_==0) is an empty pool. */
   cl->stake_delegations = aligned_alloc( 128UL, fd_ulong_align_up( sizeof(fd_stake_delegations_t), 128UL ) );
@@ -396,7 +392,7 @@ test_cluster_new( ulong tile_cnt,
     ctx->stripe_locks = fd_snapio_snoop_stripes( cl->hdr );
     ctx->my_snoop     = fd_snapio_snoop_worker( cl->hdr, t );
     if( FD_UNLIKELY( !t ) ) {
-      for( ulong w=0UL; w<tile_cnt; w++ ) ctx->snoops[ w ] = fd_snapio_snoop_worker( cl->hdr, w );
+      for( ulong w=0UL; w<tile_cnt; w++ ) ctx->lead.snoops[ w ] = fd_snapio_snoop_worker( cl->hdr, w );
     }
 
     ctx->whead.attempt_partitions    = ctx->my_snoop->fail_partitions;
@@ -404,16 +400,16 @@ test_cluster_new( ulong tile_cnt,
     ctx->whead.attempt_partition_max = FD_SNAPIO_FAIL_PARTITION_MAX;
 
     ctx->stake_delegations = cl->stake_delegations;
-    writer_init( &ctx->writer, FD_ACCDB_FD_RW, cl->write_buf+t*FD_SNAPIN_WRITE_BUF_SZ );
+    writer_init( &ctx->writer, FD_ACCDB_FD_RW );
 
-    ctx->ct_out.idx       = 1UL+t;
-    ctx->manifest_out.idx = ULONG_MAX;
-    ctx->gui_out.idx      = ULONG_MAX;
+    ctx->ct_out.idx            = 1UL+t;
+    ctx->lead.manifest_out.idx = ULONG_MAX;
+    ctx->lead.gui_out.idx      = ULONG_MAX;
     if( FD_UNLIKELY( !t ) ) {
-      ctx->manifest_out.idx = 0UL;
-      ctx->bank             = cl->bank;
-      ctx->slot_delta_parser = fd_slot_delta_parser_join( fd_slot_delta_parser_new( cl->sd_mem ) );
-      FD_TEST( ctx->slot_delta_parser );
+      ctx->lead.manifest_out.idx  = 0UL;
+      ctx->lead.bank              = cl->bank;
+      ctx->lead.slot_delta_parser = fd_slot_delta_parser_join( fd_slot_delta_parser_new( cl->sd_mem ) );
+      FD_TEST( ctx->lead.slot_delta_parser );
     }
 
     for( ulong lane=0UL; lane<lane_cnt; lane++ ) {
@@ -427,9 +423,9 @@ test_cluster_new( ulong tile_cnt,
       msg->slot = 440123518UL;
     }
 
-    ctx->accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-    ctx->accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-    ctx->boot_timestamp     = fd_log_wallclock();
+    ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    ctx->lead.boot_timestamp      = fd_log_wallclock();
 
     worker_reset_attempt( ctx );
   }
@@ -441,7 +437,6 @@ static void
 test_cluster_delete( test_cluster_t * cl ) {
   free( cl->bank );
   free( cl->stake_delegations );
-  free( cl->write_buf );
   free( cl->in_mem );
   free( cl->sd_mem );
   free( cl->hdr_mem );
@@ -570,21 +565,16 @@ test_stamp_slot_history( test_cluster_t * cl,
   hdr->slot_history.data_len   = FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ;
   fd_memcpy( hdr->slot_history.owner, fd_sysvar_owner_id.uc, 32UL );
 
-  cl->ctx[ 0 ].bank_slot = bank_slot;
+  cl->ctx[ 0 ].lead.bank_slot = bank_slot;
 }
 
 /* Regression: scratch_align() must cover the largest FD_LAYOUT_APPEND
-   alignment in scratch_footprint (the 4096-aligned write buffer).  The
-   footprint is computed from a zero base, so if the topology placed the
-   tile object at a smaller alignment the runtime layout could consume
-   up to align-scratch_align more bytes than the footprint and overflow
-   into the next workspace object. */
+   alignment in scratch_footprint. */
 
 static void
 test_scratch_layout_fits( void ) {
   FD_TEST( scratch_align()>=alignof(fd_snapin_tile_t) );
   FD_TEST( scratch_align()>=fd_accdb_align() );
-  FD_TEST( scratch_align()>=4096UL ); /* write buffer */
 
   fd_topo_tile_t tile[1];
   memset( tile, 0, sizeof(fd_topo_tile_t) );
@@ -606,7 +596,6 @@ test_scratch_layout_fits( void ) {
       FD_SCRATCH_ALLOC_APPEND( l, alignof(blockhash_group_t),    sizeof(blockhash_group_t)*FD_SNAPIN_MAX_SLOT_DELTA_GROUPS   );
       FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_sstxncache_hash_t), sizeof(fd_sstxncache_hash_t)*FD_SNAPIN_TXNCACHE_MAX_ENTRIES );
     }
-    FD_SCRATCH_ALLOC_APPEND( l, 4096UL, FD_SNAPIN_WRITE_BUF_SZ );
     ulong end = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
     FD_TEST( end<=footprint );
   }
@@ -712,7 +701,7 @@ test_init_aborted_barrier_retries( void ) {
   FD_TEST( before_frag( t0, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR )==0 );
   tile_send_control( t0, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR );
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_ERROR );
-  FD_TEST( !t0->init_completed );
+  FD_TEST( !t0->lead.init_completed );
   FD_TEST( !cl->hdr->attempt.generation );  /* slot never published */
   FD_TEST( !test_accdb_writer_begin_cnt );
 
@@ -739,7 +728,7 @@ test_init_aborted_barrier_retries( void ) {
   /* Tile 0's INIT never ran, so there is nothing to roll back -- and in
      particular the root fork id must not have been wiped on the stale
      `full` flag. */
-  FD_TEST( !t0->rollback.pending );
+  FD_TEST( !t0->lead.rollback.pending );
 
   /* Retry: generation 2 is published and the load completes. */
   test_counters_reset();
@@ -936,8 +925,8 @@ test_retry_resets( void ) {
     FD_TEST( ctx->incr_fork==ULONG_MAX );
     FD_TEST( ctx->my_snoop->fail_partition_cnt==2UL+t ); /* published for the rollback */
   }
-  FD_TEST( cl->ctx[ 0 ].rollback.pending );
-  FD_TEST( cl->ctx[ 0 ].rollback.full );
+  FD_TEST( cl->ctx[ 0 ].lead.rollback.pending );
+  FD_TEST( cl->ctx[ 0 ].lead.rollback.full );
   /* The claim counter is deliberately NOT reset by FAIL: only tile 0's
      next INIT re-zeroes it. */
   FD_TEST( cl->hdr->next_appendvec==mid_claims );
@@ -947,11 +936,11 @@ test_retry_resets( void ) {
   test_stream_init( T );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
-  FD_TEST( !cl->ctx[ 0 ].rollback.pending );
+  FD_TEST( !cl->ctx[ 0 ].lead.rollback.pending );
   FD_TEST( test_accdb_reset_cnt==1UL );      /* full retry wipes the fork wholesale */
   FD_TEST( !test_accdb_purge_cnt );          /* ... so no incremental purge */
   FD_TEST( !test_accdb_release_cnt );        /* ... and no partition release */
-  FD_TEST( !cl->ctx[ 0 ].doomed_partition_cnt );
+  FD_TEST( !cl->ctx[ 0 ].lead.doomed_partition_cnt );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].my_snoop->fail_partition_cnt ); /* gathered and cleared */
 
   FD_TEST( cl->hdr->next_appendvec==1UL );   /* claim sequence restarted at 0 */
@@ -1156,23 +1145,23 @@ test_accumulator_fold( void ) {
      input - ignored - replaced; the manifest value it is checked
      against is what process_manifest would have parsed. */
   test_stamp_slot_history( cl, bank_slot );
-  cl->ctx[ 0 ].manifest_capitalization = exp_input-exp_ign_l-exp_repl_l;
+  cl->ctx[ 0 ].lead.manifest_capitalization = exp_input-exp_ign_l-exp_repl_l;
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
 
   fd_snapin_tile_t * t0 = &cl->ctx[ 0 ];
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_IDLE );
-  FD_TEST( t0->attempt_folded );
+  FD_TEST( t0->lead.attempt_folded );
   /* The cross-tile fold lands in tile 0's diagnostic totals, NOT in its
      gauge: the gauges stay per-tile so the dashboards' sum is exact. */
-  FD_TEST( t0->totals_fold.accounts_loaded  ==exp_loaded   );
-  FD_TEST( t0->totals_fold.accounts_replaced==exp_replaced );
-  FD_TEST( t0->totals_fold.accounts_ignored ==exp_ignored  );
-  FD_TEST( t0->dup_capitalization       ==exp_repl_l   );
-  FD_TEST( t0->capitalization           ==exp_input-exp_ign_l-exp_repl_l );
-  FD_TEST( !t0->worker_fold.eq_slot_dups && !t0->worker_fold.eq_slot_lamports_diff );
+  FD_TEST( t0->lead.totals_fold.accounts_loaded  ==exp_loaded   );
+  FD_TEST( t0->lead.totals_fold.accounts_replaced==exp_replaced );
+  FD_TEST( t0->lead.totals_fold.accounts_ignored ==exp_ignored  );
+  FD_TEST( t0->lead.dup_capitalization       ==exp_repl_l   );
+  FD_TEST( t0->lead.capitalization           ==exp_input-exp_ign_l-exp_repl_l );
+  FD_TEST( !t0->lead.worker_fold.eq_slot_dups && !t0->lead.worker_fold.eq_slot_lamports_diff );
   /* The full snapshot's totals are saved for the incremental revert. */
-  FD_TEST( t0->recovery.capitalization    ==t0->capitalization );
+  FD_TEST( t0->lead.recovery.capitalization==t0->lead.capitalization );
   /* Every tile latched its own share, and the cross-tile sum is
      unchanged by the barrier -- that is the continuity the GUI and the
      snapshot-load watch depend on. */
@@ -1183,8 +1172,8 @@ test_accumulator_fold( void ) {
     gauge_sum += cl->ctx[ t ].metrics.accounts_loaded;
   }
   FD_TEST( gauge_sum==77UL*n );
-  FD_TEST( t0->slot_history.captured );
-  FD_TEST( t0->slot_history.data_len==FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ );
+  FD_TEST( t0->lead.slot_history.captured );
+  FD_TEST( t0->lead.slot_history.data_len==FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ );
 
   test_cluster_delete( cl );
 }
@@ -1225,10 +1214,10 @@ test_gauge_sum_continuity( void ) {
   FD_TEST( GAUGE_SUM()==full_share*n );   /* was ~0 before: every tile zeroed here */
 
   test_stamp_slot_history( cl, bank_slot );
-  cl->ctx[ 0 ].manifest_capitalization = 0UL;
+  cl->ctx[ 0 ].lead.manifest_capitalization = 0UL;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
   FD_TEST( GAUGE_SUM()==full_share*n );   /* was full_share*n + the fold: double counted */
-  FD_TEST( cl->ctx[ 0 ].totals_fold.accounts_loaded==full_share*n );
+  FD_TEST( cl->ctx[ 0 ].lead.totals_fold.accounts_loaded==full_share*n );
 
   /* --- Incremental that fails ------------------------------------ */
   test_counters_reset();
@@ -1259,11 +1248,11 @@ test_gauge_sum_continuity( void ) {
   FD_TEST( GAUGE_SUM()==(full_share+incr_share)*n );
 
   test_stamp_slot_history( cl, bank_slot );
-  cl->ctx[ 0 ].manifest_capitalization = cl->ctx[ 0 ].recovery.capitalization;
+  cl->ctx[ 0 ].lead.manifest_capitalization = cl->ctx[ 0 ].lead.recovery.capitalization;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_DONE );
   FD_TEST( GAUGE_SUM()==(full_share+incr_share)*n );
   /* Tile 0's diagnostic total accumulates over the session. */
-  FD_TEST( cl->ctx[ 0 ].totals_fold.accounts_loaded==(full_share+incr_share)*n );
+  FD_TEST( cl->ctx[ 0 ].lead.totals_fold.accounts_loaded==(full_share+incr_share)*n );
 
 # undef GAUGE_SUM
 
@@ -1306,7 +1295,7 @@ test_full_lifecycle_9_tiles( void ) {
   test_stamp_slot_history( cl, bank_slot );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].state==FD_SNAPSHOT_STATE_IDLE );
-  FD_TEST( !cl->ctx[ 0 ].init_completed );
+  FD_TEST( !cl->ctx[ 0 ].lead.init_completed );
 
   /* --- Incremental attempt that fails --------------------------- */
   test_counters_reset();
@@ -1328,9 +1317,9 @@ test_full_lifecycle_9_tiles( void ) {
     exp_release += 1UL+t;
   }
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
-  FD_TEST( cl->ctx[ 0 ].rollback.pending );
-  FD_TEST( !cl->ctx[ 0 ].rollback.full );
-  FD_TEST( cl->ctx[ 0 ].accdb_incr_fork_id.val==USHORT_MAX );
+  FD_TEST( cl->ctx[ 0 ].lead.rollback.pending );
+  FD_TEST( !cl->ctx[ 0 ].lead.rollback.full );
+  FD_TEST( cl->ctx[ 0 ].lead.accdb_incr_fork_id.val==USHORT_MAX );
 
   /* --- Incremental retry ---------------------------------------- */
   test_counters_reset();
@@ -1339,7 +1328,7 @@ test_full_lifecycle_9_tiles( void ) {
   FD_TEST( test_accdb_purge_cnt==1UL );                    /* failed fork purged */
   FD_TEST( test_accdb_release_cnt==1UL );                  /* its partitions released */
   FD_TEST( test_accdb_release_total==exp_release );
-  FD_TEST( !cl->ctx[ 0 ].doomed_partition_cnt );
+  FD_TEST( !cl->ctx[ 0 ].lead.doomed_partition_cnt );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].my_snoop->fail_partition_cnt );
   FD_TEST( cl->hdr->next_appendvec==1UL );
 
@@ -1352,7 +1341,7 @@ test_full_lifecycle_9_tiles( void ) {
      snapshot's saved total; nothing was inserted here, so it is
      unchanged. */
   test_stamp_slot_history( cl, bank_slot );
-  cl->ctx[ 0 ].manifest_capitalization = cl->ctx[ 0 ].recovery.capitalization;
+  cl->ctx[ 0 ].lead.manifest_capitalization = cl->ctx[ 0 ].lead.recovery.capitalization;
 
   ulong pub0 = test_pub_cnt;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_DONE );
@@ -1361,8 +1350,8 @@ test_full_lifecycle_9_tiles( void ) {
   FD_TEST( test_accdb_advance_root_cnt==1UL );
   FD_TEST( test_accdb_load_end_cnt==1UL );
   FD_TEST( test_feature_finalize_cnt==1UL );
-  FD_TEST( cl->ctx[ 0 ].accdb_root_fork_id.val==7U );
-  FD_TEST( cl->ctx[ 0 ].accdb_incr_fork_id.val==USHORT_MAX );
+  FD_TEST( cl->ctx[ 0 ].lead.accdb_root_fork_id.val==7U );
+  FD_TEST( cl->ctx[ 0 ].lead.accdb_incr_fork_id.val==USHORT_MAX );
   /* n DONE acks plus tile 0's replay notification on snapin_manif. */
   FD_TEST( test_pub_cnt==pub0+n+1UL );
   ulong manif_pubs = 0UL;
@@ -1381,14 +1370,14 @@ test_full_lifecycle_9_tiles( void ) {
 static void
 test_writer_short_write_and_eintr( void ) {
   uchar data[ 5UL ] = { 1, 2, 3, 4, 5 };
-  snapin_writer_t writer[ 1 ];
+  snapin_writer_t * writer = test_writer;
 
   test_io_reset();
   test_pwrite_push( -1L, EINTR );
   test_pwrite_push(  2L, 0     );
   test_pwrite_push(  3L, 0     );
 
-  writer_init( writer, FD_ACCDB_FD_RW, test_writer_buf );
+  writer_init( writer, FD_ACCDB_FD_RW );
   writer_begin( writer );
   FD_TEST( !buffer_write( writer, 10UL, data, sizeof(data) ) );
   FD_TEST( !writer_end( writer ) );
@@ -1400,10 +1389,10 @@ test_writer_short_write_and_eintr( void ) {
 static void
 test_writer_errors( void ) {
   uchar data[ 4UL ] = {0};
-  snapin_writer_t writer[ 1 ];
+  snapin_writer_t * writer = test_writer;
 
   test_io_reset();
-  writer_init( writer, FD_ACCDB_FD_RW, test_writer_buf );
+  writer_init( writer, FD_ACCDB_FD_RW );
   writer_begin( writer );
   test_pwrite_push( -1L, ENOSPC );
   FD_TEST( !buffer_write( writer, 0UL, data, sizeof(data) ) );
@@ -1412,7 +1401,7 @@ test_writer_errors( void ) {
   FD_TEST( !writer->buf_used );
 
   test_io_reset();
-  writer_init( writer, FD_ACCDB_FD_RW, test_writer_buf );
+  writer_init( writer, FD_ACCDB_FD_RW );
   writer_begin( writer );
   test_pwrite_push(  2L, 0   );
   test_pwrite_push( -1L, EIO );
