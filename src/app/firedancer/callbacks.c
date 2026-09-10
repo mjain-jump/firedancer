@@ -280,7 +280,7 @@ snapin_shared_new_cb( fd_topo_t const *     topo,
 }
 
 fd_topo_obj_callbacks_t fd_obj_cb_snapin_shared = {
-  .name      = "snapin_shared",
+  .name      = "snapin_shrd",
   .footprint = snapin_shared_footprint_cb,
   .align     = snapin_shared_align_cb,
   .new       = snapin_shared_new_cb,

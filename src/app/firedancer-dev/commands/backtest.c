@@ -405,7 +405,7 @@ backtest_topo( config_t * config ) {
        snapwr tile: the single snapin tile is the only worker, so
        worker_cnt is 1. */
     fd_topob_wksp( topo, "snapin_shared" );
-    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shared", "snapin_shared" );
+    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
     FD_TEST( fd_pod_insertf_ulong( topo->props, 1UL, "obj.%lu.worker_cnt", shared_obj->id ) );
     FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
     fd_topob_tile_uses( topo, snapin_tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );

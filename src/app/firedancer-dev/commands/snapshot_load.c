@@ -173,7 +173,7 @@ snapshot_load_topo( config_t * config ) {
   /* Shared snapshot attempt state, striped accdb chain locks, and
      per-tile failure staging for the parallel snapshot loader. */
   fd_topob_wksp( topo, "snapin_shared" );
-  fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shared", "snapin_shared" );
+  fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
   FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
   FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
 
