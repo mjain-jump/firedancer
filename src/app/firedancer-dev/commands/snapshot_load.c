@@ -159,10 +159,7 @@ snapshot_load_topo( config_t * config ) {
   ulong snapdc_tile_cnt = config->firedancer.layout.snapdc_tile_count;
   FOR(snapdc_tile_cnt) fd_topob_tile( topo, "snapdc", "snapdc", "metric_in", ULONG_MAX, 0, 0, 0, 0 )->allow_shutdown = 1;
 
-  /* "snapin": symmetric fused parse+insert+write snapshot loader
-     tiles.  There is no snapwr tile in this topology: every snapin
-     tile writes its owned account records to the accounts database
-     file itself, into its own exclusive partitions. */
+  /* Parallel snapshot loader tiles. */
   fd_topob_wksp( topo, "snapin" );
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
   FOR(snapin_tile_cnt) {
@@ -170,8 +167,7 @@ snapshot_load_topo( config_t * config ) {
     tile->allow_shutdown = 1;
   }
 
-  /* Shared snapshot attempt state, striped accdb chain locks, and
-     per-tile failure staging for the parallel snapshot loader. */
+  /* Shared loader state. */
   fd_topob_wksp( topo, "snapin_shared" );
   fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
   FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
@@ -190,16 +186,9 @@ snapshot_load_topo( config_t * config ) {
 
   fd_topob_wksp( topo, "snapin_ct"    );
 
-  /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH when
-     more than one loader tile is attached.  A tile's fseq is its scan
-     position, so lane depth is the runway that lets the other tiles
-     keep going through one tile's write stall instead of convoying
-     behind it.  1024 frags is ~64 MiB per lane. */
-  ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
-
   fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
   fd_topob_link( topo, "snapld_dc",    "snapld_dc",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
-  FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", snapdc_in_depth, FD_SNAPSHOT_DATA_MTU, 1UL );
+  FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in", "snapdc_in", FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU, 1UL );
   fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL )->permit_no_consumers = 1;
   fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;
 
@@ -213,9 +202,7 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_tile_out( topo, "snapld",  0UL,              "snapld_dc",    0UL                                       );
   FOR(snapdc_tile_cnt) fd_topob_tile_in ( topo, "snapdc", i,   "metric_in", "snapld_dc", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   FOR(snapdc_tile_cnt) fd_topob_tile_out( topo, "snapdc", i,               "snapdc_in", i                                         );
-  /* Every snapin tile is a full reliable consumer of every snapdc
-     lane: it walks the whole tar stream itself and parses only the
-     appendvecs it owns. */
+  /* Every snapin tile scans every snapdc lane. */
   for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
     FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_out( topo, "snapin", t, "snapin_ct", t );
@@ -229,10 +216,7 @@ snapshot_load_topo( config_t * config ) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     fd_topob_tile_uses( topo, tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     fd_topob_tile_uses( topo, tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
-    /* Every snapin tile updates the bank's root stake delegations
-       directly from its accdb snoop callback (the struct serializes
-       mutators on its own write lock), so every one of them joins the
-       banks object, not just tile 0. */
+    /* Every snapin tile may update root stake delegations. */
     fd_topob_tile_uses( topo, tile, banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     tile->snapin.accdb_obj_id    = accdb_obj->id;
     tile->snapin.txncache_obj_id = txncache_obj->id;

@@ -593,10 +593,6 @@ fd_ssparse_batch_enable( fd_ssparse_t * ssparse,
 
 void
 fd_ssparse_appendvec_parse( fd_ssparse_t * ssparse ) {
-  /* Only valid immediately after an FD_SSPARSE_ADVANCE_APPENDVEC
-     result: the tar header has been parsed, slot/acc_vec_bytes are
-     set, the account cursor was zeroed, and no body bytes have been
-     consumed yet. */
   FD_TEST( ssparse->state==FD_SSPARSE_STATE_SCROLL_ACCOUNT_GARBAGE );
   FD_TEST( !ssparse->tar.file_bytes_consumed                    );
   ssparse->state = FD_SSPARSE_STATE_ACCOUNT_HEADER;

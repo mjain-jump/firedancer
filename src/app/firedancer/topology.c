@@ -454,16 +454,9 @@ fd_topo_initialize( config_t * config ) {
   if( FD_LIKELY( snapshots_enabled ) ) {
     /* TODO: Revisit the depths of all the snapshot links */
 
-    /* snapdc_in is deeper than the default FD_SNAPSHOT_DATA_DEPTH when
-       more than one snapin tile is attached.  A tile's fseq is its
-       scan position, so this depth is the runway that lets the other
-       tiles keep going through one tile's write stall instead of
-       convoying behind it.  1024 frags is ~64 MiB per lane. */
-    ulong snapdc_in_depth = fd_ulong_if( snapin_tile_cnt>1UL, 1024UL, FD_SNAPSHOT_DATA_DEPTH );
-
     /**/                 fd_topob_link( topo, "snapct_ld",     "snapct_ld",     128UL,                                    sizeof(fd_ssctrl_init_t),      1UL );
     /**/                 fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
-    FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in",     "snapdc_in",     snapdc_in_depth,                          FD_SNAPSHOT_DATA_MTU,          1UL );
+    FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in",     "snapdc_in",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
 
     /**/                 fd_topob_link( topo, "snapin_manif",  "snapin_manif",  4UL,                                      sizeof(fd_snapshot_manifest_t),1UL ); /* only 3 frags ever traverse: FULL, INCREMENTAL, DONE */
     /**/                 fd_topob_link( topo, "snapct_repr",   "snapct_repr",   128UL,                                    0UL,                           1UL )->permit_no_consumers = 1; /* TODO: wire in repair later */
