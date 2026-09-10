@@ -1657,13 +1657,6 @@ fd_gui_run_boot_progress( fd_gui_t * gui, long now ) {
       ulong _insert_accounts_baseline      = fd_ulong_if( snapshot_idx==FD_GUI_BOOT_PROGRESS_FULL_SNAPSHOT_IDX, 0UL, gui->summary.boot_progress.loading_snapshot[ FD_GUI_BOOT_PROGRESS_FULL_SNAPSHOT_IDX ].insert_accounts_current );
       ulong _insert_accounts               = fd_ulong_sat_sub( _insert_accounts_total, _insert_accounts_baseline );
 
-      /* Keep the legacy snapwr fields, but report real file writes. */
-      ulong _snapwr_in_bytes       = _insert_bytes;
-      ulong _snapwr_accounts_total = _insert_accounts_total;
-
-      ulong _snapwr_accounts_baseline      = fd_ulong_if( snapshot_idx==FD_GUI_BOOT_PROGRESS_FULL_SNAPSHOT_IDX, 0UL, gui->summary.boot_progress.loading_snapshot[ FD_GUI_BOOT_PROGRESS_FULL_SNAPSHOT_IDX ].snapwr_accounts_current );
-      ulong _snapwr_accounts               = fd_ulong_sat_sub( _snapwr_accounts_total, _snapwr_accounts_baseline );
-
       ulong _snapwr_out_baseline           = gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_out_baseline;
       ulong _snapwr_out_bytes              = fd_ulong_sat_sub( _snapwr_out_total, _snapwr_out_baseline );
 
@@ -1682,10 +1675,10 @@ fd_gui_run_boot_progress( fd_gui_t * gui, long now ) {
       gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].insert_bytes_decompressed = _insert_bytes;
       gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].insert_accounts_current   = _insert_accounts;
 
-      /* snapwr (snapshot write) stage */
-      gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_in_bytes_decompressed  = _snapwr_in_bytes;
+      /* Legacy snapwr fields remain for API compatibility. */
+      gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_in_bytes_decompressed  = 0UL;
       gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_out_bytes_decompressed = _snapwr_out_bytes;
-      gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_accounts_current       = _snapwr_accounts;
+      gui->summary.boot_progress.loading_snapshot[ snapshot_idx ].snapwr_accounts_current       = 0UL;
 
       break;
     }

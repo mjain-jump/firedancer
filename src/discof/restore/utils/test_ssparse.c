@@ -706,10 +706,8 @@ FD_UNIT_TEST( test_parse_name_edge_cases ) {
 
 FD_UNIT_TEST( test_appendvec_passthrough ) {
   /* In passthrough mode the parser must deliver exactly one
-     ADVANCE_APPENDVEC per accounts/ entry (with slot and tar size), one
-     ADVANCE_REGION per version/manifest/status_cache entry, and never
-     any ACCOUNT_* results.  The stream must still be byte-exact
-     consumed through DONE. */
+     ADVANCE_APPENDVEC per accounts/ entry and no ACCOUNT_* results.
+     The stream must still be byte-exact consumed through DONE. */
   fd_ssparse_t p[1];
   uchar acc[512];
   ulong dl1 = 5UL, dl2 = 3UL;
@@ -729,10 +727,8 @@ FD_UNIT_TEST( test_appendvec_passthrough ) {
   off = append_tar_entry( tar_buf, sizeof(tar_buf), off, "snapshots/status_cache", (uchar const *)"\xCD",  1UL );
   off = append_eof( tar_buf, sizeof(tar_buf), off );
 
-  ulong region_cnt = 0UL;
-  ulong av_cnt     = 0UL;
+  ulong av_cnt = 0UL;
   ulong av_slots[ 4 ]; ulong av_szs[ 4 ];
-  ulong region_szs[ 4 ];
 
   fd_ssparse_init( p );
   fd_ssparse_appendvec_passthrough_enable( p, 1 );
@@ -749,10 +745,6 @@ FD_UNIT_TEST( test_appendvec_passthrough ) {
     FD_TEST( res!=FD_SSPARSE_ADVANCE_ACCOUNT_DATA   );
     FD_TEST( res!=FD_SSPARSE_ADVANCE_ACCOUNT_BATCH  );
     if( res==FD_SSPARSE_ADVANCE_DONE ) { done = 1; break; }
-    if( res==FD_SSPARSE_ADVANCE_REGION ) {
-      FD_TEST( region_cnt<4UL );
-      region_szs[ region_cnt++ ] = result->region.data_sz;
-    }
     if( res==FD_SSPARSE_ADVANCE_APPENDVEC ) {
       FD_TEST( av_cnt<4UL );
       av_slots[ av_cnt ] = result->appendvec.slot;
@@ -766,9 +758,6 @@ FD_UNIT_TEST( test_appendvec_passthrough ) {
     data_sz -= result->bytes_consumed;
   }
   FD_TEST( done );
-  FD_TEST( region_cnt==3UL );
-  FD_TEST( region_szs[0]==5UL );  /* version */
-  FD_TEST( region_szs[1]==2UL || region_szs[1]==1UL ); /* manifest */
   FD_TEST( av_cnt==2UL );
   FD_TEST( av_slots[0]==123UL && av_szs[0]==av0 );
   FD_TEST( av_slots[1]==456UL && av_szs[1]==av1 );

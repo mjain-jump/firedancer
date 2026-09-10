@@ -25,7 +25,6 @@ struct __attribute__((aligned(64))) fd_snapin_shared_totals {
   ulong replaced_lamports;
   ulong ignored_lamports;
   ulong eq_slot_dups;
-  ulong eq_slot_lamports_diff;
   ulong appendvecs_processed;
 };
 

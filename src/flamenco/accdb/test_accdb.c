@@ -1768,7 +1768,7 @@ test_snapshot_striped_writers( void ) {
 
     ulong tot_loaded=0UL, tot_replaced=0UL, tot_ignored=0UL;
     ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL;
-    ulong tot_eq=0UL, tot_eq_diff=0UL;
+    ulong tot_eq=0UL;
     ulong all_cnt=0UL;
     static ulong all_allocs[ 2UL*PAR_THREADS*PAR_KEYS ][ 2 ];
     for( ulong t=0UL; t<PAR_THREADS; t++ ) {
@@ -1779,7 +1779,6 @@ test_snapshot_striped_writers( void ) {
       tot_repl_l   += ctxs[ t ].replaced_lamports;
       tot_ign_l    += ctxs[ t ].ignored_lamports;
       tot_eq       += ctxs[ t ].m->eq_slot_dups;
-      tot_eq_diff  += ctxs[ t ].m->eq_slot_lamports_diff;
       for( ulong j=0UL; j<ctxs[ t ].alloc_cnt; j++ ) {
         all_allocs[ all_cnt ][ 0 ] = ctxs[ t ].alloc_offs[ j ];
         all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].alloc_szs [ j ];
@@ -1812,7 +1811,7 @@ test_snapshot_striped_writers( void ) {
       /* Distinct slots: winner is the highest slot's version. */
       FD_TEST( tot_loaded==PAR_KEYS );
       FD_TEST( tot_replaced+tot_ignored==PAR_KEYS*(PAR_THREADS-1UL) );
-      FD_TEST( !tot_eq && !tot_eq_diff );
+      FD_TEST( !tot_eq );
       for( ulong k=0UL; k<PAR_KEYS; k++ ) {
         fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
         FD_TEST( (ulong)acc->cache_idx==100UL+PAR_THREADS-1UL );
@@ -1826,7 +1825,6 @@ test_snapshot_striped_writers( void ) {
       FD_TEST( tot_replaced==PAR_KEYS*PAR_THREADS );
       FD_TEST( !tot_ignored );
       FD_TEST( tot_eq      ==PAR_KEYS*(PAR_THREADS-1UL) );
-      FD_TEST( tot_eq_diff ==PAR_KEYS*(PAR_THREADS-1UL) ); /* per-thread lamports always differ */
       FD_TEST( all_cnt     ==PAR_KEYS*PAR_THREADS );
       for( ulong k=0UL; k<PAR_KEYS; k++ ) {
         fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
@@ -2604,7 +2602,7 @@ test_equal_slot_last_arrival( void ) {
                                                   NULL, NULL ) );
   FD_TEST( !ignored && replaced==1UL && !loaded );
   FD_TEST( file_offsets[ 0 ]!=ULONG_MAX );
-  FD_TEST( metrics.eq_slot_dups==1UL && metrics.eq_slot_lamports_diff==1UL );
+  FD_TEST( metrics.eq_slot_dups==1UL );
 
   fd_accdb_accmeta_t * winner = par_find_unique( test_shmem_mem, max_accounts, pubkey );
   FD_TEST( winner->lamports==2UL );

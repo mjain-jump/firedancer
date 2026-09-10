@@ -13,7 +13,6 @@
 #define FD_SSPARSE_ADVANCE_ACCOUNT_BATCH  ( 6)
 #define FD_SSPARSE_ADVANCE_DONE           ( 7)
 #define FD_SSPARSE_ADVANCE_APPENDVEC      ( 8)
-#define FD_SSPARSE_ADVANCE_REGION         ( 9)
 
 /* fd_ssparse_t is a solana snapshot parser.  It is designed to parse a
    snapshot in streaming fashion, chunk by chunk. */
@@ -96,22 +95,11 @@ struct fd_ssparse_advance_result {
       ulong         slot;
     } account_batch;
 
-    /* Returned once per appendvec tar entry when appendvec passthrough
-       is enabled, immediately after the 512 byte tar header has been
-       parsed.  The appendvec body is then skipped (consumed without
-       parsing). */
+    /* Returned after an appendvec header in passthrough mode. */
     struct {
       ulong slot;
       ulong data_sz; /* tar entry size in bytes */
     } appendvec;
-
-    /* Returned once per non-appendvec tar entry (version, manifest,
-       status cache) when appendvec passthrough is enabled, immediately
-       after the 512 byte tar header has been parsed.  The entry body
-       is still parsed as usual on subsequent advances. */
-    struct {
-      ulong data_sz; /* tar entry size in bytes */
-    } region;
   };
 };
 
@@ -143,25 +131,15 @@ void
 fd_ssparse_batch_enable( fd_ssparse_t * ssparse,
                          int            enabled );
 
-/* fd_ssparse_appendvec_passthrough_enable toggles appendvec
-   passthrough mode.  When enabled, ssparse delivers a single
-   FD_SSPARSE_ADVANCE_APPENDVEC result per appendvec tar entry (as soon
-   as the tar header has been parsed) and then skips the appendvec body
-   without parsing individual accounts.  Non-appendvec tar entries
-   (version, manifest, status cache) deliver FD_SSPARSE_ADVANCE_REGION
-   once at header parse time and are then parsed as usual. */
+/* In passthrough mode, return each appendvec header before its body.
+   The body is skipped unless selected with
+   fd_ssparse_appendvec_parse. */
 void
 fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
                                          int            enabled );
 
-/* fd_ssparse_appendvec_parse switches the parser from skipping to
-   parsing the current appendvec body.  Only valid immediately after
-   fd_ssparse_advance returned FD_SSPARSE_ADVANCE_APPENDVEC (with
-   passthrough enabled): instead of skipping the appendvec body, the
-   parser then delivers ACCOUNT_HEADER/ACCOUNT_DATA/ACCOUNT_BATCH
-   results for it, exactly as if passthrough were disabled for this
-   one entry.  Tar padding, next-header discovery and end-of-stream
-   detection continue via the normal state machine. */
+/* Parse the current appendvec after fd_ssparse_advance returns
+   FD_SSPARSE_ADVANCE_APPENDVEC. */
 void
 fd_ssparse_appendvec_parse( fd_ssparse_t * ssparse );
 

@@ -212,7 +212,6 @@ struct fd_snapin_lead {
   int   attempt_folded;     /* attempt data already read */
   struct {
     ulong eq_slot_dups;
-    ulong eq_slot_lamports_diff;
   } worker_fold;
 
   /* Tile 0 totals across successful attempts. */
@@ -232,14 +231,6 @@ struct fd_snapin_lead {
   /* Failed partitions waiting for purge or reset. */
   uint  doomed_partitions[ FD_SNAPIN_SHARED_PARTITION_MAX ];
   ulong doomed_partition_cnt;
-  struct {       /* appendvec sizes logged at FINI */
-    ulong cnt;
-    ulong bytes;
-    ulong max_sz;
-    ulong over_64m_cnt;
-    ulong over_256m_bytes;
-    ulong log2_hist[ 48 ];
-  } av_stats;
 
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
   ulong gui_config_acct_off;  /* bytes accumulated so far into the current gui_out link chunk */
@@ -320,7 +311,6 @@ struct fd_snapin_tile {
   ulong appendvec_seq;      /* next appendvec number */
   ulong claimed_appendvec;  /* current claim */
   ulong owned_appendvecs;   /* used claims */
-  ulong owned_bytes;
   ulong incr_fork;          /* insert fork; USHORT_MAX for full */
 
   /* Added to shared totals at FINI. */
@@ -1353,7 +1343,6 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) ctx->in[ lane ].pos = 0UL;
   ctx->appendvec_seq    = 0UL;
   ctx->owned_appendvecs = 0UL;
-  ctx->owned_bytes      = 0UL;
   ctx->incr_fork        = ULONG_MAX;
   ctx->gate_pending     = 0;
   ctx->whead.val                    = 0UL;
@@ -1630,27 +1619,14 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
       case FD_SSPARSE_ADVANCE_APPENDVEC: {
         /* Parse only this tile's claimed appendvecs. */
         ulong av_idx = ctx->appendvec_seq++;
-        if( FD_UNLIKELY( is_lead( ctx ) ) ) {
-          ulong body_sz = result->appendvec.data_sz;
-          ctx->lead.av_stats.cnt++;
-          ctx->lead.av_stats.bytes += body_sz;
-          ctx->lead.av_stats.max_sz = fd_ulong_max( ctx->lead.av_stats.max_sz, body_sz );
-          if( FD_UNLIKELY( body_sz>(64UL<<20) ) )  ctx->lead.av_stats.over_64m_cnt++;
-          if( FD_UNLIKELY( body_sz>(256UL<<20) ) ) ctx->lead.av_stats.over_256m_bytes += body_sz;
-          ctx->lead.av_stats.log2_hist[ fd_ulong_min( (ulong)fd_ulong_find_msb( fd_ulong_max( body_sz, 1UL ) ), 47UL ) ]++;
-        }
         if( FD_UNLIKELY( av_idx==ctx->claimed_appendvec ) ) {
           /* Claim the next appendvec before parsing this one. */
           ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shared->next_appendvec, 1UL );
           ctx->owned_appendvecs++;
           fd_ssparse_appendvec_parse( ctx->ssparse );
-          ctx->owned_bytes += result->appendvec.data_sz;
         }
         break;
       }
-      case FD_SSPARSE_ADVANCE_REGION:
-        /* Ignore non-appendvec headers here. */
-        break;
       case FD_SSPARSE_ADVANCE_MANIFEST:
       case FD_SSPARSE_ADVANCE_MANIFEST_DONE: {
         if( FD_LIKELY( !is_lead( ctx ) ) ) break; /* Tile 0 only. */
@@ -1832,8 +1808,7 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   ctx->lead.capitalization = fd_ulong_sat_add( ctx->lead.capitalization, totals->input_lamports   );
   ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, totals->ignored_lamports );
   ctx->lead.dup_capitalization = totals->replaced_lamports;
-  ctx->lead.worker_fold.eq_slot_dups          += totals->eq_slot_dups;
-  ctx->lead.worker_fold.eq_slot_lamports_diff += totals->eq_slot_lamports_diff;
+  ctx->lead.worker_fold.eq_slot_dups += totals->eq_slot_dups;
 
   /* Read the shared SlotHistory winner. */
   fd_snapin_shared_t const * shared = ctx->shared;
@@ -1882,29 +1857,6 @@ log_snoop_checksums( fd_snapin_tile_t * ctx ) {
   ulong sh_cs      = ctx->lead.slot_history.captured ? fd_hash( 0x5107UL, ctx->lead.slot_history.buf, ctx->lead.slot_history.data_len ) : 0UL;
   FD_LOG_NOTICE(( "snoop A/B: stake_cnt=%lu stake_cs=%016lx feature_cs=%016lx slot_history_slot=%lu slot_history_cs=%016lx",
                   stake_cnt, stake_cs, feature_cs, ctx->lead.slot_history.captured ? ctx->lead.slot_history.slot : 0UL, sh_cs ));
-}
-
-/* Log appendvec sizes that limit parallel speed. */
-
-static void
-log_appendvec_stats( fd_snapin_tile_t * ctx ) {
-  if( FD_UNLIKELY( !ctx->lead.av_stats.cnt ) ) return;
-
-  /* Use the top of each log2 bucket. */
-  ulong p50 = 0UL, p90 = 0UL;
-  ulong seen = 0UL;
-  for( ulong b=0UL; b<48UL; b++ ) {
-    seen += ctx->lead.av_stats.log2_hist[ b ];
-    if( !p50 && seen*2UL >=      ctx->lead.av_stats.cnt ) p50 = 2UL<<b;
-    if( !p90 && seen*10UL>= 9UL*ctx->lead.av_stats.cnt  ) p90 = 2UL<<b;
-  }
-  FD_LOG_NOTICE(( "appendvecs: cnt=%lu total=%.1f GiB avg=%.1f MiB p50<=%lu p90<=%lu max=%lu, >64MiB cnt=%lu, >256MiB bytes=%.1f GiB",
-                  ctx->lead.av_stats.cnt,
-                  (double)ctx->lead.av_stats.bytes/(double)(1UL<<30),
-                  (double)ctx->lead.av_stats.bytes/(double)ctx->lead.av_stats.cnt/(double)(1UL<<20),
-                  p50, p90, ctx->lead.av_stats.max_sz,
-                  ctx->lead.av_stats.over_64m_cnt,
-                  (double)ctx->lead.av_stats.over_256m_bytes/(double)(1UL<<30) ));
 }
 
 /* Roll back after every tile has sent its FAIL ack. */
@@ -1960,7 +1912,6 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   ctx->lead.manifest_capitalization = 0UL;
   ctx->lead.attempt_folded          = 0;
   fd_memset( &ctx->lead.worker_fold, 0, sizeof(ctx->lead.worker_fold) );
-  fd_memset( &ctx->lead.av_stats,    0, sizeof(ctx->lead.av_stats)    );
 
   fd_txncache_reset( ctx->lead.txncache );
   txncache_staging_reset( ctx );
@@ -2154,10 +2105,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       fd_accdb_snapshot_writer_end( ctx->accdb );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
 
-      FD_LOG_NOTICE(( "snapin %lu: owned appendvecs=%lu owned_bytes=%lu bytes_written=%lu",
-                      ctx->tile_idx, ctx->owned_appendvecs, ctx->owned_bytes, ctx->writer.bytes_written ));
-      if( FD_UNLIKELY( is_lead( ctx ) ) ) log_appendvec_stats( ctx );
-
       /* Agave accepts equal-slot duplicates. */
 
       /* Add this tile's counters before the FINI ack. */
@@ -2169,7 +2116,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,     ctx->worker.replaced_lamports              );
       FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,      ctx->worker.ignored_lamports               );
       FD_ATOMIC_FETCH_AND_ADD( &totals->eq_slot_dups,          ctx->worker_metrics->eq_slot_dups          );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->eq_slot_lamports_diff, ctx->worker_metrics->eq_slot_lamports_diff );
       FD_ATOMIC_FETCH_AND_ADD( &totals->appendvecs_processed,  ctx->owned_appendvecs                      );
       FD_COMPILER_MFENCE(); /* publish before ack */
 
@@ -2249,12 +2195,11 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       fd_feature_snoop_finalize( &ctx->lead.bank->f.features, ctx->lead.bank_slot, &ctx->lead.epoch_schedule, ctx->lead.feature_snoop );
 
-      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu (lamports-diff=%lu)",
-                      ctx->lead.worker_fold.eq_slot_dups, ctx->lead.worker_fold.eq_slot_lamports_diff ));
+      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu", ctx->lead.worker_fold.eq_slot_dups ));
       if( FD_UNLIKELY( ctx->lead.worker_fold.eq_slot_dups ) ) {
-        FD_LOG_WARNING(( "parallel loader: accepted %lu equal-slot cross-appendvec duplicates (lamports-diff=%lu); "
+        FD_LOG_WARNING(( "parallel loader: accepted %lu equal-slot cross-appendvec duplicates; "
                          "stripe-lock arrival order picked the winner",
-                         ctx->lead.worker_fold.eq_slot_dups, ctx->lead.worker_fold.eq_slot_lamports_diff ));
+                         ctx->lead.worker_fold.eq_slot_dups ));
       }
       log_snoop_checksums( ctx );
 
@@ -2613,7 +2558,6 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->lead.attempt_folded = 0;
   fd_memset( &ctx->lead.worker_fold, 0, sizeof(ctx->lead.worker_fold) );
-  fd_memset( &ctx->lead.av_stats,    0, sizeof(ctx->lead.av_stats)    );
   ctx->lead.doomed_partition_cnt = 0UL;
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };

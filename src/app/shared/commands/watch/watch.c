@@ -672,9 +672,7 @@ write_snapshots( config_t const * config,
     ulong snapdc_idx = fd_topo_find_tile( &config->topo, "snapdc", i );
     snapdc_total_ticks += total_regime( &cur_tile[ snapdc_idx*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ snapdc_idx*FD_METRICS_TOTAL_SZ ] );
   }
-  /* Aggregate every snapin tile's regime ticks.  No topology has a
-     snapwr tile, so the "wr" stage is not a tile of its own: the "in"
-     and "wr" columns both describe the same N symmetric tiles. */
+  /* Aggregate every snapin tile's regime ticks. */
   ulong snapin_total_ticks = 0UL;
   for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
     ulong idx = fd_topo_find_tile( &config->topo, "snapin", i );
@@ -695,15 +693,12 @@ write_snapshots( config_t const * config,
   double snapdc_idle_pct = 100.0*(double)diff_tile( config, "snapdc", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapdc_total_ticks;
   double snapin_idle_pct = 100.0*(double)diff_tile( config, "snapin", prev_tile, cur_tile, MIDX( COUNTER, TILE, REGIME_DURATION_NANOS_CAUGHT_UP_POSTFRAG ) )/(double)snapin_total_ticks;
 
-  /* The "wr" stage repeats the snapin figures on purpose: insertion and
-     the account-file writes are the same tiles. */
-  double busy [ 5 ] = { 100.0-snapct_idle_pct-snapct_backp_pct,
+  double busy [ 4 ] = { 100.0-snapct_idle_pct-snapct_backp_pct,
                         100.0-snapld_idle_pct-snapld_backp_pct,
                         100.0-snapdc_idle_pct-snapdc_backp_pct,
-                        100.0-snapin_idle_pct-snapin_backp_pct,
                         100.0-snapin_idle_pct-snapin_backp_pct };
-  double backp[ 5 ] = { snapct_backp_pct, snapld_backp_pct, snapdc_backp_pct, snapin_backp_pct, snapin_backp_pct };
-  char const * stage[ 5 ] = { "ct", "ld", "dc", "in", "wr" };
+  double backp[ 4 ] = { snapct_backp_pct, snapld_backp_pct, snapdc_backp_pct, snapin_backp_pct };
+  char const * stage[ 4 ] = { "ct", "ld", "dc", "in" };
 
   PRINT( ROWH( "◐", BYELLOW, "snapshot    " )
          "  %s " BOLD "%5.1f" RESET U( "%%" )
@@ -718,10 +713,10 @@ write_snapshots( config_t const * config,
     megabytes_per_second,
     wr_megabytes_per_second,
     million_accounts_per_second );
-  for( ulong i=0UL; i<5UL; i++ )
+  for( ulong i=0UL; i<4UL; i++ )
     PRINT( " " U( "%s" ) " %s%3.0f" U( "%%" ) RESET, stage[ i ], sev_color( busy[ i ] ), busy[ i ] );
   PRINT( K( "backp" ) );
-  for( ulong i=0UL; i<5UL; i++ )
+  for( ulong i=0UL; i<4UL; i++ )
     PRINT( " " U( "%s" ) " %s%3.0f" U( "%%" ) RESET, stage[ i ], sev_color( backp[ i ] ), backp[ i ] );
   PRINT( CLEARLN "\n" );
 }

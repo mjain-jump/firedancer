@@ -223,14 +223,6 @@ advance_tar( fd_ssparse_t *                ssparse,
       break;
   }
 
-  if( FD_UNLIKELY( ssparse->appendvec_passthrough ) ) {
-    /* Notify the caller of the non-appendvec region so byte coverage
-       can be published before the (potentially very large) body is
-       parsed. */
-    result->region.data_sz = ssparse->tar.file_bytes;
-    return FD_SSPARSE_ADVANCE_REGION;
-  }
-
   return FD_SSPARSE_ADVANCE_AGAIN;
 }
 

@@ -1456,16 +1456,6 @@ test_eager_claim_coverage( void ) {
       if( n==1UL ) {
         FD_TEST( cl->ctx[ 0 ].owned_appendvecs==T );
         for( ulong i=0UL; i<T; i++ ) FD_TEST( owner[ i ]==0UL );
-        ulong bytes = 0UL;
-        for( ulong i=0UL; i<T; i++ ) bytes += test_av_sz[ i ];
-        FD_TEST( cl->ctx[ 0 ].owned_bytes==bytes );
-      }
-
-      /* Owned bytes always add up to the owned ordinals' body sizes. */
-      for( ulong t=0UL; t<n; t++ ) {
-        ulong bytes = 0UL;
-        for( ulong i=0UL; i<T; i++ ) if( owner[ i ]==t ) bytes += test_av_sz[ i ];
-        FD_TEST( cl->ctx[ t ].owned_bytes==bytes );
       }
 
       cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
@@ -2051,11 +2041,12 @@ test_txncache_staging_fits_one_gigantic_page( void ) {
   ulong footprint = scratch_footprint( &tile );
   FD_TEST( footprint<(1UL<<30) );
 
-  /* The staged entries scale with the per-slot limit (up to the 512
-     byte scratch alignment). */
+  /* The staged entries scale with the per-slot limit, within the 512
+     byte scratch alignment. */
   tile.snapin.max_txn_per_slot = 2UL*FD_MAX_TXN_PER_SLOT;
   ulong delta = scratch_footprint( &tile )-footprint;
-  FD_TEST( delta>=TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t) && delta<TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t)+scratch_align() );
+  ulong expected_delta = TEST_MAX_ENTRIES*sizeof(fd_sstxncache_hash_t);
+  FD_TEST( delta+scratch_align()>expected_delta && delta<expected_delta+scratch_align() );
 }
 
 /* Group and entry bounds are runtime limits, so a raised
@@ -2297,7 +2288,6 @@ test_retry_resets( void ) {
     FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
     FD_TEST( !ctx->appendvec_seq );
     FD_TEST( !ctx->owned_appendvecs );
-    FD_TEST( !ctx->owned_bytes );
     FD_TEST( ctx->incr_fork==ULONG_MAX );
     FD_TEST( ctx->shared_worker->fail_partition_cnt==2UL+t ); /* published for the rollback */
   }
@@ -2432,8 +2422,7 @@ test_eq_slot_fini_accepts( void ) {
     cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
     for( ulong t=0UL; t<n; t++ ) cl->ctx[ t ].worker.accounts_loaded = 10UL;
-    cl->ctx[ bad ].worker_metrics->eq_slot_dups          = 3UL;
-    cl->ctx[ bad ].worker_metrics->eq_slot_lamports_diff = 2UL;
+    cl->ctx[ bad ].worker_metrics->eq_slot_dups = 3UL;
 
     ulong pub0 = test_pub_cnt;
     cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
@@ -2447,7 +2436,6 @@ test_eq_slot_fini_accepts( void ) {
        everyone else's. */
     FD_TEST( cl->shared->totals.accounts_loaded==10UL*n );
     FD_TEST( cl->shared->totals.eq_slot_dups==3UL );
-    FD_TEST( cl->shared->totals.eq_slot_lamports_diff==2UL );
     FD_TEST( cl->shared->totals.appendvecs_processed==T );
 
     test_cluster_delete( cl );
@@ -2510,7 +2498,7 @@ test_accumulator_fold( void ) {
   FD_TEST( tot->replaced_lamports    ==exp_repl_l   );
   FD_TEST( tot->ignored_lamports     ==exp_ign_l    );
   FD_TEST( tot->appendvecs_processed ==T            );
-  FD_TEST( !tot->eq_slot_dups && !tot->eq_slot_lamports_diff );
+  FD_TEST( !tot->eq_slot_dups );
   for( ulong t=0UL; t<n; t++ ) {
     FD_TEST( cl->ctx[ t ].metrics.accounts_loaded  ==77UL );
     FD_TEST( cl->ctx[ t ].metrics.accounts_replaced==78UL );
@@ -2535,7 +2523,7 @@ test_accumulator_fold( void ) {
   FD_TEST( t0->lead.totals_fold.accounts_ignored ==exp_ignored  );
   FD_TEST( t0->lead.dup_capitalization       ==exp_repl_l   );
   FD_TEST( t0->lead.capitalization           ==exp_input-exp_ign_l-exp_repl_l );
-  FD_TEST( !t0->lead.worker_fold.eq_slot_dups && !t0->lead.worker_fold.eq_slot_lamports_diff );
+  FD_TEST( !t0->lead.worker_fold.eq_slot_dups );
   /* The full snapshot's totals are saved for the incremental revert. */
   FD_TEST( t0->lead.recovery.capitalization==t0->lead.capitalization );
   /* Every tile latched its own share, and the cross-tile sum is

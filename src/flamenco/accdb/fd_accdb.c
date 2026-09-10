@@ -4646,7 +4646,6 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
         } else if( FD_UNLIKELY( existing_slot==slot ) ) {
           /* Equal-slot duplicates use last-arrival-wins ordering. */
           metrics->eq_slot_dups++;
-          if( FD_UNLIKELY( candidate->lamports!=lamports[ i ] ) ) metrics->eq_slot_lamports_diff++;
           if( FD_UNLIKELY( incremental && candidate->key.generation!=gen ) ) cross_existing = candidate;
           else                                                               existing       = candidate;
         } else if( FD_UNLIKELY( incremental ) && candidate->key.generation!=gen ) {

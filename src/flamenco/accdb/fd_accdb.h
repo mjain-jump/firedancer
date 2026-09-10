@@ -571,7 +571,6 @@ struct fd_accdb_snapshot_worker_metrics {
   ulong disk_used_removed;
   ulong accounts_total_added;
   ulong eq_slot_dups;
-  ulong eq_slot_lamports_diff;
 };
 
 typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
