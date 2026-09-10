@@ -1003,7 +1003,7 @@ test_mainnet_footprint( void ) {
   ulong cache_footprint             = 32UL*(1UL<<30UL);
 
   FD_TEST( max_account_writes_per_slot==321280UL );
-  FD_TEST( sizeof(fd_accdb_txn_t)==12UL );
+  FD_TEST( sizeof(fd_accdb_txn_t)==8UL );
 
   ulong shmem_fp = fd_accdb_shmem_footprint( max_accounts, max_live_slots, max_account_writes_per_slot, partition_cnt, cache_footprint, 640UL, 1UL, 0UL );
   FD_TEST( shmem_fp );

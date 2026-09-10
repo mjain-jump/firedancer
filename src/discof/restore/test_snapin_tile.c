@@ -433,15 +433,47 @@ static void
 sync_ctx_init( fd_snapin_tile_t * ctx,
                ulong              lane_cnt,
                int                state ) {
+  static uchar snoop_mem[ sizeof(fd_snapio_snoop_hdr_t)
+                        + 2UL*4096UL
+                        + FD_SNAPIO_STRIPE_CNT*sizeof(int)
+                        + sizeof(fd_snapio_worker_t) ] __attribute__((aligned(4096)));
+  static uchar init_mem[ FD_TOPO_MAX_TILE_IN_LINKS ][ sizeof(fd_ssctrl_init_t) ] __attribute__((aligned(FD_CHUNK_ALIGN)));
+
   fd_memset( ctx, 0, sizeof(*ctx) );
-  ctx->state           = state;
-  ctx->full            = 1;
-  ctx->lane_cnt        = lane_cnt;
-  ctx->pending_control = ULONG_MAX;
-  ctx->ct_out.idx      = 0UL;
+  fd_memset( init_mem, 0, sizeof(init_mem) );
+  FD_TEST( fd_snapio_snoop_footprint( 1UL )<=sizeof(snoop_mem) );
+  ctx->snoop_hdr = fd_snapio_snoop_join( fd_snapio_snoop_new( snoop_mem, 1UL ) );
+  FD_TEST( ctx->snoop_hdr );
+
+  ctx->state        = state;
+  ctx->full         = 1;
+  ctx->tile_idx     = 0UL;
+  ctx->tile_cnt     = 1UL;
+  ctx->lane_cnt     = lane_cnt;
+  ctx->ct_out.idx   = 0UL;
+  ctx->stripe_locks = fd_snapio_snoop_stripes( ctx->snoop_hdr );
+  ctx->my_snoop     = fd_snapio_snoop_worker( ctx->snoop_hdr, 0UL );
+  ctx->lead.snoops[ 0 ] = ctx->my_snoop;
+
+  ctx->whead.attempt_partitions    = ctx->my_snoop->fail_partitions;
+  ctx->whead.attempt_partition_max = FD_SNAPIO_FAIL_PARTITION_MAX;
+  writer_init( &ctx->writer, FD_ACCDB_FD_RW );
+  worker_reset_attempt( ctx );
+  clear_control_barrier( ctx );
+
+  ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+  ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+  ctx->lead.boot_timestamp     = fd_log_wallclock();
   ctx->lead.txncache_max_groups_per_slot  = TEST_MAX_GROUPS_PER_SLOT;
   ctx->lead.txncache_max_entries_per_slot = TEST_MAX_ENTRIES_PER_SLOT;
   ctx->lead.txncache_entries_max          = TEST_MAX_ENTRIES;
+
+  for( ulong lane=0UL; lane<lane_cnt; lane++ ) {
+    ctx->in[ lane ].wksp   = (fd_wksp_t *)init_mem[ lane ];
+    ctx->in[ lane ].chunk0 = 0UL;
+    ctx->in[ lane ].wmark  = 0UL;
+    ctx->in[ lane ].mtu    = sizeof(fd_ssctrl_init_t);
+  }
 }
 
 static void
@@ -1105,6 +1137,11 @@ test_error_fail_and_retry( void ) {
   send_control( ctx, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
   FD_TEST( !test_accdb_reset_cnt );
   send_control( ctx, 2UL, FD_SNAPSHOT_MSG_CTRL_FAIL );
+  /* The final loader defers rollback until the retry's INIT setup,
+     after every FAIL ack has quiesced.  Run that lead-only setup here
+     without publishing another control ack, which keeps this test's
+     control-pipeline assertions focused on ERROR and FAIL. */
+  tile0_init_attempt( ctx, 0UL, 0UL );
   FD_TEST( test_accdb_reset_cnt==1UL );
   FD_TEST( test_pub_cnt==2UL );
   FD_TEST( test_pub_sig[1]==FD_SNAPSHOT_MSG_CTRL_FAIL );

@@ -166,7 +166,7 @@ snapshot_load_topo( config_t * config ) {
   fd_topob_wksp( topo, "snapin" );
   ulong snapin_tile_cnt = config->firedancer.layout.snapin_tile_count;
   FOR(snapin_tile_cnt) {
-    fd_topo_tile_t * tile = fd_topob_tile( topo, "snapin", "snapin", "metric_in", ULONG_MAX, 0, 0, 0 );
+    fd_topo_tile_t * tile = fd_topob_tile( topo, "snapin", "snapin", "metric_in", ULONG_MAX, 0, 0, 0, 0 );
     tile->allow_shutdown = 1;
   }
 
