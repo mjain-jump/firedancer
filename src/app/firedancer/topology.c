@@ -413,7 +413,7 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "snapld_dc"   );
     fd_topob_wksp( topo, "snapdc_in"   );
     fd_topob_wksp( topo, "snapin_ct"   );
-    fd_topob_wksp( topo, "snapio_snoop" );
+    fd_topob_wksp( topo, "snapin_shared" );
 
     if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "snapct_gui"  );
     if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "snapin_gui"  );
@@ -1250,16 +1250,16 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "genesi", 0UL ) ], accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
   if( FD_LIKELY( snapshots_enabled ) ) {
-    /* Striped accdb chain locks + per-tile snoop staging shared by the
-       parallel snapshot loader tiles. */
-    fd_topo_obj_t * snoop_obj = fd_topob_obj( topo, "snapio_snoop", "snapio_snoop" );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", snoop_obj->id ) );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, snoop_obj->id, "snapio_snoop" ) );
+    /* Shared snapshot attempt state, striped accdb chain locks, and
+       per-tile failure staging for the parallel snapshot loader tiles. */
+    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shared", "snapin_shared" );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
 
     FOR(snapin_tile_cnt) {
       fd_topo_tile_t * snapin_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
       fd_topob_tile_uses( topo, snapin_tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
-      fd_topob_tile_uses( topo, snapin_tile, snoop_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+      fd_topob_tile_uses( topo, snapin_tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     }
   }
   fd_topo_obj_t * backup_obj = NULL;
@@ -1543,7 +1543,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->snapin.accdb_obj_id = fd_pod_query_ulong( config->topo.props, "accdb", ULONG_MAX );
     tile->snapin.txncache_obj_id = fd_pod_query_ulong( config->topo.props, "txncache", ULONG_MAX );
     tile->snapin.banks_obj_id = fd_pod_query_ulong( config->topo.props, "banks", ULONG_MAX );
-    tile->snapin.snoop_obj_id = fd_pod_query_ulong( config->topo.props, "snapio_snoop", ULONG_MAX );
+    tile->snapin.shared_obj_id = fd_pod_query_ulong( config->topo.props, "snapin_shared", ULONG_MAX );
     tile->snapin.alpenglow = config->firedancer.development.alpenglow;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "repair" ) ) ) {

@@ -8,7 +8,7 @@
 #include "../../../disco/pack/fd_pack_cost.h"
 #include "../../../util/pod/fd_pod_format.h"
 #include "../../../discof/restore/utils/fd_ssctrl.h"
-#include "../../../discof/restore/utils/fd_snapin_io.h"
+#include "../../../discof/restore/utils/fd_snapin_shared.h"
 #include "../../../discof/restore/utils/fd_ssmsg.h"
 #include "../../../flamenco/runtime/fd_cost_tracker.h"
 #include "../../../flamenco/accdb/fd_accdb_private.h"
@@ -170,12 +170,12 @@ snapshot_load_topo( config_t * config ) {
     tile->allow_shutdown = 1;
   }
 
-  /* Striped accdb chain locks + per-tile snoop staging for the
-     parallel snapshot loader. */
-  fd_topob_wksp( topo, "snapio_snoop" );
-  fd_topo_obj_t * snoop_obj = fd_topob_obj( topo, "snapio_snoop", "snapio_snoop" );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", snoop_obj->id ) );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, snoop_obj->id, "snapio_snoop" ) );
+  /* Shared snapshot attempt state, striped accdb chain locks, and
+     per-tile failure staging for the parallel snapshot loader. */
+  fd_topob_wksp( topo, "snapin_shared" );
+  fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shared", "snapin_shared" );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
 
   fd_topob_wksp( topo, "diag" );
   fd_topob_tile( topo, "diag", "diag", "metric_in", ULONG_MAX, 0, 0, 0, 0 );
@@ -228,7 +228,7 @@ snapshot_load_topo( config_t * config ) {
   FOR(snapin_tile_cnt) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     fd_topob_tile_uses( topo, tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
-    fd_topob_tile_uses( topo, tile, snoop_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topob_tile_uses( topo, tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     /* Every snapin tile updates the bank's root stake delegations
        directly from its accdb snoop callback (the struct serializes
        mutators on its own write lock), so every one of them joins the
@@ -237,7 +237,7 @@ snapshot_load_topo( config_t * config ) {
     tile->snapin.accdb_obj_id    = accdb_obj->id;
     tile->snapin.txncache_obj_id = txncache_obj->id;
     tile->snapin.banks_obj_id    = banks_obj->id;
-    tile->snapin.snoop_obj_id    = snoop_obj->id;
+    tile->snapin.shared_obj_id   = shared_obj->id;
     tile->snapin.max_live_slots  = config->firedancer.runtime.max_live_slots;
   }
 

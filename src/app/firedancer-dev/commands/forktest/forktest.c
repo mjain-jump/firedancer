@@ -147,7 +147,7 @@ forktest_topo( config_t * config ) {
     fd_topob_wksp( topo, "snapct_repr"  );
 
     fd_topob_wksp( topo, "snapin_ct" );
-    fd_topob_wksp( topo, "snapio_snoop" );
+    fd_topob_wksp( topo, "snapin_shared" );
   }
 
   fd_topob_wksp( topo, "forkt" );
@@ -413,14 +413,15 @@ forktest_topo( config_t * config ) {
   FOR(execrp_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "execrp", i ) ], accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
 
   if( FD_LIKELY( snapshots_enabled ) ) {
-    /* Striped accdb chain locks + per-tile snoop staging for the
-       fused parse+insert+write snapshot loader tile.  There is no
+    /* Shared snapshot attempt state, striped accdb chain locks, and
+       per-tile failure staging for the fused parse+insert+write
+       snapshot loader tile.  There is no
        snapwr tile: the single snapin tile is the only worker, so
        worker_cnt is 1. */
-    fd_topo_obj_t * snoop_obj = fd_topob_obj( topo, "snapio_snoop", "snapio_snoop" );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, 1UL, "obj.%lu.worker_cnt", snoop_obj->id ) );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, snoop_obj->id, "snapio_snoop" ) );
-    fd_topob_tile_uses( topo, snapin_tile, snoop_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shared", "snapin_shared" );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, 1UL, "obj.%lu.worker_cnt", shared_obj->id ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
+    fd_topob_tile_uses( topo, snapin_tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
 
   fd_pod_insert_int( topo->props, "sandbox", config->development.sandbox ? 1 : 0 );
