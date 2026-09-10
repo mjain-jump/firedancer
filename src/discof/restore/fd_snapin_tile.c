@@ -2536,9 +2536,6 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].mtu    = in_link->mtu;
     ctx->in[ i ].pos    = 0UL;
   }
-  if( FD_UNLIKELY( !ctx->lane_cnt || ctx->lane_cnt>FD_SNAPIN_LANE_MAX ) ) {
-    FD_LOG_ERR(( "tile `" NAME ":%lu` has %lu snapshot data lanes, expected 1..%lu", ctx->tile_idx, ctx->lane_cnt, FD_SNAPIN_LANE_MAX ));
-  }
 
   worker_reset_attempt( ctx );
 

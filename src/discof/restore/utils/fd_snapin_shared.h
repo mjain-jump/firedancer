@@ -3,11 +3,8 @@
 
 /* Shared coordination state for parallel snapshot loaders. */
 
-#include "fd_ssctrl.h"
 #include "../../../flamenco/features/fd_feature_snoop.h"
 #include "../../../flamenco/runtime/sysvar/fd_sysvar_base.h"
-
-#define FD_SNAPIN_LANE_MAX (16UL)
 
 /* 4096 stripes kept lock contention below 0.4% with 8 workers. */
 #define FD_SNAPIN_SHARED_STRIPE_CNT (1UL<<12)

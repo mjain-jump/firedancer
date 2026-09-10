@@ -580,10 +580,6 @@ static void
 write_snapshots( config_t const * config,
                  ulong const *    cur_tile,
                  ulong const *    prev_tile ) {
-  /* N symmetric snapin tiles each walk the whole tar stream and insert
-     (and write) their own share of the accounts.  No topology has a
-     snapwr tile, so the write stage is not separately observable: it is
-     approximated from the snapin tiles' tar-stream intake. */
   ulong snapct_idx = fd_topo_find_tile( &config->topo, "snapct", 0UL );
   ulong snapin_idx = fd_topo_find_tile( &config->topo, "snapin", 0UL );
   ulong snapdc_tile_cnt = fd_topo_tile_name_cnt( &config->topo, "snapdc" );
@@ -672,7 +668,6 @@ write_snapshots( config_t const * config,
     ulong snapdc_idx = fd_topo_find_tile( &config->topo, "snapdc", i );
     snapdc_total_ticks += total_regime( &cur_tile[ snapdc_idx*FD_METRICS_TOTAL_SZ ] )-total_regime( &prev_tile[ snapdc_idx*FD_METRICS_TOTAL_SZ ] );
   }
-  /* Aggregate every snapin tile's regime ticks. */
   ulong snapin_total_ticks = 0UL;
   for( ulong i=0UL; i<snapin_tile_cnt; i++ ) {
     ulong idx = fd_topo_find_tile( &config->topo, "snapin", i );
