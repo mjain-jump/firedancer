@@ -413,7 +413,7 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "snapld_dc"   );
     fd_topob_wksp( topo, "snapdc_in"   );
     fd_topob_wksp( topo, "snapin_ct"   );
-    fd_topob_wksp( topo, "snapin_shared" );
+    fd_topob_wksp( topo, "snapin_shmem" );
 
     if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "snapct_gui"  );
     if( FD_LIKELY( config->tiles.gui.enabled ) ) fd_topob_wksp( topo, "snapin_gui"  );
@@ -453,7 +453,6 @@ fd_topo_initialize( config_t * config ) {
 
   if( FD_LIKELY( snapshots_enabled ) ) {
     /* TODO: Revisit the depths of all the snapshot links */
-
     /**/                 fd_topob_link( topo, "snapct_ld",     "snapct_ld",     128UL,                                    sizeof(fd_ssctrl_init_t),      1UL );
     /**/                 fd_topob_link( topo, "snapld_dc",     "snapld_dc",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
     FOR(snapdc_tile_cnt) fd_topob_link( topo, "snapdc_in",     "snapdc_in",     FD_SNAPSHOT_DATA_DEPTH,                   FD_SNAPSHOT_DATA_MTU,          1UL );
@@ -580,9 +579,6 @@ fd_topo_initialize( config_t * config ) {
     /**/                 fd_topob_tile( topo, "snapct", "snapct", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0,                 0 )->allow_shutdown = 1;
     /**/                 fd_topob_tile( topo, "snapld", "snapld", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0,                 0 )->allow_shutdown = 1;
     FOR(snapdc_tile_cnt) fd_topob_tile( topo, "snapdc", "snapdc", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0,                 0 )->allow_shutdown = 1;
-    /* N symmetric snapin tiles: there is no snapwr tile, every snapin
-       tile parses, inserts and writes its own share of the snapshot
-       to the accounts database file. */
     FOR(snapin_tile_cnt) fd_topob_tile( topo, "snapin", "snapin", "metric_in", tile_to_cpu[ topo->tile_cnt ],    0,        0,                 0,                 0 )->allow_shutdown = 1;
   }
   if( snapmk_enabled ) {
@@ -702,10 +698,7 @@ fd_topo_initialize( config_t * config ) {
     FOR(snapdc_tile_cnt) fd_topob_tile_in (    topo, "snapdc",  i,            "metric_in", "snapld_dc",     0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(snapdc_tile_cnt) fd_topob_tile_out(    topo, "snapdc",  i,                      "snapdc_in",     i                                                  );
 
-    /* Every snapin tile is a full reliable consumer of every snapdc
-       lane: it walks the whole tar stream itself and parses only the
-       appendvecs it owns (there is no snapwr tile -- every snapin
-       tile writes its own share of the accounts database file). */
+    /* Every snapin tile scans every snapdc lane. */
     for( ulong t=0UL; t<snapin_tile_cnt; t++ ) {
       FOR(snapdc_tile_cnt) fd_topob_tile_in( topo, "snapin", t, "metric_in", "snapdc_in", i, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     }
@@ -1245,14 +1238,14 @@ fd_topo_initialize( config_t * config ) {
   if( FD_LIKELY( snapshots_enabled ) ) {
     /* Shared snapshot attempt state, striped accdb chain locks, and
        per-tile failure staging for the parallel snapshot loader tiles. */
-    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
+    fd_topo_obj_t * shmem_obj = fd_topob_obj( topo, "snapin_shmem", "snapin_shmem" );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shmem_obj->id ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, shmem_obj->id, "snapin_shmem" ) );
 
     FOR(snapin_tile_cnt) {
       fd_topo_tile_t * snapin_tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
       fd_topob_tile_uses( topo, snapin_tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
-      fd_topob_tile_uses( topo, snapin_tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+      fd_topob_tile_uses( topo, snapin_tile, shmem_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     }
   }
   fd_topo_obj_t * backup_obj = NULL;
@@ -1536,7 +1529,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     tile->snapin.accdb_obj_id = fd_pod_query_ulong( config->topo.props, "accdb", ULONG_MAX );
     tile->snapin.txncache_obj_id = fd_pod_query_ulong( config->topo.props, "txncache", ULONG_MAX );
     tile->snapin.banks_obj_id = fd_pod_query_ulong( config->topo.props, "banks", ULONG_MAX );
-    tile->snapin.shared_obj_id = fd_pod_query_ulong( config->topo.props, "snapin_shared", ULONG_MAX );
+    tile->snapin.shmem_obj_id = fd_pod_query_ulong( config->topo.props, "snapin_shmem", ULONG_MAX );
     tile->snapin.alpenglow = config->firedancer.development.alpenglow;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "repair" ) ) ) {

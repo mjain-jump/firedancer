@@ -7,7 +7,7 @@
 #include "../../flamenco/progcache/fd_progcache.h"
 #include "../../disco/shred/fd_rnonce_ss.h"
 #include "../../discof/backup/fd_backup_shmem.h"
-#include "../../discof/restore/utils/fd_snapin_shared.h"
+#include "../../discof/restore/utils/fd_snapin_shmem.h"
 
 #include "../../discof/admin/fd_adminctl.h"
 
@@ -262,28 +262,28 @@ fd_topo_obj_callbacks_t fd_obj_cb_backup = {
 };
 
 static ulong
-snapin_shared_footprint_cb( fd_topo_t const *     topo,
-                            fd_topo_obj_t const * obj ) {
-  return fd_snapin_shared_footprint( VAL("worker_cnt") );
+snapin_shmem_footprint_cb( fd_topo_t const *     topo,
+                           fd_topo_obj_t const * obj ) {
+  return fd_snapin_shmem_footprint( VAL("worker_cnt") );
 }
 
 static ulong
-snapin_shared_align_cb( fd_topo_t const *     topo FD_FN_UNUSED,
-                        fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
-  return fd_snapin_shared_align();
+snapin_shmem_align_cb( fd_topo_t const *     topo FD_FN_UNUSED,
+                       fd_topo_obj_t const * obj  FD_FN_UNUSED ) {
+  return fd_snapin_shmem_align();
 }
 
 static void
-snapin_shared_new_cb( fd_topo_t const *     topo,
-                      fd_topo_obj_t const * obj ) {
-  FD_TEST( fd_snapin_shared_new( fd_topo_obj_laddr( topo, obj->id ), VAL("worker_cnt") ) );
+snapin_shmem_new_cb( fd_topo_t const *     topo,
+                     fd_topo_obj_t const * obj ) {
+  FD_TEST( fd_snapin_shmem_new( fd_topo_obj_laddr( topo, obj->id ), VAL("worker_cnt") ) );
 }
 
-fd_topo_obj_callbacks_t fd_obj_cb_snapin_shared = {
-  .name      = "snapin_shrd",
-  .footprint = snapin_shared_footprint_cb,
-  .align     = snapin_shared_align_cb,
-  .new       = snapin_shared_new_cb,
+fd_topo_obj_callbacks_t fd_obj_cb_snapin_shmem = {
+  .name      = "snapin_shmem",
+  .footprint = snapin_shmem_footprint_cb,
+  .align     = snapin_shmem_align_cb,
+  .new       = snapin_shmem_new_cb,
 };
 
 #undef VAL

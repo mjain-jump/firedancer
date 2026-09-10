@@ -4,7 +4,7 @@
 #include "utils/fd_ssparse.h"
 #include "utils/fd_ssmanifest_parser.h"
 #include "utils/fd_slot_delta_parser.h"
-#include "utils/fd_snapin_shared.h"
+#include "utils/fd_snapin_shmem.h"
 #include "../../util/fd_hash32.h"
 
 #include "../../disco/topo/fd_topo.h"
@@ -206,7 +206,7 @@ struct fd_snapin_lead {
 
   fd_snapin_out_link_t manifest_out;
   fd_snapin_out_link_t gui_out;
-  fd_snapin_shared_worker_t * shared_workers[ FD_TOPO_MAX_TILE_IN_LINKS ];
+  fd_snapin_shmem_worker_t * shmem_workers[ FD_TOPO_MAX_TILE_IN_LINKS ];
 
   /* Tile 0 end-of-attempt state. */
   int   attempt_folded;     /* attempt data already read */
@@ -229,7 +229,7 @@ struct fd_snapin_lead {
   } rollback;
 
   /* Failed partitions waiting for purge or reset. */
-  uint  doomed_partitions[ FD_SNAPIN_SHARED_PARTITION_MAX ];
+  uint  doomed_partitions[ FD_SNAPIN_SHMEM_PARTITION_MAX ];
   ulong doomed_partition_cnt;
 
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
@@ -303,9 +303,9 @@ struct fd_snapin_tile {
   fd_snapin_out_link_t ct_out;
 
   /* Shared snapshot state. */
-  fd_snapin_shared_t *        shared;
-  int *                       stripe_locks;
-  fd_snapin_shared_worker_t * shared_worker; /* this tile's failed partitions */
+  fd_snapin_shmem_t *        shmem;
+  int *                      stripe_locks;
+  fd_snapin_shmem_worker_t * shmem_worker; /* this tile's failed partitions */
 
   /* Parse state for one attempt. */
   ulong appendvec_seq;      /* next appendvec number */
@@ -1294,19 +1294,19 @@ worker_snoop_winner( void * cb_ctx,
 
   if( FD_UNLIKELY( !memcmp( pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
     if( FD_UNLIKELY( data_len>FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ) ) return;
-    fd_snapin_shared_t * shared = ctx->shared;
-    shared->slot_history.slot       = ctx->snoop_view.slot;
-    shared->slot_history.lamports   = lamports;
-    shared->slot_history.data_len   = data_len;
-    shared->slot_history.executable = ctx->snoop_view.executables[ batch_idx ];
-    fd_memcpy( shared->slot_history.owner, owner, 32UL );
-    fd_memcpy( shared->slot_history.buf, data, fd_ulong_min( data_len, data_sz ) );
-    shared->slot_history.captured   = 1;
+    fd_snapin_shmem_t * shmem = ctx->shmem;
+    shmem->slot_history.slot       = ctx->snoop_view.slot;
+    shmem->slot_history.lamports   = lamports;
+    shmem->slot_history.data_len   = data_len;
+    shmem->slot_history.executable = ctx->snoop_view.executables[ batch_idx ];
+    fd_memcpy( shmem->slot_history.owner, owner, 32UL );
+    fd_memcpy( shmem->slot_history.buf, data, fd_ulong_min( data_len, data_sz ) );
+    shmem->slot_history.captured   = 1;
     return;
   }
 
   if( FD_UNLIKELY( !memcmp( owner, fd_solana_feature_program_id.uc, 32UL ) ) ) {
-    fd_feature_snoop_account( &ctx->shared->feature_snoop, (fd_pubkey_t const *)pubkey,
+    fd_feature_snoop_account( &ctx->shmem->feature_snoop, (fd_pubkey_t const *)pubkey,
                               lamports, owner, data, data_sz );
     return;
   }
@@ -1423,7 +1423,7 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
                                                             data_lens, executables, candidates, &ctx->whead,
-                                                            ctx->stripe_locks, FD_SNAPIN_SHARED_STRIPE_MSK, ctx->worker_metrics,
+                                                            ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK, ctx->worker_metrics,
                                                             file_offsets, &accounts_ignored, &accounts_replaced,
                                                             &accounts_loaded, &replaced_lamports, &ignored_lamports,
                                                             worker_snoop_winner, ctx ) ) ) {
@@ -1483,7 +1483,7 @@ worker_insert_one( fd_snapin_tile_t * ctx,
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
                                                             data_lens, executables, candidates, &ctx->whead,
-                                                            ctx->stripe_locks, FD_SNAPIN_SHARED_STRIPE_MSK, ctx->worker_metrics,
+                                                            ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK, ctx->worker_metrics,
                                                             file_offsets, &accounts_ignored, &accounts_replaced,
                                                             &accounts_loaded, &replaced_lamports, &ignored_lamports,
                                                             worker_snoop_winner, ctx ) ) ) {
@@ -1617,10 +1617,10 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         break;
       case FD_SSPARSE_ADVANCE_APPENDVEC: {
         /* Parse only this tile's claimed appendvecs. */
-        ulong av_idx = ctx->appendvec_seq++;
-        if( FD_UNLIKELY( av_idx==ctx->claimed_appendvec ) ) {
+        ulong appendvec_idx = ctx->appendvec_seq++;
+        if( FD_UNLIKELY( appendvec_idx==ctx->claimed_appendvec ) ) {
           /* Claim the next appendvec before parsing this one. */
-          ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shared->next_appendvec, 1UL );
+          ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
           ctx->owned_appendvecs++;
           fd_ssparse_appendvec_parse( ctx->ssparse );
         }
@@ -1792,11 +1792,11 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( ctx->lead.attempt_folded ) ) return;
   ctx->lead.attempt_folded = 1;
 
-  fd_snapin_shared_totals_t const * totals = &ctx->shared->totals;
+  fd_snapin_shmem_totals_t const * totals = &ctx->shmem->totals;
 
   /* Each tile ends with one unused claim. */
   FD_TEST( totals->appendvecs_processed==ctx->appendvec_seq );
-  FD_TEST( ctx->shared->next_appendvec==ctx->appendvec_seq+ctx->shared->worker_cnt );
+  FD_TEST( ctx->shmem->next_appendvec==ctx->appendvec_seq+ctx->shmem->worker_cnt );
 
   /* Add this attempt to tile 0's session totals. */
   ctx->lead.totals_fold.accounts_loaded   += totals->accounts_loaded;
@@ -1810,23 +1810,23 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   ctx->lead.worker_fold.eq_slot_dups += totals->eq_slot_dups;
 
   /* Read the shared SlotHistory winner. */
-  fd_snapin_shared_t const * shared = ctx->shared;
-  if( FD_LIKELY( shared->slot_history.captured ) ) {
+  fd_snapin_shmem_t const * shmem = ctx->shmem;
+  if( FD_LIKELY( shmem->slot_history.captured ) ) {
     ctx->lead.slot_history.captured   = 1;
-    ctx->lead.slot_history.slot       = shared->slot_history.slot;
-    ctx->lead.slot_history.lamports   = shared->slot_history.lamports;
-    ctx->lead.slot_history.data_len   = shared->slot_history.data_len;
-    ctx->lead.slot_history.executable = shared->slot_history.executable;
-    fd_memcpy( ctx->lead.slot_history.owner, shared->slot_history.owner, 32UL );
-    fd_memcpy( ctx->lead.slot_history.buf, shared->slot_history.buf, shared->slot_history.data_len );
+    ctx->lead.slot_history.slot       = shmem->slot_history.slot;
+    ctx->lead.slot_history.lamports   = shmem->slot_history.lamports;
+    ctx->lead.slot_history.data_len   = shmem->slot_history.data_len;
+    ctx->lead.slot_history.executable = shmem->slot_history.executable;
+    fd_memcpy( ctx->lead.slot_history.owner, shmem->slot_history.owner, 32UL );
+    fd_memcpy( ctx->lead.slot_history.buf, shmem->slot_history.buf, shmem->slot_history.data_len );
   }
 
   /* Merge features seen in this attempt. */
   for( ulong i=0UL; i<FD_FEATURE_SNOOP_CNT; i++ ) {
-    if( FD_LIKELY( !shared->feature_snoop.present[ i ] ) ) continue;
+    if( FD_LIKELY( !shmem->feature_snoop.present[ i ] ) ) continue;
     ctx->lead.feature_snoop->present        [ i ] = 1;
-    ctx->lead.feature_snoop->is_active      [ i ] = shared->feature_snoop.is_active      [ i ];
-    ctx->lead.feature_snoop->activation_slot[ i ] = shared->feature_snoop.activation_slot[ i ];
+    ctx->lead.feature_snoop->is_active      [ i ] = shmem->feature_snoop.is_active      [ i ];
+    ctx->lead.feature_snoop->activation_slot[ i ] = shmem->feature_snoop.activation_slot[ i ];
   }
 }
 
@@ -1867,12 +1867,12 @@ tile0_rollback_failed_attempt( fd_snapin_tile_t * ctx,
 
   /* Save failed partitions until purge or reset finishes. */
   for( ulong w=0UL; w<ctx->tile_cnt; w++ ) {
-    fd_snapin_shared_worker_t * ws = ctx->lead.shared_workers[ w ];
-    for( ulong i=0UL; i<ws->fail_partition_cnt; i++ ) {
-      FD_TEST( ctx->lead.doomed_partition_cnt<FD_SNAPIN_SHARED_PARTITION_MAX );
-      ctx->lead.doomed_partitions[ ctx->lead.doomed_partition_cnt++ ] = ws->fail_partitions[ i ];
+    fd_snapin_shmem_worker_t * worker_shmem = ctx->lead.shmem_workers[ w ];
+    for( ulong i=0UL; i<worker_shmem->fail_partition_cnt; i++ ) {
+      FD_TEST( ctx->lead.doomed_partition_cnt<FD_SNAPIN_SHMEM_PARTITION_MAX );
+      ctx->lead.doomed_partitions[ ctx->lead.doomed_partition_cnt++ ] = worker_shmem->fail_partitions[ i ];
     }
-    ws->fail_partition_cnt = 0UL;
+    worker_shmem->fail_partition_cnt = 0UL;
   }
 
   if( !ctx->lead.rollback.full ) {
@@ -1968,17 +1968,17 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   ctx->lead.init_completed = 1;
 
   /* Reset shared state before publishing the attempt slot. */
-  fd_snapin_shared_t * shared = ctx->shared;
-  fd_memset( &shared->totals,        0, sizeof(shared->totals)        );
-  fd_memset( &shared->slot_history,  0, sizeof(shared->slot_history)  );
-  fd_memset( &shared->feature_snoop, 0, sizeof(shared->feature_snoop) );
-  FD_VOLATILE( shared->next_appendvec ) = 0UL;
+  fd_snapin_shmem_t * shmem = ctx->shmem;
+  fd_memset( &shmem->totals,        0, sizeof(shmem->totals)        );
+  fd_memset( &shmem->slot_history,  0, sizeof(shmem->slot_history)  );
+  fd_memset( &shmem->feature_snoop, 0, sizeof(shmem->feature_snoop) );
+  FD_VOLATILE( shmem->next_appendvec ) = 0UL;
   FD_COMPILER_MFENCE();
 
   /* Publish last. Other tiles wait for this. */
-  FD_VOLATILE( shared->attempt.fork_id ) = ctx->full ? (ulong)USHORT_MAX : (ulong)ctx->lead.accdb_incr_fork_id.val;
+  FD_VOLATILE( shmem->attempt.fork_id ) = ctx->full ? (ulong)USHORT_MAX : (ulong)ctx->lead.accdb_incr_fork_id.val;
   FD_COMPILER_MFENCE();
-  FD_VOLATILE( shared->attempt.generation ) = ctx->generation;
+  FD_VOLATILE( shmem->attempt.generation ) = ctx->generation;
 }
 
 /* Attempt slot gate */
@@ -1990,8 +1990,8 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
 static void
 attempt_gate_open( fd_snapin_tile_t * ctx ) {
   FD_COMPILER_MFENCE();
-  FD_TEST( FD_VOLATILE_CONST( ctx->shared->attempt.generation )==ctx->generation );
-  ctx->incr_fork = FD_VOLATILE_CONST( ctx->shared->attempt.fork_id );
+  FD_TEST( FD_VOLATILE_CONST( ctx->shmem->attempt.generation )==ctx->generation );
+  ctx->incr_fork = FD_VOLATILE_CONST( ctx->shmem->attempt.fork_id );
   if( FD_UNLIKELY( ctx->full ? ctx->incr_fork!=(ulong)USHORT_MAX : ctx->incr_fork>=(ulong)USHORT_MAX ) ) {
     FD_LOG_ERR(( "invalid attempt fork %lu (full=%d); this is a bug", ctx->incr_fork, (int)ctx->full ));
   }
@@ -1999,7 +1999,7 @@ attempt_gate_open( fd_snapin_tile_t * ctx ) {
   fd_accdb_snapshot_writer_begin( ctx->accdb );
 
   /* Claim before the first data fragment. */
-  ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shared->next_appendvec, 1UL );
+  ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
   ctx->gate_pending      = 0;
 }
 
@@ -2008,7 +2008,7 @@ attempt_gate_open( fd_snapin_tile_t * ctx ) {
 static inline int
 attempt_gate_ready( fd_snapin_tile_t * ctx ) {
   if( FD_LIKELY( !ctx->gate_pending ) ) return 1;
-  if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shared->attempt.generation )!=ctx->generation ) ) return 0;
+  if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shmem->attempt.generation )!=ctx->generation ) ) return 0;
   attempt_gate_open( ctx );
   return 1;
 }
@@ -2107,7 +2107,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       /* Agave accepts equal-slot duplicates. */
 
       /* Add this tile's counters before the FINI ack. */
-      fd_snapin_shared_totals_t * totals = &ctx->shared->totals;
+      fd_snapin_shmem_totals_t * totals = &ctx->shmem->totals;
       FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_loaded,       ctx->worker.accounts_loaded                );
       FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_replaced,     ctx->worker.accounts_replaced              );
       FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_ignored,      ctx->worker.accounts_ignored               );
@@ -2220,7 +2220,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       writer_abort( &ctx->writer );
       fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
-      ctx->shared_worker->fail_partition_cnt = ctx->whead.attempt_partition_cnt;
+      ctx->shmem_worker->fail_partition_cnt = ctx->whead.attempt_partition_cnt;
       FD_COMPILER_MFENCE(); /* publish before ack */
       worker_reset_attempt( ctx );
       fd_accdb_snapshot_writer_end( ctx->accdb );
@@ -2459,22 +2459,22 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
   FD_TEST( ctx->accdb );
 
-  fd_snapin_shared_t * shared = fd_snapin_shared_join( fd_topo_obj_laddr( topo, tile->snapin.shared_obj_id ) );
-  FD_TEST( shared );
-  FD_TEST( shared->worker_cnt<=FD_TOPO_MAX_TILE_IN_LINKS );
-  FD_TEST( ctx->tile_idx<shared->worker_cnt );
-  ctx->shared       = shared;
-  ctx->tile_cnt     = shared->worker_cnt;
-  ctx->stripe_locks = fd_snapin_shared_stripes( shared );
-  ctx->shared_worker = fd_snapin_shared_worker( shared, ctx->tile_idx );
+  fd_snapin_shmem_t * shmem = fd_snapin_shmem_join( fd_topo_obj_laddr( topo, tile->snapin.shmem_obj_id ) );
+  FD_TEST( shmem );
+  FD_TEST( shmem->worker_cnt<=FD_TOPO_MAX_TILE_IN_LINKS );
+  FD_TEST( ctx->tile_idx<shmem->worker_cnt );
+  ctx->shmem        = shmem;
+  ctx->tile_cnt     = shmem->worker_cnt;
+  ctx->stripe_locks = fd_snapin_shmem_stripes( shmem );
+  ctx->shmem_worker = fd_snapin_shmem_worker( shmem, ctx->tile_idx );
   if( FD_UNLIKELY( is_lead( ctx ) ) ) {
-    for( ulong w=0UL; w<ctx->tile_cnt; w++ ) ctx->lead.shared_workers[ w ] = fd_snapin_shared_worker( shared, w );
+    for( ulong w=0UL; w<ctx->tile_cnt; w++ ) ctx->lead.shmem_workers[ w ] = fd_snapin_shmem_worker( shmem, w );
   }
 
   /* Store failed partitions in shared staging. */
-  ctx->whead.attempt_partitions    = ctx->shared_worker->fail_partitions;
+  ctx->whead.attempt_partitions    = ctx->shmem_worker->fail_partitions;
   ctx->whead.attempt_partition_cnt = 0UL;
-  ctx->whead.attempt_partition_max = FD_SNAPIN_SHARED_PARTITION_MAX;
+  ctx->whead.attempt_partition_max = FD_SNAPIN_SHMEM_PARTITION_MAX;
 
   /* Every tile updates stakes. Only tile 0 owns the bank. */
   ctx->banks = fd_banks_join( fd_topo_obj_laddr( topo, tile->snapin.banks_obj_id ) );

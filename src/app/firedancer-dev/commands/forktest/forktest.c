@@ -148,7 +148,7 @@ forktest_topo( config_t * config ) {
     fd_topob_wksp( topo, "snapct_repr"  );
 
     fd_topob_wksp( topo, "snapin_ct" );
-    fd_topob_wksp( topo, "snapin_shared" );
+    fd_topob_wksp( topo, "snapin_shmem" );
   }
 
   fd_topob_wksp( topo, "forkt" );
@@ -416,10 +416,10 @@ forktest_topo( config_t * config ) {
 
   if( FD_LIKELY( snapshots_enabled ) ) {
     /* Shared state for parallel snapshot loader tiles. */
-    fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
-    FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
-    FOR(snapin_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ], shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topo_obj_t * shmem_obj = fd_topob_obj( topo, "snapin_shmem", "snapin_shmem" );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shmem_obj->id ) );
+    FD_TEST( fd_pod_insertf_ulong( topo->props, shmem_obj->id, "snapin_shmem" ) );
+    FOR(snapin_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ], shmem_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
 
   fd_pod_insert_int( topo->props, "sandbox", config->development.sandbox ? 1 : 0 );

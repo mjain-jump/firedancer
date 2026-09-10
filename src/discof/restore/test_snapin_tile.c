@@ -3,7 +3,7 @@
 
    There is no coordinator and no message-passing protocol between the
    tiles, so the harness models a cluster directly: N real
-   fd_snapin_tile_t contexts sharing one real snapin_shared object, each
+   fd_snapin_tile_t contexts sharing one real snapin_shmem object, each
    driven frag by frag through returnable_frag/before_frag.  The accdb,
    ssparse and stem entry points the tile calls out to are mocked, so
    what these tests pin is the tile's own protocol: the attempt-slot
@@ -433,17 +433,17 @@ static void
 sync_ctx_init( fd_snapin_tile_t * ctx,
                ulong              lane_cnt,
                int                state ) {
-  static uchar shared_mem[ sizeof(fd_snapin_shared_t)
-                         + 2UL*4096UL
-                         + FD_SNAPIN_SHARED_STRIPE_CNT*sizeof(int)
-                         + sizeof(fd_snapin_shared_worker_t) ] __attribute__((aligned(4096)));
+  static uchar shmem_mem[ sizeof(fd_snapin_shmem_t)
+                        + 2UL*4096UL
+                        + FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int)
+                        + sizeof(fd_snapin_shmem_worker_t) ] __attribute__((aligned(4096)));
   static uchar init_mem[ FD_TOPO_MAX_TILE_IN_LINKS ][ sizeof(fd_ssctrl_init_t) ] __attribute__((aligned(FD_CHUNK_ALIGN)));
 
   fd_memset( ctx, 0, sizeof(*ctx) );
   fd_memset( init_mem, 0, sizeof(init_mem) );
-  FD_TEST( fd_snapin_shared_footprint( 1UL )<=sizeof(shared_mem) );
-  ctx->shared = fd_snapin_shared_join( fd_snapin_shared_new( shared_mem, 1UL ) );
-  FD_TEST( ctx->shared );
+  FD_TEST( fd_snapin_shmem_footprint( 1UL )<=sizeof(shmem_mem) );
+  ctx->shmem = fd_snapin_shmem_join( fd_snapin_shmem_new( shmem_mem, 1UL ) );
+  FD_TEST( ctx->shmem );
 
   ctx->state        = state;
   ctx->full         = 1;
@@ -451,12 +451,12 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
   ctx->tile_cnt     = 1UL;
   ctx->lane_cnt     = lane_cnt;
   ctx->ct_out.idx   = 0UL;
-  ctx->stripe_locks  = fd_snapin_shared_stripes( ctx->shared );
-  ctx->shared_worker = fd_snapin_shared_worker( ctx->shared, 0UL );
-  ctx->lead.shared_workers[ 0 ] = ctx->shared_worker;
+  ctx->stripe_locks = fd_snapin_shmem_stripes( ctx->shmem );
+  ctx->shmem_worker = fd_snapin_shmem_worker( ctx->shmem, 0UL );
+  ctx->lead.shmem_workers[ 0 ] = ctx->shmem_worker;
 
-  ctx->whead.attempt_partitions    = ctx->shared_worker->fail_partitions;
-  ctx->whead.attempt_partition_max = FD_SNAPIN_SHARED_PARTITION_MAX;
+  ctx->whead.attempt_partitions    = ctx->shmem_worker->fail_partitions;
+  ctx->whead.attempt_partition_max = FD_SNAPIN_SHMEM_PARTITION_MAX;
   writer_init( &ctx->writer, FD_ACCDB_FD_RW );
   worker_reset_attempt( ctx );
   clear_control_barrier( ctx );
@@ -490,8 +490,8 @@ send_control( fd_snapin_tile_t * ctx,
 #define TEST_FRAG_SZ  (4096UL)
 
 typedef struct {
-  fd_snapin_shared_t * shared;
-  void *               shared_mem;
+  fd_snapin_shmem_t * shmem;
+  void *              shmem_mem;
   void *                  sd_mem;    /* tile 0's real slot delta parser */
   ulong                   tile_cnt;
   ulong                   lane_cnt;
@@ -525,7 +525,7 @@ test_counters_reset( void ) {
 }
 
 /* Build a cluster of tile_cnt symmetric snapin tiles sharing one real
-   snapin_shared object, wired the way unprivileged_init wires them. */
+   snapin_shmem object, wired the way unprivileged_init wires them. */
 static test_cluster_t *
 test_cluster_new( ulong tile_cnt,
                   ulong lane_cnt ) {
@@ -538,10 +538,10 @@ test_cluster_new( ulong tile_cnt,
   cl->tile_cnt = tile_cnt;
   cl->lane_cnt = lane_cnt;
 
-  cl->shared_mem = aligned_alloc( fd_snapin_shared_align(), fd_ulong_align_up( fd_snapin_shared_footprint( tile_cnt ), fd_snapin_shared_align() ) );
-  FD_TEST( cl->shared_mem );
-  cl->shared = fd_snapin_shared_join( fd_snapin_shared_new( cl->shared_mem, tile_cnt ) );
-  FD_TEST( cl->shared );
+  cl->shmem_mem = aligned_alloc( fd_snapin_shmem_align(), fd_ulong_align_up( fd_snapin_shmem_footprint( tile_cnt ), fd_snapin_shmem_align() ) );
+  FD_TEST( cl->shmem_mem );
+  cl->shmem = fd_snapin_shmem_join( fd_snapin_shmem_new( cl->shmem_mem, tile_cnt ) );
+  FD_TEST( cl->shmem );
 
   cl->sd_mem = aligned_alloc( fd_slot_delta_parser_align(), fd_ulong_align_up( fd_slot_delta_parser_footprint(), fd_slot_delta_parser_align() ) );
   FD_TEST( cl->sd_mem );
@@ -570,16 +570,16 @@ test_cluster_new( ulong tile_cnt,
     ctx->state    = FD_SNAPSHOT_STATE_IDLE;
     clear_control_barrier( ctx );
 
-    ctx->shared        = cl->shared;
-    ctx->stripe_locks  = fd_snapin_shared_stripes( cl->shared );
-    ctx->shared_worker = fd_snapin_shared_worker( cl->shared, t );
+    ctx->shmem        = cl->shmem;
+    ctx->stripe_locks = fd_snapin_shmem_stripes( cl->shmem );
+    ctx->shmem_worker = fd_snapin_shmem_worker( cl->shmem, t );
     if( FD_UNLIKELY( !t ) ) {
-      for( ulong w=0UL; w<tile_cnt; w++ ) ctx->lead.shared_workers[ w ] = fd_snapin_shared_worker( cl->shared, w );
+      for( ulong w=0UL; w<tile_cnt; w++ ) ctx->lead.shmem_workers[ w ] = fd_snapin_shmem_worker( cl->shmem, w );
     }
 
-    ctx->whead.attempt_partitions    = ctx->shared_worker->fail_partitions;
+    ctx->whead.attempt_partitions    = ctx->shmem_worker->fail_partitions;
     ctx->whead.attempt_partition_cnt = 0UL;
-    ctx->whead.attempt_partition_max = FD_SNAPIN_SHARED_PARTITION_MAX;
+    ctx->whead.attempt_partition_max = FD_SNAPIN_SHMEM_PARTITION_MAX;
 
     ctx->stake_delegations = cl->stake_delegations;
     writer_init( &ctx->writer, FD_ACCDB_FD_RW );
@@ -621,7 +621,7 @@ test_cluster_delete( test_cluster_t * cl ) {
   free( cl->stake_delegations );
   free( cl->in_mem );
   free( cl->sd_mem );
-  free( cl->shared_mem );
+  free( cl->shmem_mem );
   free( cl );
 }
 
@@ -747,11 +747,11 @@ test_stream_init( ulong av_cnt ) {
 static void
 test_stamp_slot_history( test_cluster_t * cl,
                          ulong            bank_slot ) {
-  fd_snapin_shared_t * shared = cl->shared;
+  fd_snapin_shmem_t * shmem = cl->shmem;
   ulong blocks_len = FD_SLOT_HISTORY_MAX_ENTRIES/64UL;
   FD_TEST( 9UL+blocks_len*8UL+16UL==FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ );
 
-  uchar * buf = shared->slot_history.buf;
+  uchar * buf = shmem->slot_history.buf;
   fd_memset( buf, 0, FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ );
   buf[ 0 ] = 1;
   FD_STORE( ulong, buf+1UL, blocks_len );
@@ -759,12 +759,12 @@ test_stamp_slot_history( test_cluster_t * cl,
   FD_STORE( ulong, footer,      FD_SLOT_HISTORY_MAX_ENTRIES );
   FD_STORE( ulong, footer+8UL,  bank_slot+1UL               );
 
-  shared->slot_history.captured   = 1;
-  shared->slot_history.executable = 0;
-  shared->slot_history.slot       = bank_slot;
-  shared->slot_history.lamports   = 1UL;
-  shared->slot_history.data_len   = FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ;
-  fd_memcpy( shared->slot_history.owner, fd_sysvar_owner_id.uc, 32UL );
+  shmem->slot_history.captured   = 1;
+  shmem->slot_history.executable = 0;
+  shmem->slot_history.slot       = bank_slot;
+  shmem->slot_history.lamports   = 1UL;
+  shmem->slot_history.data_len   = FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ;
+  fd_memcpy( shmem->slot_history.owner, fd_sysvar_owner_id.uc, 32UL );
 
   cl->ctx[ 0 ].lead.bank_slot = bank_slot;
 }
@@ -1218,8 +1218,8 @@ test_init_gate_holds_data( void ) {
      left plausible (USHORT_MAX, i.e. what a previous full attempt would
      have published) so that only the generation gate can stop the tile
      -- the fork-id sanity check must not be what saves us. */
-  FD_TEST( cl->shared->attempt.generation==0UL );
-  cl->shared->attempt.fork_id = (ulong)USHORT_MAX;
+  FD_TEST( cl->shmem->attempt.generation==0UL );
+  cl->shmem->attempt.fork_id = (ulong)USHORT_MAX;
 
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( ctx, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
@@ -1230,7 +1230,7 @@ test_init_gate_holds_data( void ) {
   FD_TEST( ctx->gate_pending );
   FD_TEST( ctx->incr_fork==ULONG_MAX );
   FD_TEST( !test_accdb_writer_begin_cnt );
-  FD_TEST( !cl->shared->next_appendvec );
+  FD_TEST( !cl->shmem->next_appendvec );
   FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
   /* Data is held, repeatedly and without side effects.  Controls are
@@ -1240,23 +1240,23 @@ test_init_gate_holds_data( void ) {
     FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
     FD_TEST( ctx->gate_pending );
     FD_TEST( !test_accdb_writer_begin_cnt );
-    FD_TEST( !cl->shared->next_appendvec );
+    FD_TEST( !cl->shmem->next_appendvec );
     FD_TEST( !ctx->appendvec_seq );
   }
   FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR )==0 );
   FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_FAIL  )==0 );
 
   /* Publish the attempt slot exactly as tile 0's INIT does. */
-  FD_VOLATILE( cl->shared->attempt.fork_id ) = (ulong)USHORT_MAX;
+  FD_VOLATILE( cl->shmem->attempt.fork_id ) = (ulong)USHORT_MAX;
   FD_COMPILER_MFENCE();
-  FD_VOLATILE( cl->shared->attempt.generation ) = 1UL;
+  FD_VOLATILE( cl->shmem->attempt.generation ) = 1UL;
 
   /* The next data frag opens the gate and is admitted. */
   FD_TEST( tile_step( ctx )==0UL );
   FD_TEST( !ctx->gate_pending );
   FD_TEST( ctx->incr_fork==(ulong)USHORT_MAX );
   FD_TEST( test_accdb_writer_begin_cnt==1UL );
-  FD_TEST( cl->shared->next_appendvec==2UL );  /* the eager claim, then its replacement */
+  FD_TEST( cl->shmem->next_appendvec==2UL );  /* the eager claim, then its replacement */
   FD_TEST( ctx->owned_appendvecs==1UL );
   FD_TEST( test_pub_cnt==1UL );             /* still just the INIT ack */
 
@@ -1296,7 +1296,7 @@ test_init_aborted_barrier_retries( void ) {
   tile_send_control( t0, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR );
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( !t0->lead.init_completed );
-  FD_TEST( !cl->shared->attempt.generation );  /* slot never published */
+  FD_TEST( !cl->shmem->attempt.generation );  /* slot never published */
   FD_TEST( !test_accdb_writer_begin_cnt );
 
   /* Tile 1 holds its data behind the unpublished slot, but the ERROR at
@@ -1328,7 +1328,7 @@ test_init_aborted_barrier_retries( void ) {
   test_counters_reset();
   test_stream_init( T );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( cl->shared->attempt.generation==2UL );
+  FD_TEST( cl->shmem->attempt.generation==2UL );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].generation==2UL );
   FD_TEST( !t0->gate_pending );  /* tile 0 publishes, so it never gates */
   FD_TEST( t1->gate_pending );   /* ... and tile 1 opens on its first data frag */
@@ -1339,8 +1339,8 @@ test_init_aborted_barrier_retries( void ) {
   FD_TEST( test_accdb_writer_begin_cnt==n );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shared->totals.appendvecs_processed==T );
-  FD_TEST( cl->shared->next_appendvec==T+n );
+  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
+  FD_TEST( cl->shmem->next_appendvec==T+n );
 
   test_cluster_delete( cl );
 }
@@ -1357,7 +1357,7 @@ test_init_gate_rejects_stale_generation( void ) {
 
   /* Attempt 1 loads normally on tile 1 (tile 0 publishes generation 1). */
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( cl->shared->attempt.generation==1UL );
+  FD_TEST( cl->shmem->attempt.generation==1UL );
   (void)tile_step( t1 );  /* the first data frag opens tile 1's gate */
   FD_TEST( !t1->gate_pending );
 
@@ -1367,7 +1367,7 @@ test_init_gate_rejects_stale_generation( void ) {
      generation 1, which must NOT open the gate. */
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( t1, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
   FD_TEST( t1->generation==2UL );
-  FD_TEST( cl->shared->attempt.generation==1UL );
+  FD_TEST( cl->shmem->attempt.generation==1UL );
   test_cur_tile = 1UL;
   FD_TEST( before_frag( t1, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
   FD_TEST( t1->gate_pending );
@@ -1385,28 +1385,28 @@ test_init_publishes_after_reset( void ) {
 
   /* Dirty every attempt-scoped shared field, as a killed load would
      leave them. */
-  fd_snapin_shared_t * shared = cl->shared;
-  shared->next_appendvec              = 999UL;
-  shared->totals.accounts_loaded      = 1234UL;
-  shared->totals.input_lamports       = 5678UL;
-  shared->totals.appendvecs_processed = 42UL;
-  shared->slot_history.captured       = 1;
-  shared->feature_snoop.present[ 0 ]  = 1;
+  fd_snapin_shmem_t * shmem = cl->shmem;
+  shmem->next_appendvec              = 999UL;
+  shmem->totals.accounts_loaded      = 1234UL;
+  shmem->totals.input_lamports       = 5678UL;
+  shmem->totals.appendvecs_processed = 42UL;
+  shmem->slot_history.captured       = 1;
+  shmem->feature_snoop.present[ 0 ]  = 1;
 
   /* Only tile 0's INIT: it re-zeroes and publishes. */
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( &cl->ctx[ 0 ], lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
-  FD_TEST( !shared->totals.accounts_loaded );
-  FD_TEST( !shared->totals.input_lamports );
-  FD_TEST( !shared->totals.appendvecs_processed );
-  FD_TEST( !shared->slot_history.captured );
-  FD_TEST( !shared->feature_snoop.present[ 0 ] );
-  FD_TEST( shared->attempt.generation==1UL );
-  FD_TEST( shared->attempt.fork_id==(ulong)USHORT_MAX );
+  FD_TEST( !shmem->totals.accounts_loaded );
+  FD_TEST( !shmem->totals.input_lamports );
+  FD_TEST( !shmem->totals.appendvecs_processed );
+  FD_TEST( !shmem->slot_history.captured );
+  FD_TEST( !shmem->feature_snoop.present[ 0 ] );
+  FD_TEST( shmem->attempt.generation==1UL );
+  FD_TEST( shmem->attempt.fork_id==(ulong)USHORT_MAX );
   /* Re-zeroed, then tile 0's own eager claim (it publishes the slot, so
      its gate opens inside the INIT handler; the other tiles draw theirs
      when their first data frag arrives). */
-  FD_TEST( shared->next_appendvec==1UL );
+  FD_TEST( shmem->next_appendvec==1UL );
   FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
   FD_TEST( !cl->ctx[ 0 ].gate_pending );
 
@@ -1439,7 +1439,7 @@ test_eager_claim_coverage( void ) {
       /* Only tile 0 claims at INIT (it publishes the slot its own gate
          waits on); every other tile draws its claim when its first data
          frag opens its gate. */
-      FD_TEST( cl->shared->next_appendvec==1UL );
+      FD_TEST( cl->shmem->next_appendvec==1UL );
       FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
       for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].gate_pending );
 
@@ -1459,8 +1459,8 @@ test_eager_claim_coverage( void ) {
       }
 
       cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-      FD_TEST( cl->shared->totals.appendvecs_processed==T );
-      FD_TEST( cl->shared->next_appendvec==T+n ); /* T consumed claims + N unmatched */
+      FD_TEST( cl->shmem->totals.appendvecs_processed==T );
+      FD_TEST( cl->shmem->next_appendvec==T+n ); /* T consumed claims + N unmatched */
 
       test_cluster_delete( cl );
     }
@@ -2266,20 +2266,20 @@ test_retry_resets( void ) {
   test_stream_init( T );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( cl->shared->next_appendvec==1UL );
+  FD_TEST( cl->shmem->next_appendvec==1UL );
 
   /* Partial walk: every tile gets three events in. */
   for( ulong step=0UL; step<3UL; step++ ) {
     for( ulong t=0UL; t<n; t++ ) (void)tile_step( &cl->ctx[ t ] );
   }
-  ulong mid_claims = cl->shared->next_appendvec;
+  ulong mid_claims = cl->shmem->next_appendvec;
   FD_TEST( mid_claims>n );
 
   /* Every tile acquired partitions during the attempt; the FAIL handler
      must publish each list for tile 0's deferred rollback. */
   for( ulong t=0UL; t<n; t++ ) {
     cl->ctx[ t ].whead.attempt_partition_cnt = 2UL+t;
-    for( ulong i=0UL; i<2UL+t; i++ ) cl->ctx[ t ].shared_worker->fail_partitions[ i ] = (uint)(100UL*t+i);
+    for( ulong i=0UL; i<2UL+t; i++ ) cl->ctx[ t ].shmem_worker->fail_partitions[ i ] = (uint)(100UL*t+i);
   }
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
@@ -2289,13 +2289,13 @@ test_retry_resets( void ) {
     FD_TEST( !ctx->appendvec_seq );
     FD_TEST( !ctx->owned_appendvecs );
     FD_TEST( ctx->incr_fork==ULONG_MAX );
-    FD_TEST( ctx->shared_worker->fail_partition_cnt==2UL+t ); /* published for the rollback */
+    FD_TEST( ctx->shmem_worker->fail_partition_cnt==2UL+t ); /* published for the rollback */
   }
   FD_TEST( cl->ctx[ 0 ].lead.rollback.pending );
   FD_TEST( cl->ctx[ 0 ].lead.rollback.full );
   /* The claim counter is deliberately NOT reset by FAIL: only tile 0's
      next INIT re-zeroes it. */
-  FD_TEST( cl->shared->next_appendvec==mid_claims );
+  FD_TEST( cl->shmem->next_appendvec==mid_claims );
 
   /* Retry.  Tile 0 rolls back first, then re-zeroes and republishes. */
   test_counters_reset();
@@ -2307,9 +2307,9 @@ test_retry_resets( void ) {
   FD_TEST( !test_accdb_purge_cnt );          /* ... so no incremental purge */
   FD_TEST( !test_accdb_release_cnt );        /* ... and no partition release */
   FD_TEST( !cl->ctx[ 0 ].lead.doomed_partition_cnt );
-  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].shared_worker->fail_partition_cnt ); /* gathered and cleared */
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].shmem_worker->fail_partition_cnt ); /* gathered and cleared */
 
-  FD_TEST( cl->shared->next_appendvec==1UL );   /* claim sequence restarted at 0 */
+  FD_TEST( cl->shmem->next_appendvec==1UL );   /* claim sequence restarted at 0 */
   FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].generation==2UL );
   for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].gate_pending );
@@ -2320,9 +2320,9 @@ test_retry_resets( void ) {
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shared->totals.appendvecs_processed==T );
-  FD_TEST( cl->shared->next_appendvec==T+n );
-  FD_TEST( !cl->shared->totals.eq_slot_dups );
+  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
+  FD_TEST( cl->shmem->next_appendvec==T+n );
+  FD_TEST( !cl->shmem->totals.eq_slot_dups );
 
   test_cluster_delete( cl );
 }
@@ -2354,7 +2354,7 @@ test_fini_truncated_malform( void ) {
   FD_TEST( test_pub_cnt==pub0+n );
   for( ulong i=pub0; i<test_pub_cnt; i++ ) FD_TEST( test_pub_sig[ i ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
   /* Nothing was folded: tile 0 must not read a partial attempt. */
-  FD_TEST( !cl->shared->totals.appendvecs_processed );
+  FD_TEST( !cl->shmem->totals.appendvecs_processed );
 
   /* In ERROR only FAIL flows; everything else is held. */
   FD_TEST( before_frag( &cl->ctx[ 0 ], 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==1 );
@@ -2434,9 +2434,9 @@ test_eq_slot_fini_accepts( void ) {
 
     /* The flagging tile's counters, dups included, are folded like
        everyone else's. */
-    FD_TEST( cl->shared->totals.accounts_loaded==10UL*n );
-    FD_TEST( cl->shared->totals.eq_slot_dups==3UL );
-    FD_TEST( cl->shared->totals.appendvecs_processed==T );
+    FD_TEST( cl->shmem->totals.accounts_loaded==10UL*n );
+    FD_TEST( cl->shmem->totals.eq_slot_dups==3UL );
+    FD_TEST( cl->shmem->totals.appendvecs_processed==T );
 
     test_cluster_delete( cl );
   }
@@ -2490,7 +2490,7 @@ test_accumulator_fold( void ) {
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
 
-  fd_snapin_shared_totals_t const * tot = &cl->shared->totals;
+  fd_snapin_shmem_totals_t const * tot = &cl->shmem->totals;
   FD_TEST( tot->accounts_loaded      ==exp_loaded   );
   FD_TEST( tot->accounts_replaced    ==exp_replaced );
   FD_TEST( tot->accounts_ignored     ==exp_ignored  );
@@ -2645,7 +2645,7 @@ test_full_lifecycle_9_tiles( void ) {
   FD_TEST( test_accdb_reset_cnt==1UL );
   FD_TEST( test_accdb_load_begin_cnt==1UL );
   FD_TEST( test_accdb_writer_begin_cnt==1UL );   /* tile 0 only; the rest are gated */
-  FD_TEST( cl->shared->next_appendvec==1UL );
+  FD_TEST( cl->shmem->next_appendvec==1UL );
   FD_TEST( cl->ctx[ 0 ].incr_fork==(ulong)USHORT_MAX );
 
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
@@ -2654,7 +2654,7 @@ test_full_lifecycle_9_tiles( void ) {
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( test_accdb_worker_close_cnt==n );
   FD_TEST( test_accdb_writer_end_cnt==n );
-  FD_TEST( cl->shared->totals.appendvecs_processed==T );
+  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
 
   test_stamp_slot_history( cl, bank_slot );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
@@ -2667,9 +2667,9 @@ test_full_lifecycle_9_tiles( void ) {
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
   FD_TEST( !test_accdb_reset_cnt );
   FD_TEST( test_accdb_attach_cnt==1UL );          /* child fork for the incremental writes */
-  FD_TEST( cl->shared->attempt.fork_id==7UL );
+  FD_TEST( cl->shmem->attempt.fork_id==7UL );
   FD_TEST( cl->ctx[ 0 ].incr_fork==7UL );
-  FD_TEST( cl->shared->next_appendvec==1UL );
+  FD_TEST( cl->shmem->next_appendvec==1UL );
 
   for( ulong step=0UL; step<4UL; step++ ) {
     for( ulong t=0UL; t<n; t++ ) (void)tile_step( &cl->ctx[ t ] );
@@ -2693,13 +2693,13 @@ test_full_lifecycle_9_tiles( void ) {
   FD_TEST( test_accdb_release_cnt==1UL );                  /* its partitions released */
   FD_TEST( test_accdb_release_total==exp_release );
   FD_TEST( !cl->ctx[ 0 ].lead.doomed_partition_cnt );
-  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].shared_worker->fail_partition_cnt );
-  FD_TEST( cl->shared->next_appendvec==1UL );
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].shmem_worker->fail_partition_cnt );
+  FD_TEST( cl->shmem->next_appendvec==1UL );
 
   cluster_stream( cl, TEST_ORDER_REVERSE, owner );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shared->totals.appendvecs_processed==T );
-  FD_TEST( cl->shared->next_appendvec==T+n );
+  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
+  FD_TEST( cl->shmem->next_appendvec==T+n );
 
   /* An incremental load's capitalization starts from the full
      snapshot's saved total; nothing was inserted here, so it is

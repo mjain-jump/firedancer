@@ -28,8 +28,8 @@ typedef struct {
   ulong                    worker_cnt;
   void *                   shmem_mem;
   fd_accdb_shmem_t *       shmem;
-  void *                   shared_mem;
-  fd_snapin_shared_t *     shared;
+  void *                   snapin_shmem_mem;
+  fd_snapin_shmem_t *      snapin_shmem;
   fd_snapin_tile_t *       worker;
   void *                   join_mem [ TEST_WORKER_MAX ];
   fd_accdb_fork_id_t       root;
@@ -128,12 +128,12 @@ test_env_init( test_env_t * env,
                           0, 42UL, worker_cnt, 0UL ) );
   FD_TEST( env->shmem );
 
-  ulong shared_fp = fd_snapin_shared_footprint( worker_cnt );
-  env->shared_mem = aligned_alloc( fd_snapin_shared_align(),
-                                   fd_ulong_align_up( shared_fp, fd_snapin_shared_align() ) );
-  FD_TEST( env->shared_mem );
-  env->shared = fd_snapin_shared_join( fd_snapin_shared_new( env->shared_mem, worker_cnt ) );
-  FD_TEST( env->shared );
+  ulong snapin_shmem_fp = fd_snapin_shmem_footprint( worker_cnt );
+  env->snapin_shmem_mem = aligned_alloc( fd_snapin_shmem_align(),
+                                         fd_ulong_align_up( snapin_shmem_fp, fd_snapin_shmem_align() ) );
+  FD_TEST( env->snapin_shmem_mem );
+  env->snapin_shmem = fd_snapin_shmem_join( fd_snapin_shmem_new( env->snapin_shmem_mem, worker_cnt ) );
+  FD_TEST( env->snapin_shmem );
 
   ulong worker_fp = fd_ulong_align_up( worker_cnt*sizeof(fd_snapin_tile_t), alignof(fd_snapin_tile_t) );
   env->worker = aligned_alloc( alignof(fd_snapin_tile_t), worker_fp );
@@ -152,11 +152,11 @@ test_env_init( test_env_t * env,
     ctx->full         = 1;
     ctx->tile_idx     = i;
     ctx->tile_cnt     = worker_cnt;
-    ctx->stripe_locks  = fd_snapin_shared_stripes( env->shared );
-    ctx->shared        = env->shared;
-    ctx->shared_worker = fd_snapin_shared_worker( env->shared, i );
-    ctx->whead.attempt_partitions    = ctx->shared_worker->fail_partitions;
-    ctx->whead.attempt_partition_max = FD_SNAPIN_SHARED_PARTITION_MAX;
+    ctx->stripe_locks = fd_snapin_shmem_stripes( env->snapin_shmem );
+    ctx->shmem        = env->snapin_shmem;
+    ctx->shmem_worker = fd_snapin_shmem_worker( env->snapin_shmem, i );
+    ctx->whead.attempt_partitions    = ctx->shmem_worker->fail_partitions;
+    ctx->whead.attempt_partition_max = FD_SNAPIN_SHMEM_PARTITION_MAX;
 
     writer_init( &ctx->writer, FD_ACCDB_FD_RW );
   }
@@ -296,7 +296,7 @@ test_env_fini( test_env_t *          env,
     free( env->join_mem[ i ] );
   }
   free( env->worker );
-  free( env->shared_mem );
+  free( env->snapin_shmem_mem );
   free( env->shmem_mem );
   FD_TEST( !close( FD_ACCDB_FD_RW ) );
 }

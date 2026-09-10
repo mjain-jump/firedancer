@@ -723,7 +723,7 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
       ulong txncache_obj_id;
       ulong banks_obj_id;
-      ulong shared_obj_id; /* parallel snapshot-load topology only */
+      ulong shmem_obj_id; /* parallel snapshot-load topology only */
       int   alpenglow;
       ulong max_txn_per_slot;
     } snapin;

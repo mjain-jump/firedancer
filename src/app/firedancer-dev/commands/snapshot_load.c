@@ -8,7 +8,6 @@
 #include "../../../disco/pack/fd_pack_cost.h"
 #include "../../../util/pod/fd_pod_format.h"
 #include "../../../discof/restore/utils/fd_ssctrl.h"
-#include "../../../discof/restore/utils/fd_snapin_shared.h"
 #include "../../../discof/restore/utils/fd_ssmsg.h"
 #include "../../../flamenco/runtime/fd_cost_tracker.h"
 #include "../../../flamenco/accdb/fd_accdb_private.h"
@@ -168,10 +167,10 @@ snapshot_load_topo( config_t * config ) {
   }
 
   /* Shared loader state. */
-  fd_topob_wksp( topo, "snapin_shared" );
-  fd_topo_obj_t * shared_obj = fd_topob_obj( topo, "snapin_shrd", "snapin_shared" );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shared_obj->id ) );
-  FD_TEST( fd_pod_insertf_ulong( topo->props, shared_obj->id, "snapin_shared" ) );
+  fd_topob_wksp( topo, "snapin_shmem" );
+  fd_topo_obj_t * shmem_obj = fd_topob_obj( topo, "snapin_shmem", "snapin_shmem" );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shmem_obj->id ) );
+  FD_TEST( fd_pod_insertf_ulong( topo->props, shmem_obj->id, "snapin_shmem" ) );
 
   fd_topob_wksp( topo, "diag" );
   fd_topob_tile( topo, "diag", "diag", "metric_in", ULONG_MAX, 0, 0, 0, 0 );
@@ -215,13 +214,13 @@ snapshot_load_topo( config_t * config ) {
   FOR(snapin_tile_cnt) {
     fd_topo_tile_t * tile = &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ];
     fd_topob_tile_uses( topo, tile, accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
-    fd_topob_tile_uses( topo, tile, shared_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
+    fd_topob_tile_uses( topo, tile, shmem_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     /* Every snapin tile may update root stake delegations. */
     fd_topob_tile_uses( topo, tile, banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
     tile->snapin.accdb_obj_id    = accdb_obj->id;
     tile->snapin.txncache_obj_id = txncache_obj->id;
     tile->snapin.banks_obj_id    = banks_obj->id;
-    tile->snapin.shared_obj_id   = shared_obj->id;
+    tile->snapin.shmem_obj_id    = shmem_obj->id;
     tile->snapin.max_live_slots  = config->firedancer.runtime.max_live_slots;
   }
 
