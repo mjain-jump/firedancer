@@ -176,7 +176,6 @@ dispatch_snapshot( test_env_t *  env,
   fd_ssparse_t parser[ 1 ];
   fd_ssparse_init( parser );
   fd_ssparse_batch_enable( parser, 1 );
-  fd_ssparse_appendvec_passthrough_enable( parser, 1 );
 
   fd_snapin_tile_t * owner = NULL;
   ulong off                = 0UL;

@@ -1354,7 +1354,6 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->pending.active            = 0;
   fd_ssparse_init( ctx->ssparse );
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
-  fd_ssparse_appendvec_passthrough_enable( ctx->ssparse, 1 );
   /* The gate takes the next appendvec claim. */
 }
 

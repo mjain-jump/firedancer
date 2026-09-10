@@ -19,7 +19,6 @@
 struct fd_ssparse {
   int state;
   uint batch_enabled : 1;
-  uint appendvec_passthrough : 1;
 
   struct {
     int seen_zero_tar_frame;
@@ -95,7 +94,7 @@ struct fd_ssparse_advance_result {
       ulong         slot;
     } account_batch;
 
-    /* Returned after an appendvec header in passthrough mode. */
+    /* Returned after an appendvec header. */
     struct {
       ulong slot;
       ulong data_sz; /* tar entry size in bytes */
@@ -130,13 +129,6 @@ fd_ssparse_advance( fd_ssparse_t *                ssparse,
 void
 fd_ssparse_batch_enable( fd_ssparse_t * ssparse,
                          int            enabled );
-
-/* In passthrough mode, return each appendvec header before its body.
-   The body is skipped unless selected with
-   fd_ssparse_appendvec_parse. */
-void
-fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
-                                         int            enabled );
 
 /* Parse the current appendvec after fd_ssparse_advance returns
    FD_SSPARSE_ADVANCE_APPENDVEC. */

@@ -199,16 +199,11 @@ advance_tar( fd_ssparse_t *                ssparse,
       }
 
       ssparse->account.header_bytes_consumed = 0UL;
-      if( FD_UNLIKELY( ssparse->appendvec_passthrough ) ) {
-        /* Do not parse individual accounts: report the appendvec once
-           and consume its body via the garbage skipper. */
-        ssparse->state = FD_SSPARSE_STATE_SCROLL_ACCOUNT_GARBAGE;
-        result->appendvec.slot    = ssparse->slot;
-        result->appendvec.data_sz = ssparse->tar.file_bytes;
-        return FD_SSPARSE_ADVANCE_APPENDVEC;
-      }
-      ssparse->state = FD_SSPARSE_STATE_ACCOUNT_HEADER;
-      break;
+      /* Report the appendvec once and skip its body unless selected. */
+      ssparse->state = FD_SSPARSE_STATE_SCROLL_ACCOUNT_GARBAGE;
+      result->appendvec.slot    = ssparse->slot;
+      result->appendvec.data_sz = ssparse->tar.file_bytes;
+      return FD_SSPARSE_ADVANCE_APPENDVEC;
     case FD_SSPARSE_STATE_STATUS_CACHE:
       if( FD_UNLIKELY( ssparse->flags.seen_status_cache ) ) {
         FD_LOG_WARNING(( "unexpected status cache file" ));
@@ -597,18 +592,11 @@ fd_ssparse_batch_enable( fd_ssparse_t * ssparse,
 }
 
 void
-fd_ssparse_appendvec_passthrough_enable( fd_ssparse_t * ssparse,
-                                         int            enabled ) {
-  ssparse->appendvec_passthrough = !!enabled;
-}
-
-void
 fd_ssparse_appendvec_parse( fd_ssparse_t * ssparse ) {
   /* Only valid immediately after an FD_SSPARSE_ADVANCE_APPENDVEC
      result: the tar header has been parsed, slot/acc_vec_bytes are
-     set, the account cursor was zeroed just before the passthrough
-     branch, and no body bytes have been consumed yet. */
-  FD_TEST( ssparse->appendvec_passthrough                       );
+     set, the account cursor was zeroed, and no body bytes have been
+     consumed yet. */
   FD_TEST( ssparse->state==FD_SSPARSE_STATE_SCROLL_ACCOUNT_GARBAGE );
   FD_TEST( !ssparse->tar.file_bytes_consumed                    );
   ssparse->state = FD_SSPARSE_STATE_ACCOUNT_HEADER;

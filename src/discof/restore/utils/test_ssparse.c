@@ -69,6 +69,7 @@ feed_all( fd_ssparse_t * parser,
     fd_ssparse_advance_result_t result[1];
     int res = fd_ssparse_advance( parser, data, data_sz, result );
     if( res==FD_SSPARSE_ADVANCE_DONE || res==FD_SSPARSE_ADVANCE_ERROR ) return res;
+    if( res==FD_SSPARSE_ADVANCE_APPENDVEC ) fd_ssparse_appendvec_parse( parser );
     FD_TEST( result->bytes_consumed<=data_sz );
     if( FD_UNLIKELY( result->bytes_consumed==0UL ) ) {
       FD_TEST( ++zero_progress<1024UL ); /* detect stuck parser */
@@ -92,6 +93,7 @@ feed_bytewise( fd_ssparse_t * parser,
     fd_ssparse_advance_result_t result[1];
     int res = fd_ssparse_advance( parser, data, 1UL, result );
     if( res==FD_SSPARSE_ADVANCE_DONE || res==FD_SSPARSE_ADVANCE_ERROR ) return res;
+    if( res==FD_SSPARSE_ADVANCE_APPENDVEC ) fd_ssparse_appendvec_parse( parser );
     ulong consumed = result->bytes_consumed;
     FD_TEST( consumed<=1UL );
     if( FD_UNLIKELY( consumed==0UL ) ) {
@@ -704,9 +706,9 @@ FD_UNIT_TEST( test_parse_name_edge_cases ) {
   }
 }
 
-FD_UNIT_TEST( test_appendvec_passthrough ) {
-  /* In passthrough mode the parser must deliver exactly one
-     ADVANCE_APPENDVEC per accounts/ entry and no ACCOUNT_* results.
+FD_UNIT_TEST( test_appendvec_skip ) {
+  /* The parser must deliver exactly one ADVANCE_APPENDVEC per
+     accounts/ entry and no ACCOUNT_* results unless selected.
      The stream must still be byte-exact consumed through DONE. */
   fd_ssparse_t p[1];
   uchar acc[512];
@@ -731,7 +733,6 @@ FD_UNIT_TEST( test_appendvec_passthrough ) {
   ulong av_slots[ 4 ]; ulong av_szs[ 4 ];
 
   fd_ssparse_init( p );
-  fd_ssparse_appendvec_passthrough_enable( p, 1 );
 
   uchar const * data    = tar_buf;
   ulong         data_sz = off;
@@ -764,12 +765,10 @@ FD_UNIT_TEST( test_appendvec_passthrough ) {
 }
 
 FD_UNIT_TEST( test_appendvec_parse ) {
-  /* Ownership-selective parse: in passthrough mode, calling
-     fd_ssparse_appendvec_parse right after an APPENDVEC result must
-     parse that one appendvec's accounts in-stream, while appendvecs
-     left alone are skipped arithmetically.  The stream must still end
-     in DONE with byte-exact consumption.  Feed all-at-once and
-     bytewise. */
+  /* Calling fd_ssparse_appendvec_parse right after an APPENDVEC result
+     must parse that one appendvec's accounts in-stream, while
+     appendvecs left alone are skipped arithmetically.  The stream must
+     still end in DONE with byte-exact consumption. */
   fd_ssparse_t p[1];
   uchar acc[512];
   ulong dl1 = 5UL, dl2 = 3UL;
@@ -793,7 +792,6 @@ FD_UNIT_TEST( test_appendvec_parse ) {
 
   for( int bytewise=0; bytewise<2; bytewise++ ) {
     fd_ssparse_init( p );
-    fd_ssparse_appendvec_passthrough_enable( p, 1 );
 
     ulong av_cnt    = 0UL;
     ulong hdr_cnt   = 0UL;
@@ -864,7 +862,6 @@ FD_UNIT_TEST( test_appendvec_parse_batch_garbage ) {
 
   fd_ssparse_init( p );
   fd_ssparse_batch_enable( p, 1 );
-  fd_ssparse_appendvec_passthrough_enable( p, 1 );
 
   ulong av_cnt     = 0UL;
   ulong batch_accs = 0UL;
