@@ -1074,10 +1074,7 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapmk", 0UL ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
   if( FD_LIKELY( snapshots_enabled ) ) {
-    /* Every snapin tile updates the bank's root stake delegations
-       directly from its accdb snoop callback (the struct serializes
-       mutators on its own write lock), so every one of them joins the
-       banks object, not just tile 0. */
+    /* Every snapin tile may update root stake delegations. */
     FOR(snapin_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "snapin", i ) ], banks_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
   FD_TEST( fd_pod_insertf_ulong( topo->props, banks_obj->id, "banks" ) );
@@ -1211,9 +1208,7 @@ fd_topo_initialize( config_t * config ) {
   FOR(execrp_tile_cnt) fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "execrp", i ) ], txncache_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   FD_TEST( fd_pod_insertf_ulong( topo->props, txncache_obj->id, "txncache" ) );
 
-  /* Plus either the snapin tiles (snapshots enabled: every one of them
-     is an accdb writer joiner) or genesi (bootstrap), which are
-     mutually exclusive accdb writers. */
+  /* Snapin and genesi are mutually exclusive accdb writers. */
   ulong accdb_joiners = 3UL+execle_tile_cnt+execrp_tile_cnt+resolv_tile_cnt
                       + fd_ulong_if( snapshots_enabled, snapin_tile_cnt, 1UL );
   ulong partition_sz = config->development.accdb.partition_size_gib*(1UL<<30UL);
@@ -1236,8 +1231,7 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_uses( topo, &topo->tiles[ fd_topo_find_tile( topo, "genesi", 0UL ) ], accdb_obj, FD_SHMEM_JOIN_MODE_READ_WRITE );
   }
   if( FD_LIKELY( snapshots_enabled ) ) {
-    /* Shared snapshot attempt state, striped accdb chain locks, and
-       per-tile failure staging for the parallel snapshot loader tiles. */
+    /* Shared loader state. */
     fd_topo_obj_t * shmem_obj = fd_topob_obj( topo, "snapin_shmem", "snapin_shmem" );
     FD_TEST( fd_pod_insertf_ulong( topo->props, snapin_tile_cnt, "obj.%lu.worker_cnt", shmem_obj->id ) );
     FD_TEST( fd_pod_insertf_ulong( topo->props, shmem_obj->id, "snapin_shmem" ) );
