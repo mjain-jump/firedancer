@@ -36,10 +36,10 @@
 FD_STATIC_ASSERT( FD_SNAPSHOT_DATA_MTU<FD_SNAPIN_WRITE_BUF_SZ, write_buf );
 FD_STATIC_ASSERT( sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX<=FD_SNAPIN_WRITE_BUF_SZ, max_account );
 
-/* The snapin tiles are state machines that parse and load a full
-   and optionally an incremental snapshot.  They are responsible
-   for loading accounts into the accounts database and writing their
-   records to disk. */
+/* The snapin tiles are state machines that parse and load a full and
+   optionally an incremental snapshot.  They are responsible for loading
+   accounts into the accounts database and writing their records to
+   disk. */
 
 struct fd_blockhash_entry {
   fd_hash_t blockhash;
@@ -202,6 +202,7 @@ struct fd_snapin_lead {
   ulong capitalization;          /* tracks capitalization of all loaded accounts in the current snapshot */
   ulong dup_capitalization;      /* tracks capitalization of duplicate accounts encountered during incremental snapshot loading */
   ulong manifest_capitalization; /* capitalization according to the current snapshot manifest */
+  fd_snapin_account_counts_t account_counts;
 
   struct {
     ulong                        capitalization;
@@ -351,11 +352,24 @@ is_lead( fd_snapin_tile_t const * ctx ) {
   return ctx->tile_idx==0UL;
 }
 
+static void
+format_count( char * out, ulong out_sz, ulong n ) {
+  if(      n>=1000000UL ) FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%.1fM", (double)n/1e6 ) );
+  else if( n>=1000UL    ) FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%.1fK", (double)n/1e3 ) );
+  else                    FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%lu",   n             ) );
+}
+
 static inline int
 should_shutdown( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN && is_lead( ctx ) ) ) {
-    long elapsed_ns = fd_log_wallclock() - ctx->lead.boot_timestamp;
-    FD_LOG_NOTICE(( "loaded snapshot in %.3f seconds", (double)elapsed_ns/1e9 ));
+    ulong accounts_dup = ctx->lead.account_counts.ignored + ctx->lead.account_counts.replaced;
+    long  elapsed_ns   = fd_log_wallclock() - ctx->lead.boot_timestamp;
+    char  loaded_buf[ 32 ];
+    char  dup_buf   [ 32 ];
+    format_count( loaded_buf, sizeof(loaded_buf), ctx->lead.account_counts.loaded );
+    format_count( dup_buf,    sizeof(dup_buf),    accounts_dup                    );
+    FD_LOG_NOTICE(( "loaded %s accounts %s(%s dups)%s from snapshot in %.3f seconds",
+                    loaded_buf, fd_log_style_dim(), dup_buf, fd_log_style_normal(), (double)elapsed_ns/1e9 ));
   }
   return ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN;
 }
@@ -1259,6 +1273,9 @@ worker_commit_batch( fd_snapin_tile_t *              ctx,
   ctx->metrics.accounts_ignored  += accounts_ignored;
   ctx->metrics.accounts_replaced += accounts_replaced;
   ctx->metrics.accounts_loaded   += accounts_loaded;
+  ctx->worker.accounts.ignored  += accounts_ignored;
+  ctx->worker.accounts.replaced += accounts_replaced;
+  ctx->worker.accounts.loaded   += accounts_loaded;
   ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
@@ -1684,6 +1701,18 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   }
 }
 
+static void
+tile0_commit_account_counts( fd_snapin_tile_t * ctx ) {
+  fd_snapin_account_counts_t const * counts = &ctx->shmem->totals.accounts;
+  if( ctx->full ) {
+    ctx->lead.account_counts = *counts;
+  } else {
+    ctx->lead.account_counts.loaded   += counts->loaded;
+    ctx->lead.account_counts.replaced += counts->replaced;
+    ctx->lead.account_counts.ignored  += counts->ignored;
+  }
+}
+
 /* Roll back after every tile has sent its FAIL ack. */
 
 static void
@@ -1740,6 +1769,7 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
     ctx->lead.capitalization          = 0UL;
     ctx->lead.dup_capitalization      = 0UL;
     ctx->lead.recovery.capitalization = 0UL;
+    fd_memset( &ctx->lead.account_counts, 0, sizeof(ctx->lead.account_counts) );
 
     fd_stake_delegations_reset( ctx->stake_delegations );
     fd_accdb_reset( ctx->accdb );
@@ -1907,8 +1937,11 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       }
       fd_accdb_flush_metrics( ctx->accdb );
 
-      /* Add this tile's capitalization before the FINI ack. */
+      /* Add this tile's totals before the FINI ack. */
       fd_snapin_shmem_totals_t * totals = &ctx->shmem->totals;
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.loaded,      ctx->worker.accounts.loaded      );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.replaced,    ctx->worker.accounts.replaced    );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.ignored,     ctx->worker.accounts.ignored     );
       FD_ATOMIC_FETCH_AND_ADD( &totals->input_lamports,        ctx->worker.input_lamports                 );
       FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,     ctx->worker.replaced_lamports              );
       FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,      ctx->worker.ignored_lamports               );
@@ -1946,6 +1979,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
+      tile0_commit_account_counts( ctx );
       ctx->lead.recovery.capitalization = ctx->lead.capitalization;
       fd_accdb_snapshot_save_whead( ctx->accdb, &ctx->lead.recovery.accdb_metadata );
       ctx->lead.recovery.feature_snoop = *ctx->lead.feature_snoop;
@@ -1975,6 +2009,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
+      tile0_commit_account_counts( ctx );
       if( !ctx->full ) {
         fd_accdb_snapshot_recover_delta( ctx->accdb, ctx->lead.accdb_incr_fork_id );
         /* ensure that snapin tile sees all delta changes before rooting */
@@ -2331,6 +2366,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lead.capitalization                     = 0UL;
   ctx->lead.dup_capitalization                 = 0UL;
   ctx->lead.recovery.capitalization            = 0UL;
+  fd_memset( &ctx->lead.account_counts, 0, sizeof(ctx->lead.account_counts) );
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
   ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };

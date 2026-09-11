@@ -2422,13 +2422,20 @@ test_accumulator_fold( void ) {
   ulong owner[ TEST_AV_MAX ];
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
+  ulong exp_loaded=0UL, exp_replaced=0UL, exp_ignored=0UL;
   ulong exp_input=0UL, exp_repl_l=0UL, exp_ign_l=0UL;
   for( ulong t=0UL; t<n; t++ ) {
     fd_snapin_tile_t * ctx = &cl->ctx[ t ];
+    ctx->worker.accounts.loaded   = 100UL+t;
+    ctx->worker.accounts.replaced =  10UL+t;
+    ctx->worker.accounts.ignored  =   1UL+t;
     ctx->worker.input_lamports    = 1000000UL*(t+1UL);
     ctx->worker.replaced_lamports =   5000UL*(t+1UL);
     ctx->worker.ignored_lamports  =    700UL*(t+1UL);
 
+    exp_loaded   += ctx->worker.accounts.loaded;
+    exp_replaced += ctx->worker.accounts.replaced;
+    exp_ignored  += ctx->worker.accounts.ignored;
     exp_input    += ctx->worker.input_lamports;
     exp_repl_l   += ctx->worker.replaced_lamports;
     exp_ign_l    += ctx->worker.ignored_lamports;
@@ -2437,6 +2444,9 @@ test_accumulator_fold( void ) {
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
 
   fd_snapin_shmem_totals_t const * tot = &cl->shmem->totals;
+  FD_TEST( tot->accounts.loaded  ==exp_loaded   );
+  FD_TEST( tot->accounts.replaced==exp_replaced );
+  FD_TEST( tot->accounts.ignored ==exp_ignored  );
   FD_TEST( tot->input_lamports    ==exp_input  );
   FD_TEST( tot->replaced_lamports ==exp_repl_l );
   FD_TEST( tot->ignored_lamports  ==exp_ign_l  );
@@ -2453,6 +2463,9 @@ test_accumulator_fold( void ) {
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_IDLE );
   FD_TEST( t0->lead.dup_capitalization==exp_repl_l );
   FD_TEST( t0->lead.capitalization==exp_input-exp_ign_l-exp_repl_l );
+  FD_TEST( t0->lead.account_counts.loaded  ==exp_loaded   );
+  FD_TEST( t0->lead.account_counts.replaced==exp_replaced );
+  FD_TEST( t0->lead.account_counts.ignored ==exp_ignored  );
   /* The full snapshot's totals are saved for the incremental revert. */
   FD_TEST( t0->lead.recovery.capitalization==t0->lead.capitalization );
   FD_TEST( t0->lead.slot_history.captured );

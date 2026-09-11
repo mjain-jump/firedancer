@@ -10,8 +10,17 @@
 #define FD_SNAPIN_SHMEM_STRIPE_CNT (1UL<<12)
 #define FD_SNAPIN_SHMEM_STRIPE_MSK (FD_SNAPIN_SHMEM_STRIPE_CNT-1UL)
 
-/* Workers add capitalization totals before ACKing FINI. */
+struct fd_snapin_account_counts {
+  ulong loaded;
+  ulong replaced;
+  ulong ignored;
+};
+
+typedef struct fd_snapin_account_counts fd_snapin_account_counts_t;
+
+/* Workers add attempt totals before ACKing FINI. */
 struct fd_snapin_shmem_totals {
+  fd_snapin_account_counts_t accounts;
   ulong input_lamports;
   ulong replaced_lamports;
   ulong ignored_lamports;
