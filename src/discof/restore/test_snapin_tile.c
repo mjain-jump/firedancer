@@ -81,8 +81,6 @@ static ulong test_accdb_purge_cnt;
 static int   test_parser_script;
 static ulong test_parser_call_cnt;
 static ulong test_accdb_advance_root_cnt;
-static ulong test_accdb_writer_begin_cnt;
-static ulong test_accdb_writer_end_cnt;
 static ulong test_accdb_load_begin_cnt;
 static ulong test_accdb_load_end_cnt;
 static ulong test_accdb_readback_cnt;
@@ -149,8 +147,6 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_accdb_attach_child                        mock_accdb_attach_child
 #define fd_accdb_purge                               mock_accdb_purge
 #define fd_accdb_advance_root                        mock_accdb_advance_root
-#define fd_accdb_snapshot_writer_begin               mock_accdb_snapshot_writer_begin
-#define fd_accdb_snapshot_writer_end                 mock_accdb_snapshot_writer_end
 #define fd_accdb_snapshot_load_begin                 mock_accdb_snapshot_load_begin
 #define fd_accdb_snapshot_load_end                   mock_accdb_snapshot_load_end
 #define fd_accdb_flush_metrics                       mock_accdb_flush_metrics
@@ -192,8 +188,6 @@ test_stem_publish( fd_stem_context_t * stem,
 #undef fd_accdb_flush_metrics
 #undef fd_accdb_snapshot_load_end
 #undef fd_accdb_snapshot_load_begin
-#undef fd_accdb_snapshot_writer_end
-#undef fd_accdb_snapshot_writer_begin
 #undef fd_accdb_advance_root
 #undef fd_accdb_purge
 #undef fd_accdb_attach_child
@@ -211,8 +205,6 @@ test_stem_publish( fd_stem_context_t * stem,
 /* Mocks ***************************************************************/
 
 void mock_accdb_reset                            ( fd_accdb_t * accdb ) { (void)accdb; test_file_off=0UL; test_accdb_reset_cnt++; }
-void mock_accdb_snapshot_writer_begin            ( fd_accdb_t * accdb ) { (void)accdb; test_accdb_writer_begin_cnt++;  }
-void mock_accdb_snapshot_writer_end              ( fd_accdb_t * accdb ) { (void)accdb; test_accdb_writer_end_cnt++;    }
 void mock_accdb_snapshot_load_end                ( fd_accdb_t * accdb ) { (void)accdb; test_accdb_load_end_cnt++;      }
 void mock_accdb_flush_metrics                    ( fd_accdb_t * accdb ) { (void)accdb; }
 
@@ -514,8 +506,6 @@ test_counters_reset( void ) {
   test_accdb_attach_cnt         = 0UL;
   test_accdb_purge_cnt          = 0UL;
   test_accdb_advance_root_cnt   = 0UL;
-  test_accdb_writer_begin_cnt   = 0UL;
-  test_accdb_writer_end_cnt     = 0UL;
   test_accdb_load_begin_cnt     = 0UL;
   test_accdb_load_end_cnt       = 0UL;
   test_accdb_readback_cnt       = 0UL;
@@ -1240,7 +1230,6 @@ test_init_gate_holds_data( void ) {
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
   FD_TEST( ctx->gate_pending );
   FD_TEST( ctx->incr_fork==ULONG_MAX );
-  FD_TEST( !test_accdb_writer_begin_cnt );
   FD_TEST( !cl->shmem->next_appendvec );
   FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
@@ -1250,7 +1239,6 @@ test_init_gate_holds_data( void ) {
   for( ulong i=0UL; i<8UL; i++ ) {
     FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
     FD_TEST( ctx->gate_pending );
-    FD_TEST( !test_accdb_writer_begin_cnt );
     FD_TEST( !cl->shmem->next_appendvec );
     FD_TEST( !ctx->appendvec_seq );
   }
@@ -1266,7 +1254,6 @@ test_init_gate_holds_data( void ) {
   FD_TEST( tile_step( ctx )==0UL );
   FD_TEST( !ctx->gate_pending );
   FD_TEST( ctx->incr_fork==(ulong)USHORT_MAX );
-  FD_TEST( test_accdb_writer_begin_cnt==1UL );
   FD_TEST( cl->shmem->next_appendvec==2UL );  /* the eager claim, then its replacement */
   FD_TEST( test_pub_cnt==1UL );             /* still just the INIT ack */
 
@@ -1307,7 +1294,6 @@ test_init_aborted_barrier_retries( void ) {
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( !t0->lead.init_completed );
   FD_TEST( !cl->shmem->attempt.generation );  /* slot never published */
-  FD_TEST( !test_accdb_writer_begin_cnt );
 
   /* Tile 1 holds its data behind the unpublished slot, but the ERROR at
      its lane head is still deliverable. */
@@ -1346,7 +1332,6 @@ test_init_aborted_barrier_retries( void ) {
   ulong owner[ TEST_AV_MAX ];
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].gate_pending );
-  FD_TEST( test_accdb_writer_begin_cnt==n );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( cl->shmem->next_appendvec==T+n );
@@ -2604,15 +2589,12 @@ test_full_lifecycle_9_tiles( void ) {
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
   FD_TEST( test_accdb_reset_cnt==1UL );
   FD_TEST( test_accdb_load_begin_cnt==1UL );
-  FD_TEST( test_accdb_writer_begin_cnt==1UL );   /* tile 0 only; the rest are gated */
   FD_TEST( cl->shmem->next_appendvec==1UL );
   FD_TEST( cl->ctx[ 0 ].incr_fork==(ulong)USHORT_MAX );
 
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
-  FD_TEST( test_accdb_writer_begin_cnt==n );     /* every gate opened on first data */
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].incr_fork==(ulong)USHORT_MAX );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( test_accdb_writer_end_cnt==n );
 
   test_stamp_slot_history( cl, bank_slot );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );

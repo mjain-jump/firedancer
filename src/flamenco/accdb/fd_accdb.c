@@ -42,11 +42,6 @@ typedef struct fd_accdb_fork fd_accdb_fork_t;
 #define FD_ACCDB_ACQUIRE_STATE_PHASE_A (1)
 #define FD_ACCDB_ACQUIRE_STATE_OPEN    (2)
 
-/* Amortize the shared lazy-pool head across a large local block.  A
-   mainnet full snapshot consumes nearly every reservation; the small
-   unused tail is returned at the worker control barrier. */
-#define FD_ACCDB_SNAPSHOT_POOL_BLOCK (4096UL)
-
 struct __attribute__((aligned(FD_ACCDB_ALIGN))) fd_accdb_private {
   int fd;
 
@@ -127,15 +122,6 @@ struct __attribute__((aligned(FD_ACCDB_ALIGN))) fd_accdb_private {
     ulong num_ops;       /* reservations behind those bytes */
     ulong partition_idx; /* set while num_ops>0 */
   } write_stats __attribute__((aligned(64)));
-
-  struct {
-    ulong next;
-    ulong end;
-    ulong disk_used_added;
-    ulong disk_used_removed;
-    ulong accounts_total_added;
-    int   active;
-  } snapshot_pool_cache;
 };
 
 static inline fd_accdb_cache_line_t *
@@ -335,7 +321,6 @@ fd_accdb_new( void *              ljoin,
 
   memset( accdb->metrics,      0, sizeof(fd_accdb_metrics_t) );
   memset( &accdb->write_stats, 0, sizeof(accdb->write_stats) );
-  fd_memset( &accdb->snapshot_pool_cache, 0, sizeof(accdb->snapshot_pool_cache) );
 
   return accdb;
 }
@@ -451,7 +436,6 @@ fd_accdb_reset( fd_accdb_t * accdb ) {
   accdb->deferred_fork_epoch = 0UL;
   accdb->acquire_state       = FD_ACCDB_ACQUIRE_STATE_IDLE;
   memset( &accdb->write_stats, 0, sizeof(accdb->write_stats) );
-  fd_memset( &accdb->snapshot_pool_cache, 0, sizeof(accdb->snapshot_pool_cache) );
 }
 
 void
@@ -459,74 +443,6 @@ fd_accdb_snapshot_load_begin( fd_accdb_t * accdb ) {
   FD_CHECK_CRIT( fd_accdb_snapshot_sync_state( &accdb->shmem->snapshot_sync )==FD_ACCDB_SNAPSHOT_SYNC_IDLE,
                  "snapshot load started while snapshot production active" );
   FD_VOLATILE( accdb->shmem->snapshot_loading ) = 1;
-}
-
-void
-fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb ) {
-  FD_TEST( !accdb->snapshot_pool_cache.active );
-  fd_memset( &accdb->snapshot_pool_cache, 0, sizeof(accdb->snapshot_pool_cache) );
-  accdb->snapshot_pool_cache.active = 1;
-}
-
-void
-fd_accdb_snapshot_writer_end( fd_accdb_t * accdb ) {
-  fd_accdb_flush_metrics( accdb );
-  if( FD_LIKELY( !accdb->snapshot_pool_cache.active ) ) return;
-  ulong next = accdb->snapshot_pool_cache.next;
-  ulong end  = accdb->snapshot_pool_cache.end;
-  ulong disk_used_added      = accdb->snapshot_pool_cache.disk_used_added;
-  ulong disk_used_removed    = accdb->snapshot_pool_cache.disk_used_removed;
-  ulong accounts_total_added = accdb->snapshot_pool_cache.accounts_total_added;
-  fd_memset( &accdb->snapshot_pool_cache, 0, sizeof(accdb->snapshot_pool_cache) );
-
-  if( FD_UNLIKELY( next<end ) ) {
-    for( ulong i=next; i+1UL<end; i++ ) {
-      accdb->acc_pool[ i ].pool.next = acc_pool_private_cidx( i+1UL );
-    }
-    acc_pool_release_chain( accdb->acc_pool_join, &accdb->acc_pool[ next ], &accdb->acc_pool[ end-1UL ] );
-  }
-
-  FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_used_bytes, disk_used_added      );
-  FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, disk_used_removed    );
-  FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->accounts_total,  accounts_total_added );
-}
-
-static fd_accdb_accmeta_t *
-fd_accdb_snapshot_pool_acquire( fd_accdb_t * accdb ) {
-  ulong next = accdb->snapshot_pool_cache.next;
-  if( FD_LIKELY( next<accdb->snapshot_pool_cache.end ) ) {
-    accdb->snapshot_pool_cache.next = next+1UL;
-    return &accdb->acc_pool[ next ];
-  }
-
-  acc_pool_t * join = accdb->acc_pool_join;
-  acc_pool_shmem_t * pool = join->pool;
-  ulong volatile * lazy = (ulong volatile *)&pool->ver_lazy;
-  FD_COMPILER_MFENCE();
-  for(;;) {
-    ulong old = FD_VOLATILE_CONST( *lazy );
-    ulong ver = acc_pool_private_vidx_ver( old );
-    ulong idx = acc_pool_private_vidx_idx( old );
-    if( FD_UNLIKELY( ver & 1UL ) ) {
-      FD_SPIN_PAUSE();
-      continue;
-    }
-    if( FD_UNLIKELY( acc_pool_idx_is_null( idx ) ) ) return acc_pool_acquire( join );
-    if( FD_UNLIKELY( idx>=join->ele_max ) ) FD_LOG_CRIT(( "corrupt acc_pool lazy index %lu (max %lu)", idx, join->ele_max ));
-
-    ulong block_end = fd_ulong_min( idx+FD_ACCDB_SNAPSHOT_POOL_BLOCK, join->ele_max );
-    ulong lazy_next = block_end<join->ele_max ? block_end : acc_pool_idx_null();
-    ulong replacement = acc_pool_private_vidx( ver+2UL, lazy_next );
-    if( FD_UNLIKELY( FD_ATOMIC_CAS( lazy, old, replacement )!=old ) ) {
-      FD_SPIN_PAUSE();
-      continue;
-    }
-
-    FD_COMPILER_MFENCE();
-    accdb->snapshot_pool_cache.next = idx+1UL;
-    accdb->snapshot_pool_cache.end  = block_end;
-    return &accdb->acc_pool[ idx ];
-  }
 }
 
 static inline void
@@ -4345,11 +4261,7 @@ fd_accdb_snapshot_write_batch_impl( fd_accdb_t *        accdb,
       replaced_lamports += accmeta->lamports;
       replaced++;
     } else {
-      if( FD_LIKELY( !incremental && accdb->snapshot_pool_cache.active ) ) {
-        accmeta = fd_accdb_snapshot_pool_acquire( accdb );
-      } else {
-        accmeta = acc_pool_acquire_nolock( accdb->acc_pool_join );
-      }
+      accmeta = acc_pool_acquire_nolock( accdb->acc_pool_join );
       if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
 
       uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
@@ -4386,24 +4298,15 @@ fd_accdb_snapshot_write_batch_impl( fd_accdb_t *        accdb,
     used_bytes_added    += entry_sz;
   }
 
-  if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) {
-    accdb->snapshot_pool_cache.disk_used_added   += used_bytes_added;
-    accdb->snapshot_pool_cache.disk_used_removed += used_bytes_removed;
-  } else {
-    accdb->shmem->shmetrics->disk_used_bytes += used_bytes_added;
-    accdb->shmem->shmetrics->disk_used_bytes -= used_bytes_removed;
-  }
+  accdb->shmem->shmetrics->disk_used_bytes += used_bytes_added;
+  accdb->shmem->shmetrics->disk_used_bytes -= used_bytes_removed;
 
   /* accounts_total tracks acc_pool entries: increment for every new
      allocation (both genuinely new accounts and cross-fork overrides
      that insert a second pool entry).  The output counter
      *accounts_loaded excludes cross-fork overrides to match
      snapshot_write_one semantics (cross-fork returns 2 = replaced). */
-  if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) {
-    accdb->snapshot_pool_cache.accounts_total_added += loaded + cross_replaced;
-  } else {
-    accdb->shmem->shmetrics->accounts_total += loaded + cross_replaced;
-  }
+  accdb->shmem->shmetrics->accounts_total += loaded + cross_replaced;
 
   *accounts_ignored      = ignored;
   *accounts_replaced     = replaced;
@@ -4553,8 +4456,7 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
       existing->offset_fork     = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
     } else {
       fd_accdb_accmeta_t * accmeta;
-      if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
-      else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
+      accmeta = acc_pool_acquire( accdb->acc_pool_join );
       if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
       uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
 

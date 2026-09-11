@@ -1844,7 +1844,6 @@ attempt_gate_open( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( ctx->full ? ctx->incr_fork!=(ulong)USHORT_MAX : ctx->incr_fork>=(ulong)USHORT_MAX ) ) {
     FD_LOG_ERR(( "invalid attempt fork %lu (full=%d); this is a bug", ctx->incr_fork, (int)ctx->full ));
   }
-  fd_accdb_snapshot_writer_begin( ctx->accdb );
 
   /* Claim before the first data fragment. */
   ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
@@ -1948,7 +1947,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         forward_msg = 0;
         break;
       }
-      fd_accdb_snapshot_writer_end( ctx->accdb );
+      fd_accdb_flush_metrics( ctx->accdb );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
 
       /* Add this tile's capitalization before the FINI ack. */
@@ -2052,7 +2051,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_FAIL: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
-      fd_accdb_snapshot_writer_end( ctx->accdb );
+      fd_accdb_flush_metrics( ctx->accdb );
       FD_COMPILER_MFENCE(); /* publish before ack */
       worker_reset_attempt( ctx );
 

@@ -1792,10 +1792,7 @@ test_snapshot_striped_writers( void ) {
 
   fd_accdb_t * joins[ PAR_THREADS ];
   par_writer_ctx_t ctxs[ PAR_THREADS ];
-  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
-    joins[ t ] = test_join_writer( fd );
-    fd_accdb_snapshot_writer_begin( joins[ t ] );
-  }
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) joins[ t ] = test_join_writer( fd );
 
   ulong cum_input = 0UL, cum_ign_l = 0UL, cum_repl_l = 0UL;
   for( int phase=0; phase<2; phase++ ) {
@@ -1882,9 +1879,7 @@ test_snapshot_striped_writers( void ) {
     FD_TEST( cum_input-cum_ign_l-cum_repl_l==live_lamports );
   }
 
-  for( ulong t=0UL; t<PAR_THREADS; t++ ) {
-    fd_accdb_snapshot_writer_end( joins[ t ] );
-  }
+  for( ulong t=0UL; t<PAR_THREADS; t++ ) fd_accdb_flush_metrics( joins[ t ] );
 
   /* disk_used_bytes invariant: sum of (72+len) over the live set. */
   fd_accdb_flush_metrics( accdb );
@@ -1903,9 +1898,8 @@ test_snapshot_striped_writers( void ) {
      winners staged at their explicit offsets. */
   fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS );
 
-  /* writer_end returned every unused block tail, so exactly the live
-     entries are still checked out of the shared pool.  Drains the pool,
-     so this must be the last thing the test does with it. */
+  /* Exactly the live entries are checked out of the shared pool.
+     Drains the pool, so this must be the last thing the test does with it. */
   acc_pool_t pool_join[ 1 ];
   FD_TEST( acc_pool_join( pool_join, test_shmem_mem->acc_pool, par_layout( max_accounts ).acc_ele, max_accounts ) );
   ulong free_cnt = 0UL;

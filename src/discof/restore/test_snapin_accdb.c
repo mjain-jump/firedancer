@@ -171,9 +171,6 @@ test_env_init( test_env_t * env,
 
   env->root = fd_accdb_attach_child( env->worker[ 0 ].accdb, (fd_accdb_fork_id_t){ .val = USHORT_MAX } );
   fd_accdb_snapshot_load_begin( env->worker[ 0 ].accdb );
-  for( ulong i=0UL; i<worker_cnt; i++ ) {
-    fd_accdb_snapshot_writer_begin( env->worker[ i ].accdb );
-  }
 }
 
 static void
@@ -280,7 +277,7 @@ test_env_fini( test_env_t *          env,
     fd_snapin_tile_t * ctx = &env->worker[ i ];
     FD_TEST( !writer_flush( ctx ) );
     bytes_written += ctx->metrics.disk_bytes_written;
-    fd_accdb_snapshot_writer_end( ctx->accdb );
+    fd_accdb_flush_metrics( ctx->accdb );
     fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
   }
 

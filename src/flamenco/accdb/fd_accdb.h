@@ -122,15 +122,6 @@ fd_accdb_join_readonly( void *             ljoin,
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
 
-/* Bracket each worker's writes.  writer_end returns unused acc_pool
-   reservations and flushes partition metrics. */
-
-void
-fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb );
-
-void
-fd_accdb_snapshot_writer_end( fd_accdb_t * accdb );
-
 void
 fd_accdb_snapshot_load_end( fd_accdb_t * accdb );
 
