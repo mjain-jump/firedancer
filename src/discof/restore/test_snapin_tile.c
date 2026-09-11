@@ -83,6 +83,7 @@ static ulong test_parser_call_cnt;
 static ulong test_accdb_advance_root_cnt;
 static ulong test_accdb_load_begin_cnt;
 static ulong test_accdb_load_end_cnt;
+static ulong test_accdb_flush_metrics_cnt;
 static ulong test_accdb_readback_cnt;
 static ulong test_accdb_recover_delta_cnt;
 static ulong test_accdb_save_whead_cnt;
@@ -206,7 +207,7 @@ test_stem_publish( fd_stem_context_t * stem,
 
 void mock_accdb_reset                            ( fd_accdb_t * accdb ) { (void)accdb; test_file_off=0UL; test_accdb_reset_cnt++; }
 void mock_accdb_snapshot_load_end                ( fd_accdb_t * accdb ) { (void)accdb; test_accdb_load_end_cnt++;      }
-void mock_accdb_flush_metrics                    ( fd_accdb_t * accdb ) { (void)accdb; }
+void mock_accdb_flush_metrics                    ( fd_accdb_t * accdb ) { (void)accdb; test_accdb_flush_metrics_cnt++; }
 
 fd_accdb_fork_id_t
 mock_accdb_attach_child( fd_accdb_t *       accdb,
@@ -450,8 +451,8 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
   ctx->lane_cnt     = lane_cnt;
   ctx->ct_out.idx   = 0UL;
   ctx->stripe_locks = fd_snapin_shmem_stripes( ctx->shmem );
-  ctx->staged.data = staged_data;
-  ctx->writer.buf = write_buf;
+  ctx->staged.data    = staged_data;
+  ctx->writer.buf     = write_buf;
   ctx->writer.records = write_records;
   test_file_off = 0UL;
   worker_reset_attempt( ctx );
@@ -508,6 +509,7 @@ test_counters_reset( void ) {
   test_accdb_advance_root_cnt   = 0UL;
   test_accdb_load_begin_cnt     = 0UL;
   test_accdb_load_end_cnt       = 0UL;
+  test_accdb_flush_metrics_cnt  = 0UL;
   test_accdb_readback_cnt       = 0UL;
   test_accdb_recover_delta_cnt  = 0UL;
   test_accdb_save_whead_cnt     = 0UL;
@@ -575,8 +577,8 @@ test_cluster_new( ulong tile_cnt,
 
     ctx->shmem        = cl->shmem;
     ctx->stripe_locks = fd_snapin_shmem_stripes( cl->shmem );
-    ctx->staged.data   = cl->staged_mem + t*FD_RUNTIME_ACC_SZ_MAX;
-    ctx->writer.buf    = cl->write_mem + t*FD_SNAPIN_WRITE_BUF_SZ;
+    ctx->staged.data    = cl->staged_mem + t*FD_RUNTIME_ACC_SZ_MAX;
+    ctx->writer.buf     = cl->write_mem + t*FD_SNAPIN_WRITE_BUF_SZ;
     ctx->writer.records = cl->write_records + t*FD_SNAPIN_WRITE_RECORD_MAX;
 
     ctx->stake_delegations = cl->stake_delegations;
@@ -1204,8 +1206,8 @@ test_frame_ordering( void ) {
    non-blocking, so the tile acks INIT immediately and then HOLDS its
    data lane (before_frag returns -1) without opening its writer or
    drawing a claim.  Once the slot carries this attempt's generation the
-   next data frag opens the gate: the fork id is cached, the writer is
-   opened and the eager claim is taken. */
+   next data frag opens the gate, caches the fork ID, and takes the
+   eager claim. */
 static void
 test_init_gate_holds_data( void ) {
   test_cluster_t * cl = test_cluster_new( 2UL, 1UL );
@@ -2365,14 +2367,7 @@ test_fini_storage_error_retries( void ) {
   uchar pubkey[ 32UL ] = {1};
   uchar account_owner[ 32UL ] = {2};
   uchar data[ 1UL ] = {3};
-  uchar const * pubkeys[ 1 ] = { pubkey };
-  uchar const * owners [ 1 ] = { account_owner };
-  uchar const * datas  [ 1 ] = { data };
-  ulong lamports [ 1 ] = { 1UL };
-  ulong data_lens[ 1 ] = { 1UL };
-  int executables[ 1 ] = { 0 };
-  FD_TEST( !writer_append_batch( &cl->ctx[ 0 ], 1UL, pubkeys, owners, datas, 42UL,
-                                 lamports, data_lens, executables ) );
+  FD_TEST( !worker_insert_one( &cl->ctx[ 0 ], pubkey, account_owner, 42UL, 1UL, 1UL, 0, data ) );
   test_pwrite_push( -1L, ENOSPC );
 
   ulong pub0 = test_pub_cnt;
@@ -2414,14 +2409,7 @@ test_incremental_storage_error_reverts_range( void ) {
   uchar pubkey[ 32UL ] = {1};
   uchar owner [ 32UL ] = {2};
   uchar data[ 1UL ] = {3};
-  uchar const * pubkeys[ 1 ] = { pubkey };
-  uchar const * owners [ 1 ] = { owner };
-  uchar const * datas  [ 1 ] = { data };
-  ulong lamports [ 1 ] = { 1UL };
-  ulong data_lens[ 1 ] = { 1UL };
-  int executables[ 1 ] = { 0 };
-  FD_TEST( !writer_append_batch( &cl->ctx[ 0 ], 1UL, pubkeys, owners, datas, 42UL,
-                                 lamports, data_lens, executables ) );
+  FD_TEST( !worker_insert_one( &cl->ctx[ 0 ], pubkey, owner, 42UL, 1UL, 1UL, 0, data ) );
   test_pwrite_push( -1L, ENOSPC );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
@@ -2595,6 +2583,7 @@ test_full_lifecycle_9_tiles( void ) {
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].incr_fork==(ulong)USHORT_MAX );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( test_accdb_flush_metrics_cnt==n );
 
   test_stamp_slot_history( cl, bank_slot );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );

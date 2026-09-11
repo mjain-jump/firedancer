@@ -164,8 +164,8 @@ test_env_init( test_env_t * env,
     ctx->tile_idx     = i;
     ctx->stripe_locks = fd_snapin_shmem_stripes( env->snapin_shmem );
     ctx->shmem        = env->snapin_shmem;
-    ctx->staged.data  = env->staged_mem + i*FD_RUNTIME_ACC_SZ_MAX;
-    ctx->writer.buf   = env->write_mem + i*FD_SNAPIN_WRITE_BUF_SZ;
+    ctx->staged.data    = env->staged_mem + i*FD_RUNTIME_ACC_SZ_MAX;
+    ctx->writer.buf     = env->write_mem + i*FD_SNAPIN_WRITE_BUF_SZ;
     ctx->writer.records = env->write_records + i*FD_SNAPIN_WRITE_RECORD_MAX;
   }
 

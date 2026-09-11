@@ -250,11 +250,7 @@ fd_accdb_new( void *              ljoin,
   ulong max_account_writes_per_slot = shmem->max_account_writes_per_slot;
   ulong partition_cnt = shmem->partition_cnt;
 
-  /* chain_cnt is read back from the shmem header rather than recomputed
-     from max_accounts: the sizing formula lives only in
-     fd_accdb_shmem_new, so a joiner can never disagree with the actual
-     shmem layout. */
-  ulong chain_cnt = shmem->chain_cnt;
+  ulong chain_cnt = fd_ulong_pow2_up( (max_accounts>>1) + (max_accounts&1UL) );
   ulong txn_max = max_live_slots * max_account_writes_per_slot;
 
   FD_SCRATCH_ALLOC_INIT( l, shmem );
@@ -664,7 +660,7 @@ fd_accdb_join_readonly( void *             ljoin,
   ulong max_account_writes_per_slot  = shmem->max_account_writes_per_slot;
   ulong partition_cnt                = shmem->partition_cnt;
 
-  ulong chain_cnt = shmem->chain_cnt; /* see fd_accdb_new */
+  ulong chain_cnt = fd_ulong_pow2_up( (max_accounts>>1) + (max_accounts&1UL) );
   ulong txn_max   = max_live_slots * max_account_writes_per_slot;
 
   /* Recompute the same shmem scratch layout that fd_accdb_shmem_new
@@ -1799,51 +1795,6 @@ fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
                                  ulong        sz ) {
   FD_TEST( sz && sz<=accdb->shmem->partition_sz );
   return allocate_next_write( accdb, sz );
-}
-
-/* Try to reserve a whole snapshot account batch in one partition.  The
-   normal snapshot batch has about 7 accounts, so this replaces one atomic
-   fetch-and-add per account with one CAS per batch.  If the batch would
-   cross a partition boundary, make no change and let the caller use the
-   exact per-account allocator.  Thus the on-disk layout remains identical.
-
-   Snapshot disk reservation is deliberately single-coordinator even when
-   index writes are parallel: distributing reservations would reorder bytes
-   relative to the input stream.  The coordinator can therefore publish the
-   new head directly. */
-
-static inline int
-allocate_next_write_batch_fast( fd_accdb_t *  accdb,
-                                ulong         cnt,
-                                ulong const * sz,
-                                ulong *       file_offsets ) {
-  ulong total_sz = 0UL;
-  for( ulong i=0UL; i<cnt; i++ ) total_sz += sz[ i ];
-
-  accdb_offset_t offset = { .val = FD_VOLATILE_CONST( accdb->shmem->whead[ 0 ].val ) };
-  ulong partition_off = packed_partition_offset( &offset );
-
-  if( FD_UNLIKELY( partition_off>accdb->shmem->partition_sz ||
-                   total_sz>accdb->shmem->partition_sz-partition_off ) ) return 0;
-
-  FD_VOLATILE( accdb->shmem->whead[ 0 ].val ) = offset.val+total_sz;
-
-  ulong partition_idx = packed_partition_idx( &offset );
-  if( FD_LIKELY( accdb->write_stats.num_ops ) &&
-      FD_UNLIKELY( accdb->write_stats.partition_idx!=partition_idx ) ) {
-    fd_accdb_flush_metrics( accdb );
-  }
-
-  ulong file_offset = packed_partition_file_offset( &offset, accdb->shmem->partition_sz );
-  for( ulong i=0UL; i<cnt; i++ ) {
-    file_offsets[ i ] = file_offset;
-    file_offset += sz[ i ];
-  }
-
-  accdb->write_stats.partition_idx  = partition_idx;
-  accdb->write_stats.bytes         += total_sz;
-  accdb->write_stats.num_ops       += cnt;
-  return 1;
 }
 
 /* Compaction write allocation.  Single-threaded: only the compaction
@@ -4097,23 +4048,6 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
   return ( replace || cross_fork ) ? 2 : 1;
 }
 
-/* Reserve the on-disk locations for a batch in stream order, without
-   mutating the account index.  Exactly one writer may do this during a
-   load (the write head is shared).  entry_sizes[] receives the on-disk
-   size of every entry, so the caller does not have to recompute it. */
-
-static void
-snapshot_reserve_batch( fd_accdb_t * accdb,
-                        ulong        cnt,
-                        ulong const  data_lens[],
-                        ulong        entry_sizes[],
-                        ulong        file_offsets[] ) {
-  for( ulong i=0UL; i<cnt; i++ ) entry_sizes[ i ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
-  if( FD_UNLIKELY( !allocate_next_write_batch_fast( accdb, cnt, entry_sizes, file_offsets ) ) ) {
-    for( ulong i=0UL; i<cnt; i++ ) file_offsets[ i ] = allocate_next_write( accdb, entry_sizes[ i ] );
-  }
-}
-
 __attribute__((always_inline)) static inline int
 fd_accdb_snapshot_write_batch_impl( fd_accdb_t *        accdb,
                                     fd_accdb_fork_id_t  fork_id,
@@ -4398,9 +4332,8 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
     ulong  entry_sz = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
     int *  stripe   = &stripe_locks[ hashes[ i ] & stripe_msk ];
 
-    /* skip==1: existing version wins (or an untiebreakable equal-slot
-       dup), incoming ignored without allocating.  freed_off/sz: dead
-       disk range of a replaced record, released after unlocking. */
+    /* skip==1: an existing higher-slot version wins.  freed_off/sz is
+       the dead disk range of a replaced record. */
     int   skip      = 0;
     ulong freed_off = 0UL;
     ulong freed_sz  = 0UL;
@@ -4455,8 +4388,7 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
       existing->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
       existing->offset_fork     = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
     } else {
-      fd_accdb_accmeta_t * accmeta;
-      accmeta = acc_pool_acquire( accdb->acc_pool_join );
+      fd_accdb_accmeta_t * accmeta = acc_pool_acquire( accdb->acc_pool_join );
       if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
       uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
 
@@ -4586,7 +4518,10 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
 
   ulong entry_sizes [ 8 ];
   ulong file_offsets[ 8 ];
-  snapshot_reserve_batch( accdb, cnt, data_lens, entry_sizes, file_offsets );
+  for( ulong i=0UL; i<cnt; i++ ) {
+    entry_sizes [ i ] = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+    file_offsets[ i ] = allocate_next_write( accdb, entry_sizes[ i ] );
+  }
 
   /* The incremental flag is a compile-time constant in the inlined
      body, so the two calls specialize the (much hotter) full-snapshot

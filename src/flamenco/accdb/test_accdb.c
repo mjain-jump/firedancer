@@ -1586,7 +1586,7 @@ typedef struct {
   ulong                 cnt;
 } test_store_ctx_t;
 
-static int
+static void
 test_store_record( void * ctx_,
                    ulong  batch_idx,
                    ulong  file_off ) {
@@ -1603,7 +1603,6 @@ test_store_record( void * ctx_,
   meta.generation = 0U;
   fd_memset( meta.owner, 0, 32UL );
   FD_TEST( pwrite( ctx->fd, meta.b, sizeof(meta), (long)file_off )==(long)sizeof(meta) );
-  return 0;
 }
 
 static int
@@ -1634,7 +1633,7 @@ test_write_batch_worker( fd_accdb_t *                         accdb,
   ulong file_off = fd_accdb_snapshot_reserve_write( accdb, total_sz );
   for( ulong i=0UL; i<cnt; i++ ) {
     file_offsets[ i ] = file_off;
-    FD_TEST( !test_store_record( store, i, file_off ) );
+    test_store_record( store, i, file_off );
     file_off += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
   }
 
@@ -1830,7 +1829,7 @@ test_snapshot_striped_writers( void ) {
       fd_accdb_snapshot_flush_worker_metrics( joins[ t ], ctxs[ t ].m );
     }
 
-    /* Accepted allocations never overlap. */
+    /* Reserved ranges never overlap. */
     qsort( all_allocs, all_cnt, 2UL*sizeof(ulong), par_offset_cmp );
     for( ulong i=1UL; i<all_cnt; i++ ) {
       FD_TEST( all_allocs[ i ][ 0 ]>=all_allocs[ i-1UL ][ 0 ]+all_allocs[ i-1UL ][ 1 ] );
@@ -2056,7 +2055,7 @@ test_run_striped_incr_attempt( fd_accdb_t *       reader,
   }
   FD_TEST( txn_cnt==cross_cnt+new_cnt ); /* == loaded + cross_replaced */
 
-  /* Accepted allocations never overlap. */
+  /* Reserved ranges never overlap. */
   qsort( all_allocs, all_cnt, 2UL*sizeof(ulong), par_offset_cmp );
   for( ulong i=1UL; i<all_cnt; i++ ) {
     FD_TEST( all_allocs[ i ][ 0 ]>=all_allocs[ i-1UL ][ 0 ]+all_allocs[ i-1UL ][ 1 ] );

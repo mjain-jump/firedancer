@@ -1233,24 +1233,6 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   /* The gate takes the next appendvec claim. */
 }
 
-/* Count one successful insert call. */
-
-static inline void
-worker_record_insert_metrics( fd_snapin_tile_t * ctx,
-                              ulong              accounts_ignored,
-                              ulong              accounts_replaced,
-                              ulong              accounts_loaded,
-                              ulong              input_lamports,
-                              ulong              replaced_lamports,
-                              ulong              ignored_lamports ) {
-  ctx->metrics.accounts_ignored  += accounts_ignored;
-  ctx->metrics.accounts_replaced += accounts_replaced;
-  ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
-  ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
-  ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
-}
-
 static int
 worker_commit_batch( fd_snapin_tile_t *              ctx,
                      fd_snapin_account_batch_t const * batch ) {
@@ -1272,8 +1254,12 @@ worker_commit_batch( fd_snapin_tile_t *              ctx,
                                                          &accounts_loaded, &replaced_lamports, &ignored_lamports,
                                                          worker_snoop_winner, &snoop ) ) ) return -1;
 
-  worker_record_insert_metrics( ctx, accounts_ignored, accounts_replaced, accounts_loaded,
-                                input_lamports, replaced_lamports, ignored_lamports );
+  ctx->metrics.accounts_ignored  += accounts_ignored;
+  ctx->metrics.accounts_replaced += accounts_replaced;
+  ctx->metrics.accounts_loaded   += accounts_loaded;
+  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
+  ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
+  ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
   return 0;
 }
 
@@ -1337,10 +1323,10 @@ writer_append_batch( fd_snapin_tile_t *   ctx,
   for( ulong i=0UL; i<cnt; i++ ) batch_sz += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
   FD_TEST( batch_sz<=FD_SNAPIN_WRITE_BUF_SZ );
 
-  if( FD_UNLIKELY( batch_sz>FD_SNAPIN_WRITE_BUF_SZ-ctx->writer.buf_used ||
-                   cnt>FD_SNAPIN_WRITE_RECORD_MAX-ctx->writer.record_cnt ) ) {
+  if( FD_UNLIKELY( batch_sz>FD_SNAPIN_WRITE_BUF_SZ-ctx->writer.buf_used ) ) {
     if( FD_UNLIKELY( writer_flush( ctx ) ) ) return -1;
   }
+  FD_TEST( ctx->writer.record_cnt+cnt<=FD_SNAPIN_WRITE_RECORD_MAX );
 
   for( ulong i=0UL; i<cnt; i++ ) {
     fd_snapin_write_record_t * record = &ctx->writer.records[ ctx->writer.record_cnt++ ];
