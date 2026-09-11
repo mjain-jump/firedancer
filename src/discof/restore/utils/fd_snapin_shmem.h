@@ -5,6 +5,7 @@
 
 #include "../../../flamenco/features/fd_feature_snoop.h"
 #include "../../../flamenco/runtime/sysvar/fd_sysvar_base.h"
+#include "../../../flamenco/fd_rwlock.h"
 
 /* 4096 stripes kept lock contention below 0.4% with 8 workers. */
 #define FD_SNAPIN_SHMEM_STRIPE_CNT (1UL<<12)
@@ -47,8 +48,9 @@ struct fd_snapin_shmem {
 
   fd_snapin_shmem_totals_t totals;
 
-  /* Winner callbacks update these captures while holding the account
-     stripe. */
+  /* Guards slot_history and feature_snoop. */
+  fd_rwlock_t snoop_lock __attribute__((aligned(64)));
+
   struct __attribute__((aligned(64))) {
     int   captured;
     int   executable;
@@ -90,6 +92,7 @@ fd_snapin_shmem_new( void * mem,
   shmem->attempt.number  = 0UL;
   shmem->attempt.fork_id = 0UL;
   shmem->next_appendvec  = 0UL;
+  fd_rwlock_new( &shmem->snoop_lock );
   fd_memset( &shmem->totals,        0, sizeof(fd_snapin_shmem_totals_t) );
   fd_memset( &shmem->slot_history,  0, sizeof(shmem->slot_history)      );
   fd_memset( &shmem->feature_snoop, 0, sizeof(fd_feature_snoop_t)       );

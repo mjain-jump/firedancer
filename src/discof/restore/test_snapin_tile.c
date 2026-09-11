@@ -273,7 +273,6 @@ mock_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
                                  ulong const                          lamports[],
                                  ulong const                          data_lens[],
                                  int const                            executables[],
-                                 int const                            snoop_candidates[],
                                  int *                                stripe_locks,
                                  ulong                                stripe_msk,
                                  ulong const                          file_offsets[],
@@ -281,9 +280,7 @@ mock_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
                                  ulong *                              accounts_replaced,
                                  ulong *                              accounts_loaded,
                                  ulong *                              out_replaced_lamports,
-                                 ulong *                              out_ignored_lamports,
-                                 fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                                 void *                               snoop_ctx ) {
+                                 ulong *                              out_ignored_lamports ) {
   (void)accdb;
   (void)fork_id;
   (void)pubkeys;
@@ -299,9 +296,6 @@ mock_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
   *accounts_loaded       = cnt;
   *out_replaced_lamports = 0UL;
   *out_ignored_lamports  = 0UL;
-  for( ulong i=0UL; i<cnt; i++ ) {
-    if( snoop_fn && snoop_candidates && snoop_candidates[ i ] ) snoop_fn( snoop_ctx, i );
-  }
   return 0;
 }
 
@@ -1623,6 +1617,45 @@ test_batch_stake_delegation( fd_wksp_t * wksp ) {
 }
 
 static void
+test_batch_shared_snoop( void ) {
+  fd_feature_id_t const * feature_id = fd_feature_iter_init();
+  fd_feature_t feature = { .is_active=1, .activation_slot=123UL };
+  uchar slot_history_data[ 4UL ] = { 1U, 2U, 3U, 4U };
+  uchar entry[ 2UL ][ 136UL+sizeof(fd_feature_t) ] __attribute__((aligned(8)));
+  fd_memset( entry, 0, sizeof(entry) );
+
+  FD_STORE( ulong, entry[ 0 ]+8UL, sizeof(slot_history_data) );
+  fd_memcpy( entry[ 0 ]+16UL, fd_sysvar_slot_history_id.uc, 32UL );
+  FD_STORE( ulong, entry[ 0 ]+48UL, 10UL );
+  fd_memcpy( entry[ 0 ]+64UL, fd_sysvar_owner_id.uc, 32UL );
+  fd_memcpy( entry[ 0 ]+136UL, slot_history_data, sizeof(slot_history_data) );
+
+  FD_STORE( ulong, entry[ 1 ]+8UL, sizeof(feature) );
+  fd_memcpy( entry[ 1 ]+16UL, feature_id->id.uc, 32UL );
+  FD_STORE( ulong, entry[ 1 ]+48UL, 20UL );
+  fd_memcpy( entry[ 1 ]+64UL, fd_solana_feature_program_id.uc, 32UL );
+  fd_memcpy( entry[ 1 ]+136UL, &feature, sizeof(feature) );
+
+  fd_snapin_tile_t ctx[1];
+  sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_PROCESSING );
+  fd_ssparse_advance_result_t result = {
+    .account_batch = {
+      .batch     = { entry[ 0 ], entry[ 1 ] },
+      .batch_cnt = 2UL,
+      .slot      = 10UL,
+    },
+  };
+
+  FD_TEST( !worker_process_account_batch( ctx, &result ) );
+  FD_TEST( !writer_flush( ctx ) );
+  FD_TEST( ctx->shmem->slot_history.captured );
+  FD_TEST( ctx->shmem->slot_history.data_len==sizeof(slot_history_data) );
+  FD_TEST( !memcmp( ctx->shmem->slot_history.buf, slot_history_data, sizeof(slot_history_data) ) );
+  FD_TEST( ctx->shmem->feature_snoop.present[ feature_id->index ] );
+  FD_TEST( ctx->shmem->feature_snoop.activation_slot[ feature_id->index ]==123UL );
+}
+
+static void
 test_streaming_stake_delegation( fd_wksp_t * wksp ) {
   fd_banks_t * banks = new_banks( wksp );
   fd_stake_delegations_t * stake_delegations = fd_banks_stake_delegations_root_query( banks );
@@ -2874,6 +2907,7 @@ main( int     argc,
   test_batch_duplicate_rejected_before_write();
   test_max_account_staging();
   test_private_writer_ranges();
+  test_batch_shared_snoop();
   test_scratch_layout_fits();
 
   /* The end-to-end populate test holds a full-size txncache (~1.3 GiB)

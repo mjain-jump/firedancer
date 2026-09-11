@@ -543,10 +543,6 @@ ulong
 fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
                                  ulong        sz );
 
-/* Called under the account stripe when a flagged entry wins. */
-
-typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
-
 /* fd_accdb_snapshot_write_batch processes up to 8 accounts at once,
    using software prefetching to overlap hash chain memory latency with
    useful work.  This function is thread safe when concurrent callers
@@ -565,32 +561,28 @@ typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
    for the rationale).  Passing a larger slot crashes the process.
 
    file_offsets[i] is the pre-reserved on-disk location for pubkeys[i].
-   snoop_fn runs under the account stripe when a flagged account wins.
 
    fork_id has the same semantics as in fd_accdb_snapshot_write_one:
    USHORT_MAX for full-snapshot mode, otherwise incremental mode with
    txn tracking on the specified fork. */
 
 int
-fd_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
-                               fd_accdb_fork_id_t                   fork_id,
-                               ulong                                cnt,
-                               uchar const * const                  pubkeys[],
-                               ulong const                          slots[],
-                               ulong const                          lamports[],
-                               ulong const                          data_lens[],
-                               int const                            executables[],
-                               int const                            snoop_candidates[],
-                               int *                                stripe_locks,
-                               ulong                                stripe_msk,
-                               ulong const                          file_offsets[],
-                               ulong *                              accounts_ignored,
-                               ulong *                              accounts_replaced,
-                               ulong *                              accounts_loaded,
-                               ulong *                              out_replaced_lamports,
-                               ulong *                              out_ignored_lamports,
-                               fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                               void *                               snoop_ctx );
+fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
+                               fd_accdb_fork_id_t  fork_id,
+                               ulong               cnt,
+                               uchar const * const pubkeys[],
+                               ulong const         slots[],
+                               ulong const         lamports[],
+                               ulong const         data_lens[],
+                               int const           executables[],
+                               int *               stripe_locks,
+                               ulong               stripe_msk,
+                               ulong const         file_offsets[],
+                               ulong *             accounts_ignored,
+                               ulong *             accounts_replaced,
+                               ulong *             accounts_loaded,
+                               ulong *             out_replaced_lamports,
+                               ulong *             out_ignored_lamports );
 
 /* fd_accdb_background performs one unit of background work.
 

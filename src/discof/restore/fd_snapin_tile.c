@@ -162,13 +162,6 @@ struct fd_snapin_account_batch {
 
 typedef struct fd_snapin_account_batch fd_snapin_account_batch_t;
 
-struct fd_snapin_snoop_ctx {
-  struct fd_snapin_tile *           tile;
-  fd_snapin_account_batch_t const * batch;
-};
-
-typedef struct fd_snapin_snoop_ctx fd_snapin_snoop_ctx_t;
-
 /* Only tile 0 uses this state. */
 struct fd_snapin_lead {
   uint init_completed : 1;  /* did INIT complete for this attempt? */
@@ -1145,7 +1138,7 @@ writer_pwrite( fd_snapin_tile_t * ctx,
                uchar const *      buf,
                ulong              sz,
                ulong              off ) {
-  ulong   done = 0UL;
+  ulong done = 0UL;
   while( done<sz ) {
     long res = pwrite( FD_ACCDB_FD_RW, buf+done, sz-done, (long)(off+done) );
     if( FD_UNLIKELY( res<=0L ) ) {
@@ -1162,35 +1155,20 @@ writer_pwrite( fd_snapin_tile_t * ctx,
 
 /* Shared account data */
 
-/* Find SlotHistory, feature, and stake accounts. */
-
-static inline int
-worker_snoop_candidate( uchar const * pubkey,
-                        uchar const * owner ) {
-  return !memcmp( owner,  fd_solana_feature_program_id.uc, 32UL )
-      || !memcmp( owner,  fd_solana_stake_program_id.uc,   32UL )
-      || !memcmp( pubkey, fd_sysvar_slot_history_id.uc,    32UL );
-}
-
-/* Called with the account stripe locked.
-   The last accepted account updates the shared snoop. */
-
 static void
-worker_snoop_winner( void * cb_ctx,
-                     ulong  batch_idx ) {
-  fd_snapin_snoop_ctx_t * snoop = (fd_snapin_snoop_ctx_t *)cb_ctx;
-  fd_snapin_tile_t * ctx = snoop->tile;
-  fd_snapin_account_batch_t const * batch = snoop->batch;
-
+worker_snoop_account( fd_snapin_tile_t *                ctx,
+                      fd_snapin_account_batch_t const * batch,
+                      ulong                              batch_idx ) {
   uchar const * pubkey   = batch->pubkeys  [ batch_idx ];
   uchar const * owner    = batch->owners   [ batch_idx ];
   uchar const * data     = batch->datas    [ batch_idx ];
   ulong         lamports = batch->lamports [ batch_idx ];
   ulong         data_len = batch->data_lens[ batch_idx ];
+  fd_snapin_shmem_t * shmem = ctx->shmem;
 
   if( FD_UNLIKELY( !memcmp( pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
     if( FD_UNLIKELY( data_len>FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ) ) return;
-    fd_snapin_shmem_t * shmem = ctx->shmem;
+    fd_rwlock_write( &shmem->snoop_lock );
     shmem->slot_history.slot       = batch->slots[ batch_idx ];
     shmem->slot_history.lamports   = lamports;
     shmem->slot_history.data_len   = data_len;
@@ -1198,16 +1176,19 @@ worker_snoop_winner( void * cb_ctx,
     fd_memcpy( shmem->slot_history.owner, owner, 32UL );
     fd_memcpy( shmem->slot_history.buf, data, data_len );
     shmem->slot_history.captured   = 1;
+    fd_rwlock_unwrite( &shmem->snoop_lock );
     return;
   }
 
   if( FD_UNLIKELY( !memcmp( owner, fd_solana_feature_program_id.uc, 32UL ) ) ) {
-    fd_feature_snoop_account( &ctx->shmem->feature_snoop, (fd_pubkey_t const *)pubkey,
+    fd_rwlock_write( &shmem->snoop_lock );
+    fd_feature_snoop_account( &shmem->feature_snoop, (fd_pubkey_t const *)pubkey,
                               lamports, owner, data, data_len );
+    fd_rwlock_unwrite( &shmem->snoop_lock );
     return;
   }
 
-  if( FD_UNLIKELY( !lamports ) ) return;
+  if( FD_UNLIKELY( !lamports || memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) ) ) return;
 
   /* Match the single-tile stake update. */
   fd_stake_state_t const * stake_state = fd_stake_state_view( data, data_len );
@@ -1254,46 +1235,17 @@ reset_attempt_state( fd_snapin_tile_t * ctx ) {
 }
 
 static int
-worker_commit_batch( fd_snapin_tile_t *              ctx,
-                     fd_snapin_account_batch_t const * batch ) {
-  int candidates[ FD_SSPARSE_ACC_BATCH_MAX ];
-  ulong input_lamports = 0UL;
-  for( ulong i=0UL; i<batch->cnt; i++ ) {
-    candidates[ i ] = worker_snoop_candidate( batch->pubkeys[ i ], batch->owners[ i ] );
-    input_lamports  = fd_ulong_sat_add( input_lamports, batch->lamports[ i ] );
-  }
-
-  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
-  fd_snapin_snoop_ctx_t snoop = { .tile=ctx, .batch=batch };
-  if( FD_UNLIKELY( fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, batch->cnt, batch->pubkeys,
-                                                  batch->slots, batch->lamports, batch->data_lens, batch->executables,
-                                                  candidates, ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
-                                                  batch->file_offsets,
-                                                  &accounts_ignored, &accounts_replaced,
-                                                  &accounts_loaded, &replaced_lamports, &ignored_lamports,
-                                                  worker_snoop_winner, &snoop ) ) ) return -1;
-
-  ctx->metrics.accounts_ignored  += accounts_ignored;
-  ctx->metrics.accounts_replaced += accounts_replaced;
-  ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->worker.accounts.ignored  += accounts_ignored;
-  ctx->worker.accounts.replaced += accounts_replaced;
-  ctx->worker.accounts.loaded   += accounts_loaded;
-  ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
-  ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
-  ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
-  return 0;
-}
-
-static int
 writer_flush( fd_snapin_tile_t * ctx ) {
   if( FD_UNLIKELY( !ctx->writer.buf_used ) ) return 0;
 
   ulong base_off = fd_accdb_snapshot_reserve_write( ctx->accdb, ctx->writer.buf_used );
-  /* Attempt rollback reclaims this range if writing or committing fails. */
-  if( FD_UNLIKELY( writer_pwrite( ctx, ctx->writer.buf, ctx->writer.buf_used, base_off ) ) ) return -1;
 
+  /* Attempt rollback reclaims this range if writing or committing fails. */
+  if( FD_UNLIKELY( writer_pwrite( ctx, ctx->writer.buf, ctx->writer.buf_used, base_off ) ) ) {
+    return -1;
+  }
+
+  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   ulong record_idx = 0UL;
   ulong buf_off    = 0UL;
   while( record_idx<ctx->writer.record_cnt ) {
@@ -1303,6 +1255,7 @@ writer_flush( fd_snapin_tile_t * ctx ) {
 
     fd_snapin_account_batch_t batch;
     batch.cnt = cnt;
+    ulong input_lamports = 0UL;
 
     for( ulong i=0UL; i<cnt; i++ ) {
       record = &ctx->writer.records[ record_idx+i ];
@@ -1315,10 +1268,28 @@ writer_flush( fd_snapin_tile_t * ctx ) {
       batch.data_lens  [ i ] = (ulong)meta->size;
       batch.executables[ i ] = (int)record->executable;
       batch.file_offsets[ i ] = base_off+buf_off;
+      input_lamports  = fd_ulong_sat_add( input_lamports, batch.lamports[ i ] );
+      worker_snoop_account( ctx, &batch, i );
       buf_off += sizeof(fd_accdb_disk_meta_t)+(ulong)meta->size;
     }
 
-    if( FD_UNLIKELY( worker_commit_batch( ctx, &batch ) ) ) return -1;
+    ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
+    if( FD_UNLIKELY( fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, batch.cnt, batch.pubkeys,
+                                                    batch.slots, batch.lamports, batch.data_lens, batch.executables,
+                                                    ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
+                                                    batch.file_offsets,
+                                                    &accounts_ignored, &accounts_replaced,
+                                                    &accounts_loaded, &replaced_lamports, &ignored_lamports ) ) ) return -1;
+
+    ctx->metrics.accounts_ignored  += accounts_ignored;
+    ctx->metrics.accounts_replaced += accounts_replaced;
+    ctx->metrics.accounts_loaded   += accounts_loaded;
+    ctx->worker.accounts.ignored   += accounts_ignored;
+    ctx->worker.accounts.replaced  += accounts_replaced;
+    ctx->worker.accounts.loaded    += accounts_loaded;
+    ctx->worker.input_lamports     = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
+    ctx->worker.replaced_lamports  = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
+    ctx->worker.ignored_lamports   = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
     record_idx += cnt;
   }
 
@@ -1819,14 +1790,11 @@ tile0_begin_attempt( fd_snapin_tile_t * ctx,
   FD_VOLATILE( shmem->attempt.number ) = ctx->attempt_number;
 }
 
-/* Attempt sync */
-
-/* Tile 0 publishes the attempt after INIT work.
-   Other tiles hold DATA until then.
-   Controls still pass, so ERROR and FAIL can cancel the attempt. */
+/* Other tiles wait for tile 0 to finish shared setup before processing
+   data.  Control messages are not blocked. */
 
 static void
-sync_attempt( fd_snapin_tile_t * ctx ) {
+start_processing_attempt( fd_snapin_tile_t * ctx ) {
   FD_COMPILER_MFENCE();
   FD_TEST( FD_VOLATILE_CONST( ctx->shmem->attempt.number )==ctx->attempt_number );
   ctx->incr_fork = FD_VOLATILE_CONST( ctx->shmem->attempt.fork_id );
@@ -1837,14 +1805,6 @@ sync_attempt( fd_snapin_tile_t * ctx ) {
   /* Claim before the first data fragment. */
   ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
   ctx->waiting_for_tile0 = 0;
-}
-
-static inline int
-try_sync_attempt( fd_snapin_tile_t * ctx ) {
-  if( FD_LIKELY( !ctx->waiting_for_tile0 ) ) return 1;
-  if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shmem->attempt.number )!=ctx->attempt_number ) ) return 0;
-  sync_attempt( ctx );
-  return 1;
 }
 
 static void
@@ -1897,7 +1857,9 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       /* Tile 0 opens now. Other tiles open in before_frag. */
       ctx->waiting_for_tile0 = 1;
-      if( FD_UNLIKELY( is_lead( ctx ) ) ) sync_attempt( ctx );
+      if( FD_UNLIKELY( is_lead( ctx ) ) ) {
+        start_processing_attempt( ctx );
+      }
       break;
     }
 
@@ -1935,16 +1897,17 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         forward_msg = 0;
         break;
       }
+
       fd_accdb_flush_metrics( ctx->accdb );
 
       /* Add this tile's totals before the FINI ack. */
       fd_snapin_shmem_totals_t * totals = &ctx->shmem->totals;
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.loaded,      ctx->worker.accounts.loaded      );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.replaced,    ctx->worker.accounts.replaced    );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.ignored,     ctx->worker.accounts.ignored     );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->input_lamports,        ctx->worker.input_lamports                 );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,     ctx->worker.replaced_lamports              );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,      ctx->worker.ignored_lamports               );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.loaded,      ctx->worker.accounts.loaded   );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.replaced,    ctx->worker.accounts.replaced );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts.ignored,     ctx->worker.accounts.ignored  );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->input_lamports,       ctx->worker.input_lamports    );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,    ctx->worker.replaced_lamports );
+      FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,     ctx->worker.ignored_lamports  );
       FD_COMPILER_MFENCE(); /* publish before ack */
 
       /* Keep per-tile gauges. Dashboards sum them. */
@@ -2109,8 +2072,13 @@ before_frag( fd_snapin_tile_t * ctx,
     /* Only accept DATA frags from the expected lane */
     if( FD_UNLIKELY( in_idx!=ctx->expected_frame%ctx->lane_cnt ) ) return -1;
 
-    /* Wait for tile 0 to be ready */
-    if( FD_UNLIKELY( !try_sync_attempt( ctx ) ) ) return -1;
+    if( FD_UNLIKELY( ctx->waiting_for_tile0 ) ) {
+      if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shmem->attempt.number )!=ctx->attempt_number ) ) {
+        return -1;
+      }
+
+      start_processing_attempt( ctx );
+    }
   }
 
   return 0;
@@ -2268,7 +2236,7 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( ctx->tile_idx>=FD_TOPO_MAX_TILE_IN_LINKS ) ) {
     FD_LOG_ERR(( "tile `" NAME "` has unsupported kind id %lu", tile->kind_id ));
   }
-  
+
   ctx->full                = 1;
   ctx->state               = FD_SNAPSHOT_STATE_IDLE;
   ctx->lane_cnt            = tile->in_cnt;

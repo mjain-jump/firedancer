@@ -175,14 +175,12 @@ fd_accdb_partition_write_bump( fd_accdb_t * accdb,
 
 void
 fd_accdb_flush_metrics( fd_accdb_t * accdb ) {
-  ulong bytes    = accdb->write_stats.bytes;
-  ulong num_ops  = accdb->write_stats.num_ops;
-  ulong part_idx = accdb->write_stats.partition_idx;
+  ulong bytes                = accdb->write_stats.bytes;
+  ulong num_ops              = accdb->write_stats.num_ops;
+  ulong part_idx             = accdb->write_stats.partition_idx;
   ulong disk_used_added      = accdb->write_stats.disk_used_added;
   ulong disk_used_removed    = accdb->write_stats.disk_used_removed;
   ulong accounts_total_added = accdb->write_stats.accounts_total_added;
-
-  if( !(num_ops | disk_used_added | disk_used_removed | accounts_total_added) ) return;
 
   memset( &accdb->write_stats, 0, sizeof(accdb->write_stats) );
 
@@ -190,6 +188,7 @@ fd_accdb_flush_metrics( fd_accdb_t * accdb ) {
     FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, bytes );
     fd_accdb_partition_write_bump( accdb, part_idx, bytes, num_ops );
   }
+  
   if( disk_used_added      ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_used_bytes, disk_used_added      );
   if( disk_used_removed    ) FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, disk_used_removed    );
   if( accounts_total_added ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->accounts_total,  accounts_total_added );
@@ -4067,25 +4066,22 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
    stripes are plain spin locks (see spin_lock_acquire). */
 
 int
-fd_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
-                               fd_accdb_fork_id_t                   fork_id,
-                               ulong                                cnt,
-                               uchar const * const                  pubkeys[],
-                               ulong const                          slots[],
-                               ulong const                          lamports[],
-                               ulong const                          data_lens[],
-                               int const                            executables[],
-                               int const                            snoop_candidates[],
-                               int *                                stripe_locks,
-                               ulong                                stripe_msk,
-                               ulong const                          file_offsets[],
-                               ulong *                              accounts_ignored,
-                               ulong *                              accounts_replaced,
-                               ulong *                              accounts_loaded,
-                               ulong *                              out_replaced_lamports,
-                               ulong *                              out_ignored_lamports,
-                               fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                               void *                               snoop_ctx ) {
+fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
+                               fd_accdb_fork_id_t  fork_id,
+                               ulong               cnt,
+                               uchar const * const pubkeys[],
+                               ulong const         slots[],
+                               ulong const         lamports[],
+                               ulong const         data_lens[],
+                               int const           executables[],
+                               int *               stripe_locks,
+                               ulong               stripe_msk,
+                               ulong const         file_offsets[],
+                               ulong *             accounts_ignored,
+                               ulong *             accounts_replaced,
+                               ulong *             accounts_loaded,
+                               ulong *             out_replaced_lamports,
+                               ulong *             out_ignored_lamports ) {
   FD_TEST( cnt && cnt<=8UL );
   FD_TEST( stripe_locks && file_offsets );
 
@@ -4221,8 +4217,6 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
         }
       }
     }
-
-    if( FD_UNLIKELY( snoop_fn!=NULL && snoop_candidates[ i ] ) ) snoop_fn( snoop_ctx, i );
 
     ulong cross_lamports = cross_existing ? cross_existing->lamports : 0UL;
     spin_lock_release( stripe );
