@@ -150,10 +150,10 @@ FD_STATIC_ASSERT( sizeof(fd_snapin_write_record_t)==16UL, write_record );
 
 struct fd_snapin_account_batch {
   ulong cnt;
-  ulong slot;
   uchar const * pubkeys    [ FD_SSPARSE_ACC_BATCH_MAX ];
   uchar const * owners     [ FD_SSPARSE_ACC_BATCH_MAX ];
   uchar const * datas      [ FD_SSPARSE_ACC_BATCH_MAX ];
+  ulong         slots      [ FD_SSPARSE_ACC_BATCH_MAX ];
   ulong         lamports   [ FD_SSPARSE_ACC_BATCH_MAX ];
   ulong         data_lens  [ FD_SSPARSE_ACC_BATCH_MAX ];
   int           executables[ FD_SSPARSE_ACC_BATCH_MAX ];
@@ -174,6 +174,7 @@ struct fd_snapin_lead {
   uint init_completed : 1;  /* did INIT complete for this attempt? */
 
   ulong seed;
+  long  boot_timestamp;
 
   fd_txncache_t * txncache;
   fd_bank_t *  bank;
@@ -320,8 +321,6 @@ struct fd_snapin_tile {
 
   fd_snapin_shmem_totals_t worker; /* added to shared totals at FINI */
 
-  fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
-
   struct {
     uchar *                    buf;
     fd_snapin_write_record_t * records;
@@ -354,6 +353,10 @@ is_lead( fd_snapin_tile_t const * ctx ) {
 
 static inline int
 should_shutdown( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN && is_lead( ctx ) ) ) {
+    long elapsed_ns = fd_log_wallclock() - ctx->lead.boot_timestamp;
+    FD_LOG_NOTICE(( "loaded snapshot in %.3f seconds", (double)elapsed_ns/1e9 ));
+  }
   return ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN;
 }
 
@@ -1174,7 +1177,7 @@ worker_snoop_winner( void * cb_ctx,
   if( FD_UNLIKELY( !memcmp( pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
     if( FD_UNLIKELY( data_len>FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ) ) return;
     fd_snapin_shmem_t * shmem = ctx->shmem;
-    shmem->slot_history.slot       = batch->slot;
+    shmem->slot_history.slot       = batch->slots[ batch_idx ];
     shmem->slot_history.lamports   = lamports;
     shmem->slot_history.data_len   = data_len;
     shmem->slot_history.executable = batch->executables[ batch_idx ];
@@ -1224,7 +1227,6 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->incr_fork     = ULONG_MAX;
   ctx->gate_pending  = 0;
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
-  fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
   ctx->writer.buf_used   = 0UL;
   ctx->writer.record_cnt = 0UL;
   ctx->staged.active = 0;
@@ -1246,13 +1248,13 @@ worker_commit_batch( fd_snapin_tile_t *              ctx,
   ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
   fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
   fd_snapin_snoop_ctx_t snoop = { .tile=ctx, .batch=batch };
-  if( FD_UNLIKELY( fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, batch->cnt, batch->pubkeys, batch->slot, batch->lamports,
-                                                         batch->data_lens, batch->executables, candidates,
-                                                         ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
-                                                         batch->file_offsets, ctx->worker_metrics,
-                                                         &accounts_ignored, &accounts_replaced,
-                                                         &accounts_loaded, &replaced_lamports, &ignored_lamports,
-                                                         worker_snoop_winner, &snoop ) ) ) return -1;
+  if( FD_UNLIKELY( fd_accdb_snapshot_write_batch( ctx->accdb, fork_id, batch->cnt, batch->pubkeys,
+                                                  batch->slots, batch->lamports, batch->data_lens, batch->executables,
+                                                  candidates, ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
+                                                  batch->file_offsets,
+                                                  &accounts_ignored, &accounts_replaced,
+                                                  &accounts_loaded, &replaced_lamports, &ignored_lamports,
+                                                  worker_snoop_winner, &snoop ) ) ) return -1;
 
   ctx->metrics.accounts_ignored  += accounts_ignored;
   ctx->metrics.accounts_replaced += accounts_replaced;
@@ -1278,10 +1280,8 @@ writer_flush( fd_snapin_tile_t * ctx ) {
     ulong cnt = (ulong)record->batch_cnt;
     FD_TEST( cnt && cnt<=FD_SSPARSE_ACC_BATCH_MAX && record_idx+cnt<=ctx->writer.record_cnt );
 
-    fd_snapin_account_batch_t batch = {
-      .cnt  = cnt,
-      .slot = (ulong)record->slot,
-    };
+    fd_snapin_account_batch_t batch;
+    batch.cnt = cnt;
 
     for( ulong i=0UL; i<cnt; i++ ) {
       record = &ctx->writer.records[ record_idx+i ];
@@ -1289,11 +1289,11 @@ writer_flush( fd_snapin_tile_t * ctx ) {
       batch.pubkeys    [ i ] = meta->pubkey;
       batch.owners     [ i ] = meta->owner;
       batch.datas      [ i ] = meta->b+sizeof(fd_accdb_disk_meta_t);
+      batch.slots      [ i ] = (ulong)record->slot;
       batch.lamports   [ i ] = record->lamports;
       batch.data_lens  [ i ] = (ulong)meta->size;
       batch.executables[ i ] = (int)record->executable;
       batch.file_offsets[ i ] = base_off+buf_off;
-      FD_TEST( (ulong)record->slot==batch.slot );
       buf_off += sizeof(fd_accdb_disk_meta_t)+(ulong)meta->size;
     }
 
@@ -1684,34 +1684,6 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   }
 }
 
-/* Log snoop checksums for single-tile comparisons. */
-
-static void
-log_snoop_checksums( fd_snapin_tile_t * ctx ) {
-  fd_stake_delegations_t * sd = ctx->stake_delegations;
-  fd_stake_delegation_t const * root_pool  = fd_type_pun_const( (uchar const *)sd + sd->pool_offset_ );
-  fd_stake_delegation_t const * delta_pool = fd_type_pun_const( (uchar const *)sd + sd->delta_pool_offset_ );
-  ulong stake_cs  = 0UL;
-  ulong stake_cnt = 0UL;
-  for( ulong i=0UL; i<sd->pool_idx_wmk_; i++ ) {
-    fd_stake_delegation_t const * d = &root_pool[ i ];
-    if( !d->in_use ) continue;
-    if( d->delta_idx!=UINT_MAX ) d = &delta_pool[ d->delta_idx ];
-    if( d->is_tombstone ) continue;
-    ulong h = fd_hash( 0x57A4EUL, d->stake_account.uc, 32UL );
-    h = fd_hash( h, d->vote_account.uc, 32UL );
-    ulong nums[ 6 ] = { d->stake, d->lamports, d->credits_observed,
-                        (ulong)d->activation_epoch, (ulong)d->deactivation_epoch, (ulong)d->acc_dlen };
-    h = fd_hash( h, nums, sizeof(nums) );
-    stake_cs += h; /* order independent */
-    stake_cnt++;
-  }
-  ulong feature_cs = fd_hash( 0xFEA7UL, ctx->lead.feature_snoop, sizeof(fd_feature_snoop_t) );
-  ulong sh_cs      = ctx->lead.slot_history.captured ? fd_hash( 0x5107UL, ctx->lead.slot_history.buf, ctx->lead.slot_history.data_len ) : 0UL;
-  FD_LOG_NOTICE(( "snoop A/B: stake_cnt=%lu stake_cs=%016lx feature_cs=%016lx slot_history_slot=%lu slot_history_cs=%016lx",
-                  stake_cnt, stake_cs, feature_cs, ctx->lead.slot_history.captured ? ctx->lead.slot_history.slot : 0UL, sh_cs ));
-}
-
 /* Roll back after every tile has sent its FAIL ack. */
 
 static void
@@ -1934,7 +1906,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
       fd_accdb_flush_metrics( ctx->accdb );
-      fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
 
       /* Add this tile's capitalization before the FINI ack. */
       fd_snapin_shmem_totals_t * totals = &ctx->shmem->totals;
@@ -2004,9 +1975,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
-      /* Verify disk reads before advance_root recycles old entries. */
-      fd_accdb_snapshot_verify_readback( ctx->accdb, 100000UL );
-
       if( !ctx->full ) {
         fd_accdb_snapshot_recover_delta( ctx->accdb, ctx->lead.accdb_incr_fork_id );
         /* ensure that snapin tile sees all delta changes before rooting */
@@ -2019,8 +1987,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       fd_accdb_snapshot_load_end( ctx->accdb );
 
       fd_feature_snoop_finalize( &ctx->lead.bank->f.features, ctx->lead.bank_slot, &ctx->lead.epoch_schedule, ctx->lead.feature_snoop );
-
-      log_snoop_checksums( ctx );
 
       /* Notify replay when snapshot is fully loaded and verified. */
       fd_stem_publish( stem, ctx->lead.manifest_out.idx, fd_ssmsg_sig( FD_SSMSG_DONE ), 0UL, 0UL, 0UL, 0UL, 0UL );
@@ -2036,7 +2002,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
     case FD_SNAPSHOT_MSG_CTRL_FAIL: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
-      fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
       fd_accdb_flush_metrics( ctx->accdb );
       FD_COMPILER_MFENCE(); /* publish before ack */
       worker_reset_attempt( ctx );
@@ -2372,6 +2337,7 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_memset( &ctx->lead.recovery.accdb_metadata, 0, sizeof(ctx->lead.recovery.accdb_metadata) );
 
   fd_memset( &ctx->lead.flags, 0, sizeof(ctx->lead.flags) );
+  ctx->lead.boot_timestamp = fd_log_wallclock();
 }
 
 /* There are 3 output links that affect the calculation of STEM_BURST:

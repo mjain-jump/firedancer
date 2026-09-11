@@ -515,12 +515,13 @@ fd_accdb_shmem_bytes_freed( fd_accdb_shmem_t * accdb,
      believes __builtin_object_size( &partition->bytes_freed )==0, which
      trips a spurious -Wstringop-overflow on the atomic add below. */
   FD_COMPILER_FORGET( partition );
-  FD_ATOMIC_FETCH_AND_ADD( &partition->bytes_freed, sz );
+  ulong bytes_freed = FD_ATOMIC_FETCH_AND_ADD( &partition->bytes_freed, sz ) + sz;
 
   /* Fast-path exit: skip the lock if clearly below threshold or
      already enqueued. */
-  if( FD_LIKELY( partition->bytes_freed<(accdb->partition_sz*FD_ACCDB_COMPACTION_THRESHOLD_PCT/100UL) ) ) return;
+  if( FD_LIKELY( bytes_freed<(accdb->partition_sz*FD_ACCDB_COMPACTION_THRESHOLD_PCT/100UL) ) ) return;
   if( FD_UNLIKELY( partition->marked_compaction ) ) return;
+  if( FD_UNLIKELY( FD_VOLATILE_CONST( accdb->snapshot_loading ) ) ) return;
 
   spin_lock_acquire( &accdb->partition_lock );
   fd_accdb_shmem_try_enqueue_compaction( accdb, partition_idx );

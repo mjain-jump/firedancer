@@ -84,7 +84,6 @@ static ulong test_accdb_advance_root_cnt;
 static ulong test_accdb_load_begin_cnt;
 static ulong test_accdb_load_end_cnt;
 static ulong test_accdb_flush_metrics_cnt;
-static ulong test_accdb_readback_cnt;
 static ulong test_accdb_recover_delta_cnt;
 static ulong test_accdb_save_whead_cnt;
 static ulong test_accdb_revert_whead_cnt;
@@ -151,13 +150,11 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_accdb_snapshot_load_begin                 mock_accdb_snapshot_load_begin
 #define fd_accdb_snapshot_load_end                   mock_accdb_snapshot_load_end
 #define fd_accdb_flush_metrics                       mock_accdb_flush_metrics
-#define fd_accdb_snapshot_flush_worker_metrics       mock_accdb_snapshot_flush_worker_metrics
-#define fd_accdb_snapshot_verify_readback            mock_accdb_snapshot_verify_readback
 #define fd_accdb_snapshot_recover_delta              mock_accdb_snapshot_recover_delta
 #define fd_accdb_snapshot_save_whead                 mock_accdb_snapshot_save_whead
 #define fd_accdb_snapshot_revert_whead               mock_accdb_snapshot_revert_whead
 #define fd_accdb_snapshot_reserve_write              mock_accdb_snapshot_reserve_write
-#define fd_accdb_snapshot_write_batch_worker         mock_accdb_snapshot_write_batch_worker
+#define fd_accdb_snapshot_write_batch                mock_accdb_snapshot_write_batch
 #define fd_txncache_reset                            mock_txncache_reset
 #define fd_txncache_snapin_scratch                   mock_txncache_snapin_scratch
 #define fd_ssmanifest_parser_init                    mock_ssmanifest_parser_init
@@ -179,13 +176,11 @@ test_stem_publish( fd_stem_context_t * stem,
 #undef fd_ssmanifest_parser_init
 #undef fd_txncache_snapin_scratch
 #undef fd_txncache_reset
-#undef fd_accdb_snapshot_write_batch_worker
+#undef fd_accdb_snapshot_write_batch
 #undef fd_accdb_snapshot_reserve_write
 #undef fd_accdb_snapshot_revert_whead
 #undef fd_accdb_snapshot_save_whead
 #undef fd_accdb_snapshot_recover_delta
-#undef fd_accdb_snapshot_verify_readback
-#undef fd_accdb_snapshot_flush_worker_metrics
 #undef fd_accdb_flush_metrics
 #undef fd_accdb_snapshot_load_end
 #undef fd_accdb_snapshot_load_begin
@@ -236,21 +231,6 @@ mock_accdb_advance_root( fd_accdb_t *       accdb,
 
 void mock_accdb_snapshot_load_begin( fd_accdb_t * accdb ) { (void)accdb; test_accdb_load_begin_cnt++; }
 
-void
-mock_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
-                                          fd_accdb_snapshot_worker_metrics_t * m ) {
-  (void)accdb;
-  fd_memset( m, 0, sizeof(*m) );
-}
-
-void
-mock_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
-                                     ulong        sample_max ) {
-  (void)accdb;
-  (void)sample_max;
-  test_accdb_readback_cnt++;
-}
-
 int
 mock_accdb_snapshot_recover_delta( fd_accdb_t *       accdb,
                                    fd_accdb_fork_id_t fork_id ) {
@@ -285,37 +265,35 @@ mock_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
 }
 
 int
-mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
-                                        fd_accdb_fork_id_t                   fork_id,
-                                        ulong                                cnt,
-                                        uchar const * const                  pubkeys[],
-                                        ulong                                slot,
-                                        ulong const                          lamports[],
-                                        ulong const                          data_lens[],
-                                        int const                            executables[],
-                                        int const                            snoop_candidates[],
-                                        int *                                stripe_locks,
-                                        ulong                                stripe_msk,
-                                        ulong const                          file_offsets[],
-                                        fd_accdb_snapshot_worker_metrics_t * metrics,
-                                        ulong *                              accounts_ignored,
-                                        ulong *                              accounts_replaced,
-                                        ulong *                              accounts_loaded,
-                                        ulong *                              out_replaced_lamports,
-                                        ulong *                              out_ignored_lamports,
-                                        fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                                        void *                               snoop_ctx ) {
+mock_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
+                                 fd_accdb_fork_id_t                   fork_id,
+                                 ulong                                cnt,
+                                 uchar const * const                  pubkeys[],
+                                 ulong const                          slots[],
+                                 ulong const                          lamports[],
+                                 ulong const                          data_lens[],
+                                 int const                            executables[],
+                                 int const                            snoop_candidates[],
+                                 int *                                stripe_locks,
+                                 ulong                                stripe_msk,
+                                 ulong const                          file_offsets[],
+                                 ulong *                              accounts_ignored,
+                                 ulong *                              accounts_replaced,
+                                 ulong *                              accounts_loaded,
+                                 ulong *                              out_replaced_lamports,
+                                 ulong *                              out_ignored_lamports,
+                                 fd_accdb_snapshot_snoop_fn_t         snoop_fn,
+                                 void *                               snoop_ctx ) {
   (void)accdb;
   (void)fork_id;
   (void)pubkeys;
-  (void)slot;
+  (void)slots;
   (void)lamports;
   (void)data_lens;
   (void)executables;
   (void)stripe_locks;
   (void)stripe_msk;
   (void)file_offsets;
-  (void)metrics;
   *accounts_ignored      = 0UL;
   *accounts_replaced     = 0UL;
   *accounts_loaded       = cnt;
@@ -460,6 +438,7 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
   ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+  ctx->lead.boot_timestamp     = fd_log_wallclock();
   ctx->lead.txncache_max_groups_per_slot  = TEST_MAX_GROUPS_PER_SLOT;
   ctx->lead.txncache_max_entries_per_slot = TEST_MAX_ENTRIES_PER_SLOT;
   ctx->lead.txncache_entries_max          = TEST_MAX_ENTRIES;
@@ -510,7 +489,6 @@ test_counters_reset( void ) {
   test_accdb_load_begin_cnt     = 0UL;
   test_accdb_load_end_cnt       = 0UL;
   test_accdb_flush_metrics_cnt  = 0UL;
-  test_accdb_readback_cnt       = 0UL;
   test_accdb_recover_delta_cnt  = 0UL;
   test_accdb_save_whead_cnt     = 0UL;
   test_accdb_revert_whead_cnt   = 0UL;
@@ -556,8 +534,6 @@ test_cluster_new( ulong tile_cnt,
                                      tile_cnt*FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
   FD_TEST( cl->write_records );
 
-  /* log_snoop_checksums walks the root stake delegation pool; a zeroed
-     struct (pool_idx_wmk_==0) is an empty pool. */
   cl->stake_delegations = aligned_alloc( 128UL, fd_ulong_align_up( sizeof(fd_stake_delegations_t), 128UL ) );
   FD_TEST( cl->stake_delegations );
   fd_memset( cl->stake_delegations, 0, sizeof(fd_stake_delegations_t) );
@@ -606,6 +582,7 @@ test_cluster_new( ulong tile_cnt,
 
     ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
     ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    ctx->lead.boot_timestamp     = fd_log_wallclock();
 
     worker_reset_attempt( ctx );
   }
@@ -2630,7 +2607,6 @@ test_full_lifecycle_9_tiles( void ) {
 
   ulong pub0 = test_pub_cnt;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_DONE );
-  FD_TEST( test_accdb_readback_cnt==1UL );
   FD_TEST( test_accdb_recover_delta_cnt==1UL );
   FD_TEST( test_accdb_advance_root_cnt==1UL );
   FD_TEST( test_accdb_load_end_cnt==1UL );

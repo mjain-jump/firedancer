@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -115,8 +114,8 @@ typedef struct {
 } test_background_ctx_t;
 
 /* test_snoop_ctx_t / test_snoop_record: a minimal snoop_fn recorder
-   for fd_accdb_snapshot_write_batch_worker's winner-gated callback.
-   The driver stamps cur_pubkey/cur_slot before each write_batch_worker
+   for fd_accdb_snapshot_write_batch's winner-gated callback.
+   The driver stamps cur_pubkey/cur_slot before each write_batch
    call (batch_idx alone does not identify which call produced it),
    and test_snoop_record appends (pubkey, slot) to log[] in the order
    the callback actually fired. */
@@ -1337,8 +1336,8 @@ test_revert_whead( void ) {
   test_teardown( accdb, fd );
 }
 
-/* test_deferred_write_stats: snapshot_write_batch holds
-   disk_current_bytes in the accdb instead of publishing it per
+/* test_deferred_write_stats: snapshot writes hold disk_current_bytes
+   in the accdb instead of publishing it per
    account, while disk_used_bytes and accounts_total stay immediate.
    Check both halves, over inserts, replaces and ignores. */
 static void
@@ -1352,17 +1351,9 @@ test_deferred_write_stats( void ) {
 
   uchar pk_a[ 32UL ] = { 0xA0 };
   uchar pk_b[ 32UL ] = { 0xA1 };
-  uchar const * pubkeys[ 2 ] = { pk_a, pk_b };
-  ulong lamports   [ 2 ] = { 1UL,   2UL  };
-  ulong data_lens  [ 2 ] = { 100UL, 200UL };
-  int   executables[ 2 ] = { 0, 0 };
-  ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-
-  FD_TEST( !fd_accdb_snapshot_write_batch( accdb, SENTINEL, 2UL, pubkeys, 10UL,
-                                           lamports, data_lens, executables,
-                                           &ignored, &replaced, &loaded,
-                                           &replaced_lamports, &ignored_lamports ) );
-  FD_TEST( !ignored && !replaced && loaded==2UL );
+  ulong replaced_lamports;
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, SENTINEL, pk_a, 10UL, 1UL, 100UL, 0, &replaced_lamports )==1 );
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, SENTINEL, pk_b, 10UL, 2UL, 200UL, 0, &replaced_lamports )==1 );
 
   ulong meta_sz = sizeof(fd_accdb_disk_meta_t);
 
@@ -1371,24 +1362,9 @@ test_deferred_write_stats( void ) {
   FD_TEST( shmetrics->disk_used_bytes   ==2UL*meta_sz + 100UL + 200UL );
   FD_TEST( shmetrics->accounts_total    ==2UL );
 
-  /* Replace pk_a at a newer slot, ignore pk_b at an older one.  A
-     batch now shares one slot across all its entries, so drive the
-     two different target slots as separate single-entry batches
-     (each write_batch_worker caller does the same: every account in
-     one parser batch already comes from a single AppendVec / slot). */
-  data_lens[ 0 ] = 300UL;
-  FD_TEST( !fd_accdb_snapshot_write_batch( accdb, SENTINEL, 1UL, pubkeys, 20UL,
-                                           lamports, data_lens, executables,
-                                           &ignored, &replaced, &loaded,
-                                           &replaced_lamports, &ignored_lamports ) );
-  FD_TEST( !ignored && replaced==1UL && !loaded );
-
-  data_lens[ 1 ] = 400UL;
-  FD_TEST( !fd_accdb_snapshot_write_batch( accdb, SENTINEL, 1UL, pubkeys+1, 5UL,
-                                           lamports+1, data_lens+1, executables+1,
-                                           &ignored, &replaced, &loaded,
-                                           &replaced_lamports, &ignored_lamports ) );
-  FD_TEST( ignored==1UL && !replaced && !loaded );
+  /* Replace pk_a at a newer slot and ignore pk_b at an older one. */
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, SENTINEL, pk_a, 20UL, 1UL, 300UL, 0, &replaced_lamports )==2 );
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, SENTINEL, pk_b,  5UL, 2UL, 400UL, 0, &replaced_lamports )==-1 );
 
   /* Only live entries count as used, and the replaced one stops
      counting.  The ignored entry never counted. */
@@ -1422,28 +1398,17 @@ test_deferred_write_stats_rollover( void ) {
   fd_accdb_snapshot_load_begin( accdb );
 
   /* 4 MiB each, so the third entry does not fit in the first
-     partition and the batch rolls over exactly once. */
+     partition and the writes roll over exactly once. */
   ulong entry_sz = 4UL<<20UL;
   uchar pks[ 4 ][ 32UL ];
-  uchar const * pubkeys[ 4 ];
-  ulong lamports   [ 4 ];
-  ulong data_lens  [ 4 ];
-  int   executables[ 4 ];
+  ulong replaced_lamports;
   for( ulong i=0UL; i<4UL; i++ ) {
     fd_memset( pks[ i ], 0, 32UL );
-    pks[ i ][ 0 ]    = (uchar)( 0xB0+i );
-    pubkeys[ i ]     = pks[ i ];
-    lamports[ i ]    = i+1UL;
-    data_lens[ i ]   = entry_sz-sizeof(fd_accdb_disk_meta_t);
-    executables[ i ] = 0;
+    pks[ i ][ 0 ] = (uchar)( 0xB0+i );
+    FD_TEST( fd_accdb_snapshot_write_one( accdb, SENTINEL, pks[ i ], 10UL, i+1UL,
+                                          entry_sz-sizeof(fd_accdb_disk_meta_t), 0,
+                                          &replaced_lamports )==1 );
   }
-
-  ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-  FD_TEST( !fd_accdb_snapshot_write_batch( accdb, SENTINEL, 4UL, pubkeys, 10UL,
-                                           lamports, data_lens, executables,
-                                           &ignored, &replaced, &loaded,
-                                           &replaced_lamports, &ignored_lamports ) );
-  FD_TEST( !ignored && !replaced && loaded==4UL );
 
   fd_accdb_snapshot_load_end( accdb );
 
@@ -1559,7 +1524,7 @@ test_deferred_write_stats_two_joiners( void ) {
 }
 
 /* test_snapshot_striped_writers: adversarial multi-threaded coverage of
-   fd_accdb_snapshot_write_batch_worker.  T writer threads slam the
+   fd_accdb_snapshot_write_batch.  T writer threads slam the
    SAME set of pubkeys (same hash chains) concurrently while sharing
    one disk write head:
 
@@ -1606,42 +1571,43 @@ test_store_record( void * ctx_,
 }
 
 static int
-test_write_batch_worker( fd_accdb_t *                         accdb,
-                         fd_accdb_fork_id_t                   fork_id,
-                         ulong                                cnt,
-                         uchar const * const                  pubkeys[],
-                         ulong                                slot,
-                         ulong const                          lamports[],
-                         ulong const                          data_lens[],
-                         int const                            executables[],
-                         int const                            snoop_candidates[],
-                         int *                                stripe_locks,
-                         ulong                                stripe_msk,
-                         fd_accdb_snapshot_worker_metrics_t * metrics,
-                         ulong *                              accounts_ignored,
-                         ulong *                              accounts_replaced,
-                         ulong *                              accounts_loaded,
-                         ulong *                              out_replaced_lamports,
-                         ulong *                              out_ignored_lamports,
-                         test_store_ctx_t *                   store,
-                         fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                         void *                               snoop_ctx ) {
+test_write_batch( fd_accdb_t *                         accdb,
+                  fd_accdb_fork_id_t                   fork_id,
+                  ulong                                cnt,
+                  uchar const * const                  pubkeys[],
+                  ulong                                slot,
+                  ulong const                          lamports[],
+                  ulong const                          data_lens[],
+                  int const                            executables[],
+                  int const                            snoop_candidates[],
+                  int *                                stripe_locks,
+                  ulong                                stripe_msk,
+                  ulong *                              accounts_ignored,
+                  ulong *                              accounts_replaced,
+                  ulong *                              accounts_loaded,
+                  ulong *                              out_replaced_lamports,
+                  ulong *                              out_ignored_lamports,
+                  test_store_ctx_t *                   store,
+                  fd_accdb_snapshot_snoop_fn_t         snoop_fn,
+                  void *                               snoop_ctx ) {
   ulong total_sz = 0UL;
   for( ulong i=0UL; i<cnt; i++ ) total_sz += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
 
   ulong file_offsets[ 8 ];
+  ulong slots[ 8 ];
   ulong file_off = fd_accdb_snapshot_reserve_write( accdb, total_sz );
   for( ulong i=0UL; i<cnt; i++ ) {
+    slots[ i ] = slot;
     file_offsets[ i ] = file_off;
     test_store_record( store, i, file_off );
     file_off += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
   }
 
-  return fd_accdb_snapshot_write_batch_worker( accdb, fork_id, cnt, pubkeys, slot, lamports, data_lens,
-                                               executables, snoop_candidates, stripe_locks, stripe_msk,
-                                               file_offsets, metrics, accounts_ignored, accounts_replaced,
-                                               accounts_loaded, out_replaced_lamports, out_ignored_lamports,
-                                               snoop_fn, snoop_ctx );
+  return fd_accdb_snapshot_write_batch( accdb, fork_id, cnt, pubkeys, slots, lamports, data_lens,
+                                        executables, snoop_candidates, stripe_locks, stripe_msk,
+                                        file_offsets, accounts_ignored, accounts_replaced,
+                                        accounts_loaded, out_replaced_lamports, out_ignored_lamports,
+                                        snoop_fn, snoop_ctx );
 }
 
 typedef struct {
@@ -1654,7 +1620,6 @@ typedef struct {
   uchar            (*pks)[ 32UL ];
 
   /* outputs */
-  fd_accdb_snapshot_worker_metrics_t m[1];
   ulong ignored;
   ulong replaced;
   ulong loaded;
@@ -1690,8 +1655,8 @@ par_writer_main( void * _ctx ) {
     ctx->store.data_lens = data_lens;
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-    FD_TEST( !test_write_batch_worker( ctx->accdb, ctx->fork, batch, pubkeys, slot, lamports,
-                                       data_lens, execs, NULL, ctx->stripe_locks, ctx->stripe_msk, ctx->m,
+    FD_TEST( !test_write_batch( ctx->accdb, ctx->fork, batch, pubkeys, slot, lamports,
+                                       data_lens, execs, NULL, ctx->stripe_locks, ctx->stripe_msk,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &ctx->store, NULL, NULL ) );
     ctx->ignored  += ignored;
@@ -1705,47 +1670,12 @@ par_writer_main( void * _ctx ) {
   return NULL;
 }
 
-/* Count live index entries for pubkey and return the accmeta of the
-   (unique) entry.  Uses the same chain walk as the write path. */
-static fd_accdb_accmeta_t *
-par_find_unique( fd_accdb_shmem_t * shmem,
-                 ulong              max_accounts,
-                 uchar const *      pubkey ) {
-  ulong max_live_slots = shmem->max_live_slots;
-  ulong chain_cnt      = shmem->chain_cnt;
-  FD_SCRATCH_ALLOC_INIT( l, shmem );
-                                    FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
-                                    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
-                                    FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
-  uint *               acc_map     = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
-  fd_accdb_accmeta_t * acc_pool    = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
-
-  ulong hash = fd_hash32( pubkey, shmem->seed )&(chain_cnt-1UL);
-  fd_accdb_accmeta_t * found = NULL;
-  ulong cnt = 0UL;
-  uint next = acc_map[ hash ];
-  while( next!=UINT_MAX ) {
-    fd_accdb_accmeta_t * cand = &acc_pool[ next ];
-    if( !memcmp( cand->key.pubkey, pubkey, 32UL ) ) { found = cand; cnt++; }
-    next = cand->map.next;
-  }
-  FD_TEST( cnt==1UL ); /* double insert would show up here */
-  return found;
-}
-
-static int
-par_offset_cmp( void const * a, void const * b ) {
-  ulong ua = ((ulong const *)a)[0]; ulong ub = ((ulong const *)b)[0];
-  return ua<ub ? -1 : (ua>ub ? 1 : 0);
-}
-
-/* Replay the shmem layout to reach the fork/acc/txn element arrays (the
-   private joiner struct is local to fd_accdb.c).  Keep in sync with
-   fd_accdb_shmem_new. */
+/* Replay the shmem layout to reach the fork/acc/txn element arrays. */
 typedef struct {
   fd_accdb_fork_shmem_t * fork_ele;
-  fd_accdb_accmeta_t *    acc_ele;
-  fd_accdb_txn_t *        txn_ele;
+  uint *                   acc_map;
+  fd_accdb_accmeta_t *     acc_ele;
+  fd_accdb_txn_t *         txn_ele;
 } par_layout_t;
 
 static par_layout_t
@@ -1758,10 +1688,36 @@ par_layout( ulong max_accounts ) {
                  FD_SCRATCH_ALLOC_APPEND( l, FD_ACCDB_SHMEM_ALIGN,           sizeof(fd_accdb_shmem_t)                                );
   out.fork_ele = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_fork_shmem_t), max_live_slots*sizeof(fd_accdb_fork_shmem_t)            );
                  FD_SCRATCH_ALLOC_APPEND( l, descends_set_align(),           max_live_slots*descends_set_footprint( max_live_slots ) );
-                 FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
+  out.acc_map  = FD_SCRATCH_ALLOC_APPEND( l, alignof(uint),                  chain_cnt*sizeof(uint)                                  );
   out.acc_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_accmeta_t),    max_accounts*sizeof(fd_accdb_accmeta_t)                 );
   out.txn_ele  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_accdb_txn_t),        txn_max*sizeof(fd_accdb_txn_t)                          );
   return out;
+}
+
+/* Count live index entries for pubkey and return the accmeta of the
+   (unique) entry.  Uses the same chain walk as the write path. */
+static fd_accdb_accmeta_t *
+par_find_unique( fd_accdb_shmem_t * shmem,
+                 ulong              max_accounts,
+                 uchar const *      pubkey ) {
+  par_layout_t layout = par_layout( max_accounts );
+  ulong hash = fd_hash32( pubkey, shmem->seed )&(shmem->chain_cnt-1UL);
+  fd_accdb_accmeta_t * found = NULL;
+  ulong cnt = 0UL;
+  uint next = layout.acc_map[ hash ];
+  while( next!=UINT_MAX ) {
+    fd_accdb_accmeta_t * cand = &layout.acc_ele[ next ];
+    if( !memcmp( cand->key.pubkey, pubkey, 32UL ) ) { found = cand; cnt++; }
+    next = cand->map.next;
+  }
+  FD_TEST( cnt==1UL ); /* double insert would show up here */
+  return found;
+}
+
+static int
+par_offset_cmp( void const * a, void const * b ) {
+  ulong ua = ((ulong const *)a)[0]; ulong ub = ((ulong const *)b)[0];
+  return ua<ub ? -1 : (ua>ub ? 1 : 0);
 }
 
 static void
@@ -1826,7 +1782,7 @@ test_snapshot_striped_writers( void ) {
         all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].store.sizes  [ j ];
         all_cnt++;
       }
-      fd_accdb_snapshot_flush_worker_metrics( joins[ t ], ctxs[ t ].m );
+      fd_accdb_flush_metrics( joins[ t ] );
     }
 
     /* Reserved ranges never overlap. */
@@ -1893,10 +1849,6 @@ test_snapshot_striped_writers( void ) {
 
   fd_accdb_snapshot_load_end( accdb );
 
-  /* The sampled index->file readback gate passes against the metas the
-     winners staged at their explicit offsets. */
-  fd_accdb_snapshot_verify_readback( accdb, PAR_KEYS );
-
   /* Exactly the live entries are checked out of the shared pool.
      Drains the pool, so this must be the last thing the test does with it. */
   acc_pool_t pool_join[ 1 ];
@@ -1941,8 +1893,8 @@ par_incr_writer_main( void * _ctx ) {
     ctx->store.data_lens = data_lens;
 
     ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-    FD_TEST( !test_write_batch_worker( ctx->accdb, ctx->fork, 1UL, pubkeys, slot, lamports,
-                                       data_lens, execs, NULL, ctx->stripe_locks, ctx->stripe_msk, ctx->m,
+    FD_TEST( !test_write_batch( ctx->accdb, ctx->fork, 1UL, pubkeys, slot, lamports,
+                                       data_lens, execs, NULL, ctx->stripe_locks, ctx->stripe_msk,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &ctx->store, NULL, NULL ) );
     ctx->ignored           += ignored;
@@ -2000,7 +1952,6 @@ test_run_striped_incr_attempt( fd_accdb_t *       reader,
       all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].store.sizes  [ j ];
       all_cnt++;
     }
-    fd_accdb_snapshot_flush_worker_metrics( joins[ t ], ctxs[ t ].m );
     fd_accdb_flush_metrics( joins[ t ] );
   }
 
@@ -2111,7 +2062,6 @@ test_snapshot_striped_writers_incremental( void ) {
   }
   for( ulong t=0UL; t<PAR_THREADS; t++ ) FD_TEST( !pthread_join( threads[ t ], NULL ) );
   for( ulong t=0UL; t<PAR_THREADS; t++ ) {
-    fd_accdb_snapshot_flush_worker_metrics( joins[ t ], ctxs[ t ].m );
     fd_accdb_flush_metrics( joins[ t ] );
   }
   FD_TEST( shmetrics->accounts_total==PAR_KEYS );
@@ -2171,17 +2121,17 @@ test_snapshot_striped_writers_incremental( void ) {
     eq->store.fd        = fd;
     eq->store.pubkeys   = pubkeys;
     eq->store.data_lens = data_lens;
-    FD_TEST( !test_write_batch_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
-                                       data_lens, execs, NULL, stripe_locks, stripe_msk, eq->m,
+    FD_TEST( !test_write_batch( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
+                                       data_lens, execs, NULL, stripe_locks, stripe_msk,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &eq->store, NULL, NULL ) );
     FD_TEST( replaced==1UL && eq->store.cnt==1UL ); /* cross override of the promoted winner */
-    FD_TEST( !test_write_batch_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
-                                       data_lens, execs, NULL, stripe_locks, stripe_msk, eq->m,
+    FD_TEST( !test_write_batch( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
+                                       data_lens, execs, NULL, stripe_locks, stripe_msk,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &eq->store, NULL, NULL ) );
     FD_TEST( !ignored && replaced==1UL && eq->store.cnt==2UL );
-    fd_accdb_snapshot_flush_worker_metrics( joins[ 0 ], eq->m );
+    fd_accdb_flush_metrics( joins[ 0 ] );
   }
   fd_accdb_purge( reader, eq_fork );
   drain_background( reader );
@@ -2201,10 +2151,6 @@ test_snapshot_striped_writers_incremental( void ) {
   }
   /* Shadowed full versions were unlinked by the promotion. */
   FD_TEST( shmetrics->accounts_total==PAR_INCR_KEYS );
-
-  /* The sampled index->file readback covers both phases' explicit
-     offsets. */
-  fd_accdb_snapshot_verify_readback( reader, PAR_INCR_KEYS );
 
   for( ulong t=0UL; t<PAR_THREADS; t++ ) free( joins[ t ] );
   test_teardown( reader, fd );
@@ -2334,17 +2280,9 @@ test_incremental_retry_reuses_acc_pool( void ) {
   fd_accdb_fork_id_t success = fd_accdb_attach_child( accdb, root );
   uchar success_pk[ 32UL ] = { 0xE0 };
   uchar const * pubkeys[ 2 ] = { full_pk, success_pk };
-  ulong lamports   [ 2 ] = { 10UL, 20UL };
-  ulong data_lens  [ 2 ] = { 0UL,  0UL };
-  int   executables[ 2 ] = { 0,    0 };
-  ulong ignored, replaced, loaded, ignored_lamports;
-
-  FD_TEST( !fd_accdb_snapshot_write_batch( accdb, success, 2UL, pubkeys, 30UL,
-                                           lamports, data_lens, executables,
-                                           &ignored, &replaced, &loaded,
-                                           &replaced_lamports, &ignored_lamports ) );
-  FD_TEST( !ignored && replaced==1UL && loaded==1UL );
-  FD_TEST( replaced_lamports==1UL && !ignored_lamports );
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, success, full_pk,    30UL, 10UL, 0UL, 0, &replaced_lamports )==2 );
+  FD_TEST( replaced_lamports==1UL );
+  FD_TEST( fd_accdb_snapshot_write_one( accdb, success, success_pk, 30UL, 20UL, 0UL, 0, &replaced_lamports )==1 );
   FD_TEST( acc_pool_private_vidx_idx( FD_VOLATILE_CONST( pool->ver_top ) )==acc_pool_idx_null() );
   FD_TEST( FD_VOLATILE_CONST( pool->ver_lazy )==lazy_before );
 
@@ -2367,7 +2305,7 @@ test_incremental_retry_reuses_acc_pool( void ) {
     ulong read_lamports;
     FD_TEST( accdb_read( accdb, next, pubkeys[ i ], &read_lamports,
                          NULL, NULL, NULL ) );
-    FD_TEST( read_lamports==lamports[ i ] );
+    FD_TEST( read_lamports==10UL*(i+1UL) );
   }
 
   free( background );
@@ -2474,12 +2412,11 @@ test_equal_slot_last_arrival( void ) {
   ulong data_lens[ 1 ] = { 1UL };
   int executables[ 1 ] = { 0 };
   ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_snapshot_worker_metrics_t metrics = {0};
   int stripe_locks[ 4UL ] = {0};
   test_store_ctx_t store = { .fd=fd, .pubkeys=pubkeys, .data_lens=data_lens };
 
-  FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 42UL, lamports,
-                                     data_lens, executables, NULL, stripe_locks, 3UL, &metrics,
+  FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 42UL, lamports,
+                                     data_lens, executables, NULL, stripe_locks, 3UL,
                                      &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                      &store, NULL, NULL ) );
   FD_TEST( loaded==1UL );
@@ -2487,8 +2424,8 @@ test_equal_slot_last_arrival( void ) {
   lamports[ 0 ] = 2UL;
   data_lens[ 0 ] = 2UL;
   executables[ 0 ] = 1;
-  FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 42UL, lamports,
-                                     data_lens, executables, NULL, stripe_locks, 3UL, &metrics,
+  FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 42UL, lamports,
+                                     data_lens, executables, NULL, stripe_locks, 3UL,
                                      &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                      &store, NULL, NULL ) );
   FD_TEST( !ignored && replaced==1UL && !loaded );
@@ -2503,7 +2440,7 @@ test_equal_slot_last_arrival( void ) {
   test_teardown( accdb, fd );
 }
 
-/* test_snoop_winner_gated_callback: fd_accdb_snapshot_write_batch_worker
+/* test_snoop_winner_gated_callback: fd_accdb_snapshot_write_batch
    must invoke snoop_fn for a snoop_candidate account exactly when its
    outcome is insert-or-replace, and never for an ignored/losing one.
    Two "writers" racing the same pubkey at slots 10 and 20 model this
@@ -2528,20 +2465,19 @@ test_snoop_winner_gated_callback( void ) {
     fd_accdb_attach_child( accdb, SENTINEL );
     fd_accdb_snapshot_load_begin( accdb );
 
-    int                                 stripe_locks[ 4UL ] = {0};
-    fd_accdb_snapshot_worker_metrics_t metrics             = {0};
+    int stripe_locks[ 4UL ] = {0};
     test_store_ctx_t store = { .fd=fd, .pubkeys=pubkeys, .data_lens=data_lens };
     test_snoop_ctx_t ctx = {0};
     ctx.cur_pubkey = pubkey;
 
     ctx.cur_slot = 10UL;
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 10UL, lamports,
-                                       data_lens, executables, snoop_cands, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 10UL, lamports,
+                                       data_lens, executables, snoop_cands, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, test_snoop_record, &ctx ) );
     ctx.cur_slot = 20UL;
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 20UL, lamports,
-                                       data_lens, executables, snoop_cands, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 20UL, lamports,
+                                       data_lens, executables, snoop_cands, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, test_snoop_record, &ctx ) );
 
@@ -2563,20 +2499,19 @@ test_snoop_winner_gated_callback( void ) {
     fd_accdb_attach_child( accdb, SENTINEL );
     fd_accdb_snapshot_load_begin( accdb );
 
-    int                                 stripe_locks[ 4UL ] = {0};
-    fd_accdb_snapshot_worker_metrics_t metrics             = {0};
+    int stripe_locks[ 4UL ] = {0};
     test_store_ctx_t store = { .fd=fd, .pubkeys=pubkeys, .data_lens=data_lens };
     test_snoop_ctx_t ctx = {0};
     ctx.cur_pubkey = pubkey;
 
     ctx.cur_slot = 20UL;
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 20UL, lamports,
-                                       data_lens, executables, snoop_cands, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 20UL, lamports,
+                                       data_lens, executables, snoop_cands, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, test_snoop_record, &ctx ) );
     ctx.cur_slot = 10UL;
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 10UL, lamports,
-                                       data_lens, executables, snoop_cands, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 10UL, lamports,
+                                       data_lens, executables, snoop_cands, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, test_snoop_record, &ctx ) );
     FD_TEST( store.cnt==2UL );
@@ -2596,16 +2531,15 @@ test_snoop_winner_gated_callback( void ) {
     fd_accdb_attach_child( accdb, SENTINEL );
     fd_accdb_snapshot_load_begin( accdb );
 
-    int                                 stripe_locks[ 4UL ] = {0};
-    fd_accdb_snapshot_worker_metrics_t metrics             = {0};
+    int stripe_locks[ 4UL ] = {0};
     test_store_ctx_t store = { .fd=fd, .pubkeys=pubkeys, .data_lens=data_lens };
     test_snoop_ctx_t ctx = {0};
     ctx.cur_pubkey = pubkey;
     ctx.cur_slot   = 30UL;
 
     int not_a_candidate[ 1 ] = { 0 };
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 30UL, lamports,
-                                       data_lens, executables, not_a_candidate, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 30UL, lamports,
+                                       data_lens, executables, not_a_candidate, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, test_snoop_record, &ctx ) );
     FD_TEST( loaded==1UL ); /* genuinely inserted */
@@ -2622,12 +2556,11 @@ test_snoop_winner_gated_callback( void ) {
     fd_accdb_attach_child( accdb, SENTINEL );
     fd_accdb_snapshot_load_begin( accdb );
 
-    int                                 stripe_locks[ 4UL ] = {0};
-    fd_accdb_snapshot_worker_metrics_t metrics             = {0};
+    int stripe_locks[ 4UL ] = {0};
     test_store_ctx_t store = { .fd=fd, .pubkeys=pubkeys, .data_lens=data_lens };
 
-    FD_TEST( !test_write_batch_worker( accdb, SENTINEL, 1UL, pubkeys, 40UL, lamports,
-                                       data_lens, executables, snoop_cands, stripe_locks, 3UL, &metrics,
+    FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 40UL, lamports,
+                                       data_lens, executables, snoop_cands, stripe_locks, 3UL,
                                        &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports,
                                        &store, NULL, NULL ) );
 

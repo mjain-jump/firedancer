@@ -278,14 +278,12 @@ test_env_fini( test_env_t *          env,
     FD_TEST( !writer_flush( ctx ) );
     bytes_written += ctx->metrics.disk_bytes_written;
     fd_accdb_flush_metrics( ctx->accdb );
-    fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
   }
 
   ulong expected_bytes = TEST_ACCOUNT_CNT*sizeof(fd_accdb_disk_meta_t)+accounts[ FD_SSPARSE_ACC_BATCH_MAX ].data_len;
   FD_TEST( bytes_written==expected_bytes );
 
   fd_accdb_snapshot_load_end( env->worker[ 0 ].accdb );
-  fd_accdb_snapshot_verify_readback( env->worker[ 0 ].accdb, ULONG_MAX );
   for( ulong i=0UL; i<TEST_ACCOUNT_CNT; i++ ) read_account( env, &accounts[ i ] );
 
   for( ulong i=0UL; i<env->worker_cnt; i++ ) {

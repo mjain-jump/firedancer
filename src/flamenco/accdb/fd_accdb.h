@@ -116,8 +116,7 @@ fd_accdb_join_readonly( void *             ljoin,
 /* fd_accdb_snapshot_load_{begin,end} suspend compaction while snapshot
    writers build the index.  New layer-0 partitions are tagged Cold;
    load_end opens a fresh Hot partition for runtime writes.  Call begin
-   before any writer starts and end after all writers stop.  Parallel
-   writers must use fd_accdb_snapshot_write_batch_worker. */
+   before any writer starts and end after all writers stop. */
 
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
@@ -538,16 +537,6 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
                              int                executable,
                              ulong *            out_replaced_lamports );
 
-/* Per-worker accounting changes, buffered off the hot insert path. */
-
-struct fd_accdb_snapshot_worker_metrics {
-  ulong disk_used_added;
-  ulong disk_used_removed;
-  ulong accounts_total_added;
-};
-
-typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
-
 /* Reserves one contiguous range in the layer-0 account log. */
 
 ulong
@@ -558,53 +547,10 @@ fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
 
 typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
 
-/* Writes 1..8 accounts from one parallel worker.
-   - stripe_locks protects hash chains.
-   - file_offsets contains a reserved on-disk location for every account.
-   - USHORT_MAX fork_id selects a full snapshot.
-   - Equal slots use last-lock-winner ordering.
-   - snoop_fn runs under the stripe lock for flagged winners.
-   Returns -1 on a repeated pubkey. */
-
-int
-fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
-                                      fd_accdb_fork_id_t                   fork_id,
-                                      ulong                                cnt,
-                                      uchar const * const                  pubkeys[],
-                                      ulong                                slot,
-                                      ulong const                          lamports[],
-                                      ulong const                          data_lens[],
-                                      int const                            executables[],
-                                      int const                            snoop_candidates[],
-                                      int *                                stripe_locks,
-                                      ulong                                stripe_msk,
-                                      ulong const                          file_offsets[],
-                                      fd_accdb_snapshot_worker_metrics_t * metrics,
-                                      ulong *                              accounts_ignored,
-                                      ulong *                              accounts_replaced,
-                                      ulong *                              accounts_loaded,
-                                      ulong *                              out_replaced_lamports,
-                                      ulong *                              out_ignored_lamports,
-                                      fd_accdb_snapshot_snoop_fn_t         snoop_fn,
-                                      void *                               snoop_ctx );
-
-/* Applies per-worker deltas to shared metrics, then clears them. */
-
-void
-fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
-                                        fd_accdb_snapshot_worker_metrics_t * m );
-
-/* Samples live records and verifies their on-disk pubkey and size.
-   Crashes on mismatch. */
-
-void
-fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
-                                   ulong        sample_max );
-
 /* fd_accdb_snapshot_write_batch processes up to 8 accounts at once,
    using software prefetching to overlap hash chain memory latency with
-   useful work.  This function is not thread safe and must not be called
-   concurrently.  Each pubkey[i] points to a 32-byte public key.
+   useful work.  This function is thread safe when concurrent callers
+   share stripe_locks.  Each pubkey[i] points to a 32-byte public key.
    *out_replaced_lamports is set to the sum of the lamports of all
    accounts replaced by this batch (i.e. the previous lamports value of
    each account whose acc was overwritten).  *out_ignored_lamports is
@@ -615,27 +561,36 @@ fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,
    (a corrupt-snapshot signal — the caller should flag the snapshot
    malformed).  Output counters are not meaningful when -1 is returned.
 
-   slot must be <= UINT_MAX (see fd_accdb_snapshot_write_one
+   Each slots[i] must be <= UINT_MAX (see fd_accdb_snapshot_write_one
    for the rationale).  Passing a larger slot crashes the process.
+
+   file_offsets[i] is the pre-reserved on-disk location for pubkeys[i].
+   snoop_fn runs under the account stripe when a flagged account wins.
 
    fork_id has the same semantics as in fd_accdb_snapshot_write_one:
    USHORT_MAX for full-snapshot mode, otherwise incremental mode with
    txn tracking on the specified fork. */
 
 int
-fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
-                               fd_accdb_fork_id_t  fork_id,
-                               ulong               cnt,
-                               uchar const * const pubkeys[],
-                               ulong               slot,
-                               ulong  const        lamports[],
-                               ulong  const        data_lens[],
-                               int    const        executables[],
-                               ulong *             accounts_ignored,
-                               ulong *             accounts_replaced,
-                               ulong *             accounts_loaded,
-                               ulong *             out_replaced_lamports,
-                               ulong *             out_ignored_lamports );
+fd_accdb_snapshot_write_batch( fd_accdb_t *                         accdb,
+                               fd_accdb_fork_id_t                   fork_id,
+                               ulong                                cnt,
+                               uchar const * const                  pubkeys[],
+                               ulong const                          slots[],
+                               ulong const                          lamports[],
+                               ulong const                          data_lens[],
+                               int const                            executables[],
+                               int const                            snoop_candidates[],
+                               int *                                stripe_locks,
+                               ulong                                stripe_msk,
+                               ulong const                          file_offsets[],
+                               ulong *                              accounts_ignored,
+                               ulong *                              accounts_replaced,
+                               ulong *                              accounts_loaded,
+                               ulong *                              out_replaced_lamports,
+                               ulong *                              out_ignored_lamports,
+                               fd_accdb_snapshot_snoop_fn_t         snoop_fn,
+                               void *                               snoop_ctx );
 
 /* fd_accdb_background performs one unit of background work.
 
