@@ -137,7 +137,6 @@ struct fd_snapin_lead {
   uint init_completed : 1;  /* tile 0: did INIT complete for this attempt? */
 
   ulong seed;
-  long  boot_timestamp;
 
   fd_txncache_t * txncache;
   fd_bank_t *     bank;
@@ -164,7 +163,6 @@ struct fd_snapin_lead {
   uchar advertised_hash[ FD_HASH_FOOTPRINT ];
 
   ulong capitalization;          /* tile 0: capitalization of all loaded accounts, from the shared totals */
-  ulong dup_capitalization;      /* tile 0: capitalization of duplicate accounts, from the shared totals */
   ulong manifest_capitalization; /* capitalization according to the current snapshot manifest */
 
   struct {
@@ -196,19 +194,6 @@ struct fd_snapin_lead {
 
   fd_snapin_out_link_t manifest_out;
   fd_snapin_out_link_t gui_out;
-
-  /* Tile 0 end-of-attempt state. */
-  int   attempt_folded;     /* attempt data already read */
-  struct {
-    ulong eq_slot_dups;
-  } worker_fold;
-
-  /* Tile 0 totals across successful attempts. */
-  struct {
-    ulong accounts_loaded;
-    ulong accounts_replaced;
-    ulong accounts_ignored;
-  } totals_fold;
 
   /* Tile 0 rolls back a failure at the next INIT. */
   struct {
@@ -294,18 +279,9 @@ struct fd_snapin_tile {
   /* Parse state for one attempt. */
   ulong appendvec_seq;      /* next appendvec number */
   ulong claimed_appendvec;  /* current claim */
-  ulong owned_appendvecs;   /* used claims */
   ulong incr_fork;          /* insert fork; USHORT_MAX for full */
 
-  /* Added to shared totals at FINI. */
-  struct {
-    ulong accounts_loaded;
-    ulong accounts_replaced;
-    ulong accounts_ignored;
-    ulong input_lamports;
-    ulong replaced_lamports;
-    ulong ignored_lamports;
-  } worker;
+  fd_snapin_shmem_totals_t worker; /* added to shared totals at FINI */
 
   fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
 
@@ -343,25 +319,8 @@ is_lead( fd_snapin_tile_t const * ctx ) {
   return ctx->tile_idx==0UL;
 }
 
-static void
-format_count( char * out, ulong out_sz, ulong n ) {
-  if(      n>=1000000UL ) FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%.1fM", (double)n/1e6 ) );
-  else if( n>=1000UL    ) FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%.1fK", (double)n/1e3 ) );
-  else                    FD_TEST( fd_cstr_printf_check( out, out_sz, NULL, "%lu",   n             ) );
-}
-
 static inline int
 should_shutdown( fd_snapin_tile_t * ctx ) {
-  if( FD_UNLIKELY( ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN && is_lead( ctx ) ) ) {
-    ulong accounts_dup = ctx->lead.totals_fold.accounts_ignored + ctx->lead.totals_fold.accounts_replaced;
-    long  elapsed_ns   = fd_log_wallclock() - ctx->lead.boot_timestamp;
-    char  loaded_buf[ 32 ];
-    char  dup_buf   [ 32 ];
-    format_count( loaded_buf, sizeof(loaded_buf), ctx->lead.totals_fold.accounts_loaded );
-    format_count( dup_buf,    sizeof(dup_buf),    accounts_dup                      );
-    FD_LOG_NOTICE(( "loaded %s accounts %s(%s dups)%s from snapshot in %.3f seconds",
-                    loaded_buf, fd_log_style_dim(), dup_buf, fd_log_style_normal(), (double)elapsed_ns/1e9 ));
-  }
   return ctx->state==FD_SNAPSHOT_STATE_SHUTDOWN;
 }
 
@@ -1293,10 +1252,9 @@ static void
 worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->expected_frame = 0UL;
   for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) ctx->in[ lane ].pos = 0UL;
-  ctx->appendvec_seq    = 0UL;
-  ctx->owned_appendvecs = 0UL;
-  ctx->incr_fork        = ULONG_MAX;
-  ctx->gate_pending     = 0;
+  ctx->appendvec_seq = 0UL;
+  ctx->incr_fork     = ULONG_MAX;
+  ctx->gate_pending  = 0;
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
   fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
   ctx->staged.active = 0;
@@ -1321,9 +1279,6 @@ worker_record_insert_metrics( fd_snapin_tile_t * ctx,
   ctx->metrics.accounts_loaded   += accounts_loaded;
   ctx->metrics.total_accounts_processed += cnt;
   ctx->metrics.total_account_batches_processed++;
-  ctx->worker.accounts_ignored  += accounts_ignored;
-  ctx->worker.accounts_replaced += accounts_replaced;
-  ctx->worker.accounts_loaded   += accounts_loaded;
   ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
@@ -1512,7 +1467,6 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
         if( FD_UNLIKELY( appendvec_idx==ctx->claimed_appendvec ) ) {
           /* Claim the next appendvec before parsing this one. */
           ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
-          ctx->owned_appendvecs++;
           fd_ssparse_appendvec_parse( ctx->ssparse );
         }
         break;
@@ -1680,25 +1634,14 @@ handle_data_frag( fd_snapin_tile_t *  ctx,
 
 static void
 tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
-  if( FD_UNLIKELY( ctx->lead.attempt_folded ) ) return;
-  ctx->lead.attempt_folded = 1;
-
   fd_snapin_shmem_totals_t const * totals = &ctx->shmem->totals;
 
-  /* Each tile ends with one unused claim. */
-  FD_TEST( totals->appendvecs_processed==ctx->appendvec_seq );
   FD_TEST( ctx->shmem->next_appendvec==ctx->appendvec_seq+ctx->shmem->worker_cnt );
-
-  /* Add this attempt to tile 0's session totals. */
-  ctx->lead.totals_fold.accounts_loaded   += totals->accounts_loaded;
-  ctx->lead.totals_fold.accounts_replaced += totals->accounts_replaced;
-  ctx->lead.totals_fold.accounts_ignored  += totals->accounts_ignored;
 
   ctx->lead.capitalization = fd_ulong_if( ctx->full, 0UL, ctx->lead.recovery.capitalization );
   ctx->lead.capitalization = fd_ulong_sat_add( ctx->lead.capitalization, totals->input_lamports   );
   ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, totals->ignored_lamports );
-  ctx->lead.dup_capitalization = totals->replaced_lamports;
-  ctx->lead.worker_fold.eq_slot_dups += totals->eq_slot_dups;
+  ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, totals->replaced_lamports );
 
   /* Read the shared SlotHistory winner. */
   fd_snapin_shmem_t const * shmem = ctx->shmem;
@@ -1794,8 +1737,6 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   writer_reset( ctx );
 
   ctx->lead.manifest_capitalization = 0UL;
-  ctx->lead.attempt_folded          = 0;
-  fd_memset( &ctx->lead.worker_fold, 0, sizeof(ctx->lead.worker_fold) );
 
   fd_txncache_reset( ctx->lead.txncache );
   txncache_staging_reset( ctx );
@@ -1803,12 +1744,9 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   fd_ssmanifest_parser_init( ctx->lead.manifest_parser, fd_chunk_to_laddr( ctx->lead.manifest_out.mem, ctx->lead.manifest_out.chunk ) );
   fd_slot_delta_parser_init( ctx->lead.slot_delta_parser );
 
-  /* Rewind metric counters (no-op unless recovering from a fail) */
   if( ctx->full ) {
-    fd_memset( &ctx->lead.totals_fold, 0, sizeof(ctx->lead.totals_fold) );
     ctx->lead.full_genesis_creation_time_seconds = 0UL;
     ctx->lead.capitalization          = 0UL;
-    ctx->lead.dup_capitalization      = 0UL;
     ctx->lead.recovery.capitalization = 0UL;
 
     fd_stake_delegations_reset( ctx->stake_delegations );
@@ -1822,8 +1760,7 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
 
     fd_memset( ctx->lead.feature_snoop, 0, sizeof(ctx->lead.feature_snoop) );
   } else {
-    ctx->lead.capitalization     = ctx->lead.recovery.capitalization;
-    ctx->lead.dup_capitalization = 0UL;
+    ctx->lead.capitalization = ctx->lead.recovery.capitalization;
 
     /* Discard stale capture so the retry's sysvar is snooped fresh */
     ctx->lead.slot_history.captured = 0;
@@ -1979,18 +1916,11 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
       fd_accdb_snapshot_writer_end( ctx->accdb );
       fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
 
-      /* Agave accepts equal-slot duplicates. */
-
-      /* Add this tile's counters before the FINI ack. */
+      /* Add this tile's capitalization before the FINI ack. */
       fd_snapin_shmem_totals_t * totals = &ctx->shmem->totals;
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_loaded,       ctx->worker.accounts_loaded                );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_replaced,     ctx->worker.accounts_replaced              );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->accounts_ignored,      ctx->worker.accounts_ignored               );
       FD_ATOMIC_FETCH_AND_ADD( &totals->input_lamports,        ctx->worker.input_lamports                 );
       FD_ATOMIC_FETCH_AND_ADD( &totals->replaced_lamports,     ctx->worker.replaced_lamports              );
       FD_ATOMIC_FETCH_AND_ADD( &totals->ignored_lamports,      ctx->worker.ignored_lamports               );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->eq_slot_dups,          ctx->worker_metrics->eq_slot_dups          );
-      FD_ATOMIC_FETCH_AND_ADD( &totals->appendvecs_processed,  ctx->owned_appendvecs                      );
       FD_COMPILER_MFENCE(); /* publish before ack */
 
       /* Keep per-tile gauges. Dashboards sum them. */
@@ -2018,7 +1948,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
-      ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, ctx->lead.dup_capitalization );
       if( FD_UNLIKELY( validate_capitalization( ctx )!=0 ) ) {
         transition_malformed( ctx, stem );
         forward_msg = 0;
@@ -2047,7 +1976,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
-      ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, ctx->lead.dup_capitalization );
       if( FD_UNLIKELY( validate_capitalization( ctx )!=0 ) ) {
         transition_malformed( ctx, stem );
         forward_msg = 0;
@@ -2070,12 +1998,6 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
 
       fd_feature_snoop_finalize( &ctx->lead.bank->f.features, ctx->lead.bank_slot, &ctx->lead.epoch_schedule, ctx->lead.feature_snoop );
 
-      FD_LOG_NOTICE(( "parallel loader: equal-slot cross-appendvec dups=%lu", ctx->lead.worker_fold.eq_slot_dups ));
-      if( FD_UNLIKELY( ctx->lead.worker_fold.eq_slot_dups ) ) {
-        FD_LOG_WARNING(( "parallel loader: accepted %lu equal-slot cross-appendvec duplicates; "
-                         "stripe-lock arrival order picked the winner",
-                         ctx->lead.worker_fold.eq_slot_dups ));
-      }
       log_snoop_checksums( ctx );
 
       /* Notify replay when snapshot is fully loaded and verified. */
@@ -2411,18 +2333,13 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lead.full_genesis_creation_time_seconds = 0UL;
   ctx->lead.manifest_capitalization            = 0UL;
   ctx->lead.capitalization                     = 0UL;
-  ctx->lead.dup_capitalization                 = 0UL;
   ctx->lead.recovery.capitalization            = 0UL;
-
-  ctx->lead.attempt_folded = 0;
-  fd_memset( &ctx->lead.worker_fold, 0, sizeof(ctx->lead.worker_fold) );
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
   ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
   fd_memset( &ctx->lead.recovery.accdb_metadata, 0, sizeof(ctx->lead.recovery.accdb_metadata) );
 
   fd_memset( &ctx->lead.flags, 0, sizeof(ctx->lead.flags) );
-  ctx->lead.boot_timestamp = fd_log_wallclock();
 }
 
 /* There are 3 output links that affect the calculation of STEM_BURST:

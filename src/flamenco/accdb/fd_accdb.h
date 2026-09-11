@@ -547,13 +547,12 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
                              int                executable,
                              ulong *            out_replaced_lamports );
 
-/* Per-worker metric changes, buffered off the hot insert path. */
+/* Per-worker accounting changes, buffered off the hot insert path. */
 
 struct fd_accdb_snapshot_worker_metrics {
   ulong disk_used_added;
   ulong disk_used_removed;
   ulong accounts_total_added;
-  ulong eq_slot_dups;
 };
 
 typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
@@ -600,7 +599,7 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                       void *                               snoop_ctx );
 
-/* Applies and clears shared metric changes.  Keeps eq_slot_* counts. */
+/* Applies per-worker deltas to shared metrics, then clears them. */
 
 void
 fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,

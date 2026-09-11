@@ -4516,7 +4516,6 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
           skip = 1;
         } else if( FD_UNLIKELY( existing_slot==slot ) ) {
           /* Equal-slot duplicates use last-arrival-wins ordering. */
-          metrics->eq_slot_dups++;
           if( FD_UNLIKELY( incremental && candidate->key.generation!=gen ) ) cross_existing = candidate;
           else                                                               existing       = candidate;
         } else if( FD_UNLIKELY( incremental ) && candidate->key.generation!=gen ) {
@@ -4631,9 +4630,7 @@ fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         acc
   if( m->disk_used_added      ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_used_bytes, m->disk_used_added   );
   if( m->disk_used_removed    ) FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_used_bytes, m->disk_used_removed );
   if( m->accounts_total_added ) FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->accounts_total,  m->accounts_total_added );
-  m->disk_used_added      = 0UL;
-  m->disk_used_removed    = 0UL;
-  m->accounts_total_added = 0UL;
+  fd_memset( m, 0, sizeof(*m) );
 }
 
 /* fd_accdb_snapshot_verify_readback: sample live accounts from the

@@ -242,15 +242,11 @@ mock_accdb_advance_root( fd_accdb_t *       accdb,
 
 void mock_accdb_snapshot_load_begin( fd_accdb_t * accdb ) { (void)accdb; test_accdb_load_begin_cnt++; }
 
-/* Mirrors the real function: folds (and zeroes) the shared-counter
-   deltas, leaves the eq_slot_* diagnostics untouched. */
 void
 mock_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
                                           fd_accdb_snapshot_worker_metrics_t * m ) {
   (void)accdb;
-  m->disk_used_added      = 0UL;
-  m->disk_used_removed    = 0UL;
-  m->accounts_total_added = 0UL;
+  fd_memset( m, 0, sizeof(*m) );
 }
 
 void
@@ -470,7 +466,6 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
   ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-  ctx->lead.boot_timestamp     = fd_log_wallclock();
   ctx->lead.txncache_max_groups_per_slot  = TEST_MAX_GROUPS_PER_SLOT;
   ctx->lead.txncache_max_entries_per_slot = TEST_MAX_ENTRIES_PER_SLOT;
   ctx->lead.txncache_entries_max          = TEST_MAX_ENTRIES;
@@ -609,7 +604,6 @@ test_cluster_new( ulong tile_cnt,
 
     ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
     ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-    ctx->lead.boot_timestamp      = fd_log_wallclock();
 
     worker_reset_attempt( ctx );
   }
@@ -685,16 +679,15 @@ tile_send_data( fd_snapin_tile_t * ctx,
    (if any) the tile took ownership of. */
 static ulong
 tile_step( fd_snapin_tile_t * ctx ) {
-  ulong owned0 = ctx->owned_appendvecs;
+  ulong parsed0 = test_appendvec_parse_cnt;
   FD_TEST( !tile_send_data( ctx, 0UL, TEST_FRAG_SZ ) );
-  if( FD_UNLIKELY( ctx->owned_appendvecs==owned0 ) ) return ULONG_MAX;
-  FD_TEST( ctx->owned_appendvecs==owned0+1UL );
+  if( FD_UNLIKELY( test_appendvec_parse_cnt==parsed0 ) ) return ULONG_MAX;
+  FD_TEST( test_appendvec_parse_cnt==parsed0+1UL );
   return ctx->appendvec_seq-1UL;
 }
 
 /* Stream orders the eager-claim coverage test drives.  Ownership is
-   schedule dependent (that is the point of the counter), the coverage
-   invariant is not. */
+   schedule dependent, but every ordinal must be parsed once. */
 #define TEST_ORDER_ROUND_ROBIN (0)
 #define TEST_ORDER_TILE_MAJOR  (1)
 #define TEST_ORDER_REVERSE     (2)
@@ -1260,7 +1253,6 @@ test_init_gate_holds_data( void ) {
   FD_TEST( ctx->incr_fork==(ulong)USHORT_MAX );
   FD_TEST( test_accdb_writer_begin_cnt==1UL );
   FD_TEST( cl->shmem->next_appendvec==2UL );  /* the eager claim, then its replacement */
-  FD_TEST( ctx->owned_appendvecs==1UL );
   FD_TEST( test_pub_cnt==1UL );             /* still just the INIT ack */
 
   test_cluster_delete( cl );
@@ -1342,7 +1334,6 @@ test_init_aborted_barrier_retries( void ) {
   FD_TEST( test_accdb_writer_begin_cnt==n );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
   FD_TEST( cl->shmem->next_appendvec==T+n );
 
   test_cluster_delete( cl );
@@ -1389,19 +1380,15 @@ test_init_publishes_after_reset( void ) {
   /* Dirty every attempt-scoped shared field, as a killed load would
      leave them. */
   fd_snapin_shmem_t * shmem = cl->shmem;
-  shmem->next_appendvec              = 999UL;
-  shmem->totals.accounts_loaded      = 1234UL;
-  shmem->totals.input_lamports       = 5678UL;
-  shmem->totals.appendvecs_processed = 42UL;
-  shmem->slot_history.captured       = 1;
-  shmem->feature_snoop.present[ 0 ]  = 1;
+  shmem->next_appendvec             = 999UL;
+  shmem->totals.input_lamports      = 5678UL;
+  shmem->slot_history.captured      = 1;
+  shmem->feature_snoop.present[ 0 ] = 1;
 
   /* Only tile 0's INIT: it re-zeroes and publishes. */
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( &cl->ctx[ 0 ], lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
-  FD_TEST( !shmem->totals.accounts_loaded );
   FD_TEST( !shmem->totals.input_lamports );
-  FD_TEST( !shmem->totals.appendvecs_processed );
   FD_TEST( !shmem->slot_history.captured );
   FD_TEST( !shmem->feature_snoop.present[ 0 ] );
   FD_TEST( shmem->attempt.generation==1UL );
@@ -1450,19 +1437,14 @@ test_eager_claim_coverage( void ) {
       cluster_stream( cl, orders[ o_idx ], owner );
       for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].gate_pending );
 
-      ulong owned_sum = 0UL;
-      for( ulong t=0UL; t<n; t++ ) owned_sum += cl->ctx[ t ].owned_appendvecs;
-      FD_TEST( owned_sum==T );
       FD_TEST( test_appendvec_parse_cnt==T ); /* the parser was flipped exactly once per ordinal */
 
       /* A single tile owns everything, in stream order. */
       if( n==1UL ) {
-        FD_TEST( cl->ctx[ 0 ].owned_appendvecs==T );
         for( ulong i=0UL; i<T; i++ ) FD_TEST( owner[ i ]==0UL );
       }
 
       cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-      FD_TEST( cl->shmem->totals.appendvecs_processed==T );
       FD_TEST( cl->shmem->next_appendvec==T+n ); /* T consumed claims + N unmatched */
 
       test_cluster_delete( cl );
@@ -2295,7 +2277,6 @@ test_retry_resets( void ) {
     fd_snapin_tile_t * ctx = &cl->ctx[ t ];
     FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
     FD_TEST( !ctx->appendvec_seq );
-    FD_TEST( !ctx->owned_appendvecs );
     FD_TEST( ctx->incr_fork==ULONG_MAX );
   }
   FD_TEST( cl->ctx[ 0 ].lead.rollback.pending );
@@ -2327,9 +2308,7 @@ test_retry_resets( void ) {
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
   FD_TEST( cl->shmem->next_appendvec==T+n );
-  FD_TEST( !cl->shmem->totals.eq_slot_dups );
 
   test_cluster_delete( cl );
 }
@@ -2360,9 +2339,6 @@ test_fini_truncated_malform( void ) {
   /* One unsolicited ERROR per tile, and no FINI ack from any of them. */
   FD_TEST( test_pub_cnt==pub0+n );
   for( ulong i=pub0; i<test_pub_cnt; i++ ) FD_TEST( test_pub_sig[ i ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
-  /* Nothing was folded: tile 0 must not read a partial attempt. */
-  FD_TEST( !cl->shmem->totals.appendvecs_processed );
-
   /* In ERROR only FAIL flows; everything else is held. */
   FD_TEST( before_frag( &cl->ctx[ 0 ], 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==1 );
   FD_TEST( before_frag( &cl->ctx[ 0 ], 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_NEXT )==1 );
@@ -2409,49 +2385,9 @@ test_fini_storage_error_retries( void ) {
   test_cluster_delete( cl );
 }
 
-/* Equal-slot duplicate metrics are folded at FINI. */
-static void
-test_eq_slot_metric_fold( void ) {
-  ulong const n = 4UL;
-  ulong const T = 6UL;
-
-  /* Drive the duplicate from a non-zero tile: counting is per tile,
-     not a tile-0 privilege. */
-  for( ulong bad=1UL; bad<n; bad+=2UL ) {
-    test_cluster_t * cl = test_cluster_new( n, 1UL );
-    test_counters_reset();
-    test_stream_init( T );
-
-    cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-    ulong owner[ TEST_AV_MAX ];
-    cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
-
-    for( ulong t=0UL; t<n; t++ ) cl->ctx[ t ].worker.accounts_loaded = 10UL;
-    cl->ctx[ bad ].worker_metrics->eq_slot_dups = 3UL;
-
-    ulong pub0 = test_pub_cnt;
-    cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-
-    /* Every tile acks FINI, no ERROR, no withheld fold. */
-    FD_TEST( test_pub_cnt==pub0+n );
-    for( ulong t=0UL; t<n; t++ ) FD_TEST( test_pub_sig[ pub0+t ]==FD_SNAPSHOT_MSG_CTRL_FINI );
-    for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].state==FD_SNAPSHOT_STATE_FINISHING );
-
-    /* The flagging tile's counters, dups included, are folded like
-       everyone else's. */
-    FD_TEST( cl->shmem->totals.accounts_loaded==10UL*n );
-    FD_TEST( cl->shmem->totals.eq_slot_dups==3UL );
-    FD_TEST( cl->shmem->totals.appendvecs_processed==T );
-
-    test_cluster_delete( cl );
-  }
-}
-
 /* Accumulator fold ****************************************************/
 
-/* Every tile FD_ATOMIC_FETCH_AND_ADDs its FINI-time locals straight
-   into hdr->totals, and tile 0 reads that fold at NEXT: known per-tile
-   locals must produce exact totals and exact derived tile-0 gauges. */
+/* Tile 0 folds the per-tile capitalization totals at NEXT. */
 static void
 test_accumulator_fold( void ) {
   ulong const n = 4UL;
@@ -2466,28 +2402,13 @@ test_accumulator_fold( void ) {
   ulong owner[ TEST_AV_MAX ];
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
-  /* Known per-tile locals.  owned_appendvecs is left as the stream walk
-     produced it: tile 0's fold asserts the claim identity against it. */
-  ulong exp_loaded=0UL, exp_replaced=0UL, exp_ignored=0UL;
   ulong exp_input=0UL, exp_repl_l=0UL, exp_ign_l=0UL;
   for( ulong t=0UL; t<n; t++ ) {
     fd_snapin_tile_t * ctx = &cl->ctx[ t ];
-    ctx->worker.accounts_loaded   = 1000UL+t;
-    ctx->worker.accounts_replaced =   20UL+t;
-    ctx->worker.accounts_ignored  =    3UL+t;
     ctx->worker.input_lamports    = 1000000UL*(t+1UL);
     ctx->worker.replaced_lamports =   5000UL*(t+1UL);
     ctx->worker.ignored_lamports  =    700UL*(t+1UL);
-    /* Gauges the tile must keep live through FINI: the dashboards sum
-       them across all snapin tiles, so a per-tile dip at the barrier (or
-       tile 0 folding the cross-tile total into its own) breaks them. */
-    ctx->metrics.accounts_loaded   = 77UL;
-    ctx->metrics.accounts_replaced = 78UL;
-    ctx->metrics.accounts_ignored  = 79UL;
 
-    exp_loaded   += ctx->worker.accounts_loaded;
-    exp_replaced += ctx->worker.accounts_replaced;
-    exp_ignored  += ctx->worker.accounts_ignored;
     exp_input    += ctx->worker.input_lamports;
     exp_repl_l   += ctx->worker.replaced_lamports;
     exp_ign_l    += ctx->worker.ignored_lamports;
@@ -2496,19 +2417,9 @@ test_accumulator_fold( void ) {
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
 
   fd_snapin_shmem_totals_t const * tot = &cl->shmem->totals;
-  FD_TEST( tot->accounts_loaded      ==exp_loaded   );
-  FD_TEST( tot->accounts_replaced    ==exp_replaced );
-  FD_TEST( tot->accounts_ignored     ==exp_ignored  );
-  FD_TEST( tot->input_lamports       ==exp_input    );
-  FD_TEST( tot->replaced_lamports    ==exp_repl_l   );
-  FD_TEST( tot->ignored_lamports     ==exp_ign_l    );
-  FD_TEST( tot->appendvecs_processed ==T            );
-  FD_TEST( !tot->eq_slot_dups );
-  for( ulong t=0UL; t<n; t++ ) {
-    FD_TEST( cl->ctx[ t ].metrics.accounts_loaded  ==77UL );
-    FD_TEST( cl->ctx[ t ].metrics.accounts_replaced==78UL );
-    FD_TEST( cl->ctx[ t ].metrics.accounts_ignored ==79UL );
-  }
+  FD_TEST( tot->input_lamports    ==exp_input  );
+  FD_TEST( tot->replaced_lamports ==exp_repl_l );
+  FD_TEST( tot->ignored_lamports  ==exp_ign_l  );
 
   /* Tile 0 reads the fold at NEXT.  A full attempt's capitalization is
      input - ignored - replaced; the manifest value it is checked
@@ -2520,27 +2431,9 @@ test_accumulator_fold( void ) {
 
   fd_snapin_tile_t * t0 = &cl->ctx[ 0 ];
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_IDLE );
-  FD_TEST( t0->lead.attempt_folded );
-  /* The cross-tile fold lands in tile 0's diagnostic totals, NOT in its
-     gauge: the gauges stay per-tile so the dashboards' sum is exact. */
-  FD_TEST( t0->lead.totals_fold.accounts_loaded  ==exp_loaded   );
-  FD_TEST( t0->lead.totals_fold.accounts_replaced==exp_replaced );
-  FD_TEST( t0->lead.totals_fold.accounts_ignored ==exp_ignored  );
-  FD_TEST( t0->lead.dup_capitalization       ==exp_repl_l   );
-  FD_TEST( t0->lead.capitalization           ==exp_input-exp_ign_l-exp_repl_l );
-  FD_TEST( !t0->lead.worker_fold.eq_slot_dups );
+  FD_TEST( t0->lead.capitalization==exp_input-exp_ign_l-exp_repl_l );
   /* The full snapshot's totals are saved for the incremental revert. */
   FD_TEST( t0->lead.recovery.capitalization==t0->lead.capitalization );
-  /* Every tile latched its own share, and the cross-tile sum is
-     unchanged by the barrier -- that is the continuity the GUI and the
-     snapshot-load watch depend on. */
-  ulong gauge_sum = 0UL;
-  for( ulong t=0UL; t<n; t++ ) {
-    FD_TEST( cl->ctx[ t ].metrics.full_accounts_loaded  ==77UL );
-    FD_TEST( cl->ctx[ t ].metrics.accounts_loaded       ==77UL );
-    gauge_sum += cl->ctx[ t ].metrics.accounts_loaded;
-  }
-  FD_TEST( gauge_sum==77UL*n );
   FD_TEST( t0->lead.slot_history.captured );
   FD_TEST( t0->lead.slot_history.data_len==FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ );
 
@@ -2573,10 +2466,7 @@ test_gauge_sum_continuity( void ) {
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
   ulong full_share = 100UL;
-  for( ulong t=0UL; t<n; t++ ) {
-    cl->ctx[ t ].metrics.accounts_loaded = full_share;
-    cl->ctx[ t ].worker.accounts_loaded  = full_share;
-  }
+  for( ulong t=0UL; t<n; t++ ) cl->ctx[ t ].metrics.accounts_loaded = full_share;
   FD_TEST( GAUGE_SUM()==full_share*n );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
@@ -2586,7 +2476,6 @@ test_gauge_sum_continuity( void ) {
   cl->ctx[ 0 ].lead.manifest_capitalization = 0UL;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
   FD_TEST( GAUGE_SUM()==full_share*n );   /* was full_share*n + the fold: double counted */
-  FD_TEST( cl->ctx[ 0 ].lead.totals_fold.accounts_loaded==full_share*n );
 
   /* --- Incremental that fails ------------------------------------ */
   test_counters_reset();
@@ -2609,10 +2498,7 @@ test_gauge_sum_continuity( void ) {
 
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
   ulong incr_share = 11UL;
-  for( ulong t=0UL; t<n; t++ ) {
-    cl->ctx[ t ].metrics.accounts_loaded += incr_share;
-    cl->ctx[ t ].worker.accounts_loaded   = incr_share;
-  }
+  for( ulong t=0UL; t<n; t++ ) cl->ctx[ t ].metrics.accounts_loaded += incr_share;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( GAUGE_SUM()==(full_share+incr_share)*n );
 
@@ -2620,8 +2506,6 @@ test_gauge_sum_continuity( void ) {
   cl->ctx[ 0 ].lead.manifest_capitalization = cl->ctx[ 0 ].lead.recovery.capitalization;
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_DONE );
   FD_TEST( GAUGE_SUM()==(full_share+incr_share)*n );
-  /* Tile 0's diagnostic total accumulates over the session. */
-  FD_TEST( cl->ctx[ 0 ].lead.totals_fold.accounts_loaded==(full_share+incr_share)*n );
 
 # undef GAUGE_SUM
 
@@ -2658,7 +2542,6 @@ test_full_lifecycle_9_tiles( void ) {
   for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].incr_fork==(ulong)USHORT_MAX );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( test_accdb_writer_end_cnt==n );
-  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
 
   test_stamp_slot_history( cl, bank_slot );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_NEXT );
@@ -2695,7 +2578,6 @@ test_full_lifecycle_9_tiles( void ) {
 
   cluster_stream( cl, TEST_ORDER_REVERSE, owner );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
-  FD_TEST( cl->shmem->totals.appendvecs_processed==T );
   FD_TEST( cl->shmem->next_appendvec==T+n );
 
   /* An incremental load's capitalization starts from the full
@@ -2986,7 +2868,6 @@ main( int     argc,
   test_retry_resets();
   test_fini_truncated_malform();
   test_fini_storage_error_retries();
-  test_eq_slot_metric_fold();
   test_accumulator_fold();
   test_gauge_sum_continuity();
   test_full_lifecycle_9_tiles();

@@ -11,16 +11,11 @@
 #define FD_SNAPIN_SHMEM_STRIPE_MSK (FD_SNAPIN_SHMEM_STRIPE_CNT-1UL)
 #define FD_SNAPIN_SHMEM_WRITE_BUF_SZ (64UL<<20)
 
-/* Workers add their attempt totals before ACKing FINI. */
-struct __attribute__((aligned(64))) fd_snapin_shmem_totals {
-  ulong accounts_loaded;
-  ulong accounts_replaced;
-  ulong accounts_ignored;
+/* Workers add capitalization totals before ACKing FINI. */
+struct fd_snapin_shmem_totals {
   ulong input_lamports;
   ulong replaced_lamports;
   ulong ignored_lamports;
-  ulong eq_slot_dups;
-  ulong appendvecs_processed;
 };
 
 typedef struct fd_snapin_shmem_totals fd_snapin_shmem_totals_t;

@@ -1786,7 +1786,6 @@ test_snapshot_striped_writers( void ) {
 
     ulong tot_loaded=0UL, tot_replaced=0UL, tot_ignored=0UL;
     ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL;
-    ulong tot_eq=0UL;
     ulong all_cnt=0UL;
     static ulong all_allocs[ 2UL*PAR_THREADS*PAR_KEYS ][ 2 ];
     for( ulong t=0UL; t<PAR_THREADS; t++ ) {
@@ -1796,7 +1795,6 @@ test_snapshot_striped_writers( void ) {
       tot_input    += ctxs[ t ].input_lamports;
       tot_repl_l   += ctxs[ t ].replaced_lamports;
       tot_ign_l    += ctxs[ t ].ignored_lamports;
-      tot_eq       += ctxs[ t ].m->eq_slot_dups;
       for( ulong j=0UL; j<ctxs[ t ].store.cnt; j++ ) {
         all_allocs[ all_cnt ][ 0 ] = ctxs[ t ].store.offsets[ j ];
         all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].store.sizes  [ j ];
@@ -1816,7 +1814,6 @@ test_snapshot_striped_writers( void ) {
       /* Distinct slots: winner is the highest slot's version. */
       FD_TEST( tot_loaded==PAR_KEYS );
       FD_TEST( tot_replaced+tot_ignored==PAR_KEYS*(PAR_THREADS-1UL) );
-      FD_TEST( !tot_eq );
       for( ulong k=0UL; k<PAR_KEYS; k++ ) {
         fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
         FD_TEST( (ulong)acc->cache_idx==100UL+PAR_THREADS-1UL );
@@ -1829,7 +1826,6 @@ test_snapshot_striped_writers( void ) {
       FD_TEST( !tot_loaded );
       FD_TEST( tot_replaced==PAR_KEYS*PAR_THREADS );
       FD_TEST( !tot_ignored );
-      FD_TEST( tot_eq      ==PAR_KEYS*(PAR_THREADS-1UL) );
       FD_TEST( all_cnt     ==PAR_KEYS*PAR_THREADS );
       for( ulong k=0UL; k<PAR_KEYS; k++ ) {
         fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pks[ k ] );
@@ -1970,7 +1966,7 @@ test_run_striped_incr_attempt( fd_accdb_t *       reader,
   for( ulong t=0UL; t<PAR_THREADS; t++ ) FD_TEST( !pthread_join( threads[ t ], NULL ) );
 
   ulong tot_loaded=0UL, tot_replaced=0UL, tot_ignored=0UL;
-  ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL, tot_eq=0UL;
+  ulong tot_input=0UL, tot_repl_l=0UL, tot_ign_l=0UL;
   ulong all_cnt=0UL;
   static ulong all_allocs[ 2UL*PAR_THREADS*PAR_INCR_KEYS ][ 2 ];
   for( ulong t=0UL; t<PAR_THREADS; t++ ) {
@@ -1980,7 +1976,6 @@ test_run_striped_incr_attempt( fd_accdb_t *       reader,
     tot_input    += ctxs[ t ].input_lamports;
     tot_repl_l   += ctxs[ t ].replaced_lamports;
     tot_ign_l    += ctxs[ t ].ignored_lamports;
-    tot_eq       += ctxs[ t ].m->eq_slot_dups;
     for( ulong j=0UL; j<ctxs[ t ].store.cnt; j++ ) {
       all_allocs[ all_cnt ][ 0 ] = ctxs[ t ].store.offsets[ j ];
       all_allocs[ all_cnt ][ 1 ] = ctxs[ t ].store.sizes  [ j ];
@@ -1996,7 +1991,6 @@ test_run_striped_incr_attempt( fd_accdb_t *       reader,
 
   /* Distinct slots per thread: winners deterministic; every write is
      exactly one of loaded/replaced/ignored. */
-  FD_TEST( !tot_eq );
   FD_TEST( tot_loaded==new_cnt );
   FD_TEST( tot_loaded+tot_replaced+tot_ignored==write_cnt );
 
@@ -2168,7 +2162,7 @@ test_snapshot_striped_writers_incremental( void ) {
                                                     &replaced_lamports, &ignored_lamports,
                                                     test_store_record, &eq->store,
                                                     NULL, NULL ) );
-    FD_TEST( replaced==1UL && eq->store.cnt==1UL && !eq->m->eq_slot_dups ); /* cross override of the promoted winner */
+    FD_TEST( replaced==1UL && eq->store.cnt==1UL ); /* cross override of the promoted winner */
     FD_TEST( !fd_accdb_snapshot_write_batch_worker( joins[ 0 ], eq_fork, 1UL, pubkeys, 300UL, lamports,
                                                     data_lens, execs, NULL,
                                                     stripe_locks, stripe_msk,
@@ -2177,7 +2171,7 @@ test_snapshot_striped_writers_incremental( void ) {
                                                     &replaced_lamports, &ignored_lamports,
                                                     test_store_record, &eq->store,
                                                     NULL, NULL ) );
-    FD_TEST( !ignored && replaced==1UL && eq->store.cnt==2UL && eq->m->eq_slot_dups==1UL );
+    FD_TEST( !ignored && replaced==1UL && eq->store.cnt==2UL );
     fd_accdb_snapshot_flush_worker_metrics( joins[ 0 ], eq->m );
   }
   fd_accdb_purge( reader, eq_fork );
@@ -2498,7 +2492,6 @@ test_equal_slot_last_arrival( void ) {
                                                   NULL, NULL ) );
   FD_TEST( !ignored && replaced==1UL && !loaded );
   FD_TEST( store.cnt==2UL );
-  FD_TEST( metrics.eq_slot_dups==1UL );
 
   fd_accdb_accmeta_t * winner = par_find_unique( test_shmem_mem, max_accounts, pubkey );
   FD_TEST( winner->lamports==2UL );
