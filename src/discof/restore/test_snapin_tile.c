@@ -2431,6 +2431,7 @@ test_accumulator_fold( void ) {
 
   fd_snapin_tile_t * t0 = &cl->ctx[ 0 ];
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_IDLE );
+  FD_TEST( t0->lead.dup_capitalization==exp_repl_l );
   FD_TEST( t0->lead.capitalization==exp_input-exp_ign_l-exp_repl_l );
   /* The full snapshot's totals are saved for the incremental revert. */
   FD_TEST( t0->lead.recovery.capitalization==t0->lead.capitalization );

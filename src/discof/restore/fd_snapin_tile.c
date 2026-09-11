@@ -133,15 +133,15 @@ struct fd_snapin_out_link {
 };
 typedef struct fd_snapin_out_link fd_snapin_out_link_t;
 
+/* Only tile 0 uses this state. */
 struct fd_snapin_lead {
-  uint init_completed : 1;  /* tile 0: did INIT complete for this attempt? */
+  uint init_completed : 1;  /* did INIT complete for this attempt? */
 
   ulong seed;
 
   fd_txncache_t * txncache;
-  fd_bank_t *     bank;
+  fd_bank_t *  bank;
 
-  /* Tile 0 merges feature data after each attempt. */
   fd_feature_snoop_t feature_snoop[1];
 
   fd_ssmanifest_parser_t * manifest_parser;
@@ -162,14 +162,15 @@ struct fd_snapin_lead {
   ulong full_genesis_creation_time_seconds;
   uchar advertised_hash[ FD_HASH_FOOTPRINT ];
 
-  ulong capitalization;          /* tile 0: capitalization of all loaded accounts, from the shared totals */
+  ulong capitalization;          /* tracks capitalization of all loaded accounts in the current snapshot */
+  ulong dup_capitalization;      /* tracks capitalization of duplicate accounts encountered during incremental snapshot loading */
   ulong manifest_capitalization; /* capitalization according to the current snapshot manifest */
 
   struct {
     ulong                        capitalization;
     fd_accdb_snapshot_recovery_t accdb_metadata;
     fd_feature_snoop_t           feature_snoop;
-  } recovery; /* tile 0: stores state from the last full snapshot for incremental revert */
+  } recovery; /* stores state from the last full snapshot for incremental revert */
 
   blockhash_group_t *        blockhash_groups;
   ulong                      blockhash_groups_cnt; /* every group parsed, including those from dropped slots */
@@ -188,14 +189,14 @@ struct fd_snapin_lead {
   ulong                   txncache_max_entries_per_slot; /* 2x, signature and message hash entries */
   ulong                   txncache_entries_max;          /* FD_TXNCACHE_MAX_SLOT_DELTAS slots of entries */
 
-  fd_accdb_fork_id_t     accdb_root_fork_id;
-  fd_accdb_fork_id_t     accdb_incr_fork_id; /* tile 0: child fork for incremental writes (purge on failure) */
-  fd_txncache_fork_id_t  txncache_root_fork_id;
+  fd_accdb_fork_id_t accdb_root_fork_id;
+  fd_accdb_fork_id_t accdb_incr_fork_id; /* child fork for incremental writes (purge on failure) */
+  fd_txncache_fork_id_t txncache_root_fork_id;
 
   fd_snapin_out_link_t manifest_out;
   fd_snapin_out_link_t gui_out;
 
-  /* Tile 0 rolls back a failure at the next INIT. */
+  /* Roll back a failure at the next INIT. */
   struct {
     int                pending;
     int                full;  /* failed attempt type */
@@ -205,7 +206,7 @@ struct fd_snapin_lead {
   ulong gui_config_acct_sz;   /* total expected account data length (0 when not accumulating) */
   ulong gui_config_acct_off;  /* bytes accumulated so far into the current gui_out link chunk */
 
-  /* Tile 0 copy of the shared SlotHistory account. */
+  /* Copy of the shared SlotHistory account. */
   struct {
     int   captured;
     int   executable;
@@ -1641,7 +1642,7 @@ tile0_fold_attempt( fd_snapin_tile_t * ctx ) {
   ctx->lead.capitalization = fd_ulong_if( ctx->full, 0UL, ctx->lead.recovery.capitalization );
   ctx->lead.capitalization = fd_ulong_sat_add( ctx->lead.capitalization, totals->input_lamports   );
   ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, totals->ignored_lamports );
-  ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, totals->replaced_lamports );
+  ctx->lead.dup_capitalization = totals->replaced_lamports;
 
   /* Read the shared SlotHistory winner. */
   fd_snapin_shmem_t const * shmem = ctx->shmem;
@@ -1747,6 +1748,7 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   if( ctx->full ) {
     ctx->lead.full_genesis_creation_time_seconds = 0UL;
     ctx->lead.capitalization          = 0UL;
+    ctx->lead.dup_capitalization      = 0UL;
     ctx->lead.recovery.capitalization = 0UL;
 
     fd_stake_delegations_reset( ctx->stake_delegations );
@@ -1760,7 +1762,8 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
 
     fd_memset( ctx->lead.feature_snoop, 0, sizeof(ctx->lead.feature_snoop) );
   } else {
-    ctx->lead.capitalization = ctx->lead.recovery.capitalization;
+    ctx->lead.capitalization     = ctx->lead.recovery.capitalization;
+    ctx->lead.dup_capitalization = 0UL;
 
     /* Discard stale capture so the retry's sysvar is snooped fresh */
     ctx->lead.slot_history.captured = 0;
@@ -1948,6 +1951,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
+      ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, ctx->lead.dup_capitalization );
       if( FD_UNLIKELY( validate_capitalization( ctx )!=0 ) ) {
         transition_malformed( ctx, stem );
         forward_msg = 0;
@@ -1976,6 +1980,7 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         break;
       }
 
+      ctx->lead.capitalization = fd_ulong_sat_sub( ctx->lead.capitalization, ctx->lead.dup_capitalization );
       if( FD_UNLIKELY( validate_capitalization( ctx )!=0 ) ) {
         transition_malformed( ctx, stem );
         forward_msg = 0;
@@ -2333,6 +2338,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lead.full_genesis_creation_time_seconds = 0UL;
   ctx->lead.manifest_capitalization            = 0UL;
   ctx->lead.capitalization                     = 0UL;
+  ctx->lead.dup_capitalization                 = 0UL;
   ctx->lead.recovery.capitalization            = 0UL;
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
