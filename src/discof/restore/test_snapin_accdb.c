@@ -12,7 +12,7 @@
 #define TEST_ACCOUNT_CNT     (FD_SSPARSE_ACC_BATCH_MAX+TEST_APPENDVEC_CNT-1UL)
 #define TEST_WORKER_MAX      (9UL)
 #define TEST_MAX_ACCOUNTS    (65536UL)
-#define TEST_PARTITION_SZ    (11UL<<20)
+#define TEST_PARTITION_SZ    (32UL<<20)
 #define TEST_CACHE_FOOTPRINT (32UL<<20)
 
 typedef struct {
@@ -31,6 +31,8 @@ typedef struct {
   void *                   snapin_shmem_mem;
   fd_snapin_shmem_t *      snapin_shmem;
   uchar *                  staged_mem;
+  uchar *                  write_mem;
+  fd_snapin_write_record_t * write_records;
   fd_snapin_tile_t *       worker;
   void *                   join_mem [ TEST_WORKER_MAX ];
   fd_accdb_fork_id_t       root;
@@ -143,6 +145,11 @@ test_env_init( test_env_t * env,
 
   env->staged_mem = aligned_alloc( 64UL, worker_cnt*FD_RUNTIME_ACC_SZ_MAX );
   FD_TEST( env->staged_mem );
+  env->write_mem = aligned_alloc( 64UL, worker_cnt*FD_SNAPIN_WRITE_BUF_SZ );
+  FD_TEST( env->write_mem );
+  env->write_records = aligned_alloc( alignof(fd_snapin_write_record_t),
+                                      worker_cnt*FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
+  FD_TEST( env->write_records );
 
   for( ulong i=0UL; i<worker_cnt; i++ ) {
     ulong join_fp = fd_accdb_footprint( 16UL );
@@ -158,6 +165,8 @@ test_env_init( test_env_t * env,
     ctx->stripe_locks = fd_snapin_shmem_stripes( env->snapin_shmem );
     ctx->shmem        = env->snapin_shmem;
     ctx->staged.data  = env->staged_mem + i*FD_RUNTIME_ACC_SZ_MAX;
+    ctx->writer.buf   = env->write_mem + i*FD_SNAPIN_WRITE_BUF_SZ;
+    ctx->writer.records = env->write_records + i*FD_SNAPIN_WRITE_RECORD_MAX;
   }
 
   env->root = fd_accdb_attach_child( env->worker[ 0 ].accdb, (fd_accdb_fork_id_t){ .val = USHORT_MAX } );
@@ -285,6 +294,8 @@ test_env_fini( test_env_t *          env,
   for( ulong i=0UL; i<env->worker_cnt; i++ ) {
     free( env->join_mem[ i ] );
   }
+  free( env->write_records );
+  free( env->write_mem );
   free( env->staged_mem );
   free( env->worker );
   free( env->snapin_shmem_mem );

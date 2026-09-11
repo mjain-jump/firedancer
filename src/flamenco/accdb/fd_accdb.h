@@ -557,9 +557,11 @@ struct fd_accdb_snapshot_worker_metrics {
 
 typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
 
-/* Called with the account stripe and shared writer lock held. */
+/* Reserves one contiguous range in the layer-0 account log. */
 
-typedef int (*fd_accdb_snapshot_store_fn_t)( void * cb_ctx, ulong batch_idx, ulong file_off );
+ulong
+fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
+                                 ulong        sz );
 
 /* Called under the account stripe when a flagged entry wins. */
 
@@ -567,12 +569,11 @@ typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
 
 /* Writes 1..8 accounts from one parallel worker.
    - stripe_locks protects hash chains.
-   - writer_lock protects disk offsets and store_fn.
+   - file_offsets contains a reserved on-disk location for every account.
    - USHORT_MAX fork_id selects a full snapshot.
    - Equal slots use last-lock-winner ordering.
-   - store_fn writes accepted records.
    - snoop_fn runs under the stripe lock for flagged winners.
-   Returns -1 on a repeated pubkey or store error. */
+   Returns -1 on a repeated pubkey. */
 
 int
 fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
@@ -586,16 +587,13 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       int const                            snoop_candidates[],
                                       int *                                stripe_locks,
                                       ulong                                stripe_msk,
-                                      int *                                writer_lock,
-                                      int *                                writer_err,
+                                      ulong const                          file_offsets[],
                                       fd_accdb_snapshot_worker_metrics_t * metrics,
                                       ulong *                              accounts_ignored,
                                       ulong *                              accounts_replaced,
                                       ulong *                              accounts_loaded,
                                       ulong *                              out_replaced_lamports,
                                       ulong *                              out_ignored_lamports,
-                                      fd_accdb_snapshot_store_fn_t         store_fn,
-                                      void *                               store_ctx,
                                       fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                       void *                               snoop_ctx );
 

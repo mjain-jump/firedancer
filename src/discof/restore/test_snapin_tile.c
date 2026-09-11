@@ -18,7 +18,6 @@
 #include "utils/fd_slot_delta_parser.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
 
 struct test_io_step {
@@ -160,6 +159,7 @@ test_stem_publish( fd_stem_context_t * stem,
 #define fd_accdb_snapshot_recover_delta              mock_accdb_snapshot_recover_delta
 #define fd_accdb_snapshot_save_whead                 mock_accdb_snapshot_save_whead
 #define fd_accdb_snapshot_revert_whead               mock_accdb_snapshot_revert_whead
+#define fd_accdb_snapshot_reserve_write              mock_accdb_snapshot_reserve_write
 #define fd_accdb_snapshot_write_batch_worker         mock_accdb_snapshot_write_batch_worker
 #define fd_txncache_reset                            mock_txncache_reset
 #define fd_txncache_snapin_scratch                   mock_txncache_snapin_scratch
@@ -183,6 +183,7 @@ test_stem_publish( fd_stem_context_t * stem,
 #undef fd_txncache_snapin_scratch
 #undef fd_txncache_reset
 #undef fd_accdb_snapshot_write_batch_worker
+#undef fd_accdb_snapshot_reserve_write
 #undef fd_accdb_snapshot_revert_whead
 #undef fd_accdb_snapshot_save_whead
 #undef fd_accdb_snapshot_recover_delta
@@ -283,6 +284,13 @@ mock_accdb_snapshot_revert_whead( fd_accdb_t *                         accdb,
   test_accdb_revert_whead_cnt++;
 }
 
+ulong
+mock_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
+                                   ulong        sz ) {
+  (void)accdb;
+  return FD_ATOMIC_FETCH_AND_ADD( &test_file_off, sz );
+}
+
 int
 mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
                                         fd_accdb_fork_id_t                   fork_id,
@@ -295,16 +303,13 @@ mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         acc
                                         int const                            snoop_candidates[],
                                         int *                                stripe_locks,
                                         ulong                                stripe_msk,
-                                        int *                                writer_lock,
-                                        int *                                writer_err,
+                                        ulong const                          file_offsets[],
                                         fd_accdb_snapshot_worker_metrics_t * metrics,
                                         ulong *                              accounts_ignored,
                                         ulong *                              accounts_replaced,
                                         ulong *                              accounts_loaded,
                                         ulong *                              out_replaced_lamports,
                                         ulong *                              out_ignored_lamports,
-                                        fd_accdb_snapshot_store_fn_t         store_fn,
-                                        void *                               store_ctx,
                                         fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                         void *                               snoop_ctx ) {
   (void)accdb;
@@ -312,9 +317,11 @@ mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         acc
   (void)pubkeys;
   (void)slot;
   (void)lamports;
+  (void)data_lens;
   (void)executables;
   (void)stripe_locks;
   (void)stripe_msk;
+  (void)file_offsets;
   (void)metrics;
   *accounts_ignored      = 0UL;
   *accounts_replaced     = 0UL;
@@ -322,16 +329,7 @@ mock_accdb_snapshot_write_batch_worker( fd_accdb_t *                         acc
   *out_replaced_lamports = 0UL;
   *out_ignored_lamports  = 0UL;
   for( ulong i=0UL; i<cnt; i++ ) {
-    FD_TEST( !*writer_lock && !*writer_err );
-    writer_lock_acquire( writer_lock );
-    ulong file_off = test_file_off;
-    test_file_off += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
-    if( FD_UNLIKELY( store_fn( store_ctx, i, file_off ) ) ) {
-      writer_lock_release( writer_lock );
-      return -1;
-    }
     if( snoop_fn && snoop_candidates && snoop_candidates[ i ] ) snoop_fn( snoop_ctx, i );
-    writer_lock_release( writer_lock );
   }
   return 0;
 }
@@ -442,9 +440,10 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
                int                state ) {
   static uchar shmem_mem[ sizeof(fd_snapin_shmem_t)
                         + FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int)
-                        + FD_SNAPIN_SHMEM_WRITE_BUF_SZ
                         + 3UL*4096UL ] __attribute__((aligned(4096)));
   static uchar staged_data[ FD_RUNTIME_ACC_SZ_MAX ] __attribute__((aligned(64)));
+  static uchar write_buf[ FD_SNAPIN_WRITE_BUF_SZ ] __attribute__((aligned(64)));
+  static fd_snapin_write_record_t write_records[ FD_SNAPIN_WRITE_RECORD_MAX ];
   static uchar init_mem[ FD_TOPO_MAX_TILE_IN_LINKS ][ sizeof(fd_ssctrl_init_t) ] __attribute__((aligned(FD_CHUNK_ALIGN)));
 
   fd_memset( ctx, 0, sizeof(*ctx) );
@@ -460,6 +459,8 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
   ctx->ct_out.idx   = 0UL;
   ctx->stripe_locks = fd_snapin_shmem_stripes( ctx->shmem );
   ctx->staged.data = staged_data;
+  ctx->writer.buf = write_buf;
+  ctx->writer.records = write_records;
   test_file_off = 0UL;
   worker_reset_attempt( ctx );
   clear_control_barrier( ctx );
@@ -499,6 +500,8 @@ typedef struct {
   ulong                   lane_cnt;
   uchar *                 in_mem;    /* tile_cnt*lane_cnt frag buffers */
   uchar *                 staged_mem;
+  uchar *                 write_mem;
+  fd_snapin_write_record_t * write_records;
   fd_stake_delegations_t * stake_delegations;
   fd_bank_t *              bank;
   fd_snapin_tile_t        ctx[ TEST_TILE_MAX ];
@@ -555,6 +558,11 @@ test_cluster_new( ulong tile_cnt,
 
   cl->staged_mem = aligned_alloc( 64UL, tile_cnt*FD_RUNTIME_ACC_SZ_MAX );
   FD_TEST( cl->staged_mem );
+  cl->write_mem = aligned_alloc( 64UL, tile_cnt*FD_SNAPIN_WRITE_BUF_SZ );
+  FD_TEST( cl->write_mem );
+  cl->write_records = aligned_alloc( alignof(fd_snapin_write_record_t),
+                                     tile_cnt*FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
+  FD_TEST( cl->write_records );
 
   /* log_snoop_checksums walks the root stake delegation pool; a zeroed
      struct (pool_idx_wmk_==0) is an empty pool. */
@@ -578,6 +586,8 @@ test_cluster_new( ulong tile_cnt,
     ctx->shmem        = cl->shmem;
     ctx->stripe_locks = fd_snapin_shmem_stripes( cl->shmem );
     ctx->staged.data   = cl->staged_mem + t*FD_RUNTIME_ACC_SZ_MAX;
+    ctx->writer.buf    = cl->write_mem + t*FD_SNAPIN_WRITE_BUF_SZ;
+    ctx->writer.records = cl->write_records + t*FD_SNAPIN_WRITE_RECORD_MAX;
 
     ctx->stake_delegations = cl->stake_delegations;
 
@@ -615,6 +625,8 @@ static void
 test_cluster_delete( test_cluster_t * cl ) {
   free( cl->bank );
   free( cl->stake_delegations );
+  free( cl->write_records );
+  free( cl->write_mem );
   free( cl->staged_mem );
   free( cl->in_mem );
   free( cl->sd_mem );
@@ -785,6 +797,9 @@ test_scratch_layout_fits( void ) {
     FD_SCRATCH_ALLOC_INIT( l, NULL );
     FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t) );
     FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->snapin.max_live_slots ) );
+    FD_SCRATCH_ALLOC_APPEND( l, 64UL,                      FD_RUNTIME_ACC_SZ_MAX );
+    FD_SCRATCH_ALLOC_APPEND( l, 64UL,                      FD_SNAPIN_WRITE_BUF_SZ );
+    FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_write_record_t), FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
     if( !kind_id ) {
       FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),               fd_txncache_footprint( tile->snapin.max_live_slots ) );
       FD_SCRATCH_ALLOC_APPEND( l, fd_ssmanifest_parser_align(),      fd_ssmanifest_parser_footprint()                     );
@@ -1639,6 +1654,7 @@ test_batch_stake_delegation( fd_wksp_t * wksp ) {
   };
 
   FD_TEST( !worker_process_account_batch( ctx, &result ) );
+  FD_TEST( !writer_flush( ctx ) );
   assert_stake_delegation( stake_delegations, &stake_account, &vote_account );
 }
 
@@ -1681,6 +1697,7 @@ test_streaming_stake_delegation( fd_wksp_t * wksp ) {
   data.account_data.data    = (uchar const *)state + split;
   data.account_data.data_sz = sizeof(fd_stake_state_t) - split;
   FD_TEST( !worker_process_account_data( ctx, &data ) );
+  FD_TEST( !writer_flush( ctx ) );
   assert_stake_delegation( stake_delegations, &stake_account, &vote_account );
 }
 
@@ -2268,9 +2285,9 @@ test_retry_resets( void ) {
   }
   ulong mid_claims = cl->shmem->next_appendvec;
   FD_TEST( mid_claims>n );
-  fd_snapin_shmem_write_buf( cl->shmem )[ 0 ] = 1U;
-  cl->shmem->writer.buf_used = 1UL;
-  FD_TEST( cl->shmem->writer.buf_used );
+  cl->ctx[ 0 ].writer.buf[ 0 ] = 1U;
+  cl->ctx[ 0 ].writer.buf_used = 1UL;
+  FD_TEST( cl->ctx[ 0 ].writer.buf_used );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
   for( ulong t=0UL; t<n; t++ ) {
@@ -2294,8 +2311,7 @@ test_retry_resets( void ) {
   FD_TEST( test_accdb_reset_cnt==1UL );      /* full retry wipes the fork wholesale */
   FD_TEST( !test_accdb_purge_cnt );          /* ... so no incremental purge */
   FD_TEST( !test_accdb_revert_whead_cnt );
-  FD_TEST( !cl->shmem->writer.buf_used );
-  FD_TEST( !cl->shmem->writer.err );
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].writer.buf_used );
 
   FD_TEST( cl->shmem->next_appendvec==1UL );   /* claim sequence restarted at 0 */
   FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
@@ -2361,8 +2377,17 @@ test_fini_storage_error_retries( void ) {
   ulong owner[ TEST_AV_MAX ];
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
 
-  fd_snapin_shmem_write_buf( cl->shmem )[ 0 ] = 1U;
-  cl->shmem->writer.buf_used = 1UL;
+  uchar pubkey[ 32UL ] = {1};
+  uchar account_owner[ 32UL ] = {2};
+  uchar data[ 1UL ] = {3};
+  uchar const * pubkeys[ 1 ] = { pubkey };
+  uchar const * owners [ 1 ] = { account_owner };
+  uchar const * datas  [ 1 ] = { data };
+  ulong lamports [ 1 ] = { 1UL };
+  ulong data_lens[ 1 ] = { 1UL };
+  int executables[ 1 ] = { 0 };
+  FD_TEST( !writer_append_batch( &cl->ctx[ 0 ], 1UL, pubkeys, owners, datas, 42UL,
+                                 lamports, data_lens, executables ) );
   test_pwrite_push( -1L, ENOSPC );
 
   ulong pub0 = test_pub_cnt;
@@ -2370,17 +2395,62 @@ test_fini_storage_error_retries( void ) {
   FD_TEST( cl->ctx[ 0 ].state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( test_pub_cnt==pub0+1UL );
   FD_TEST( test_pub_sig[ pub0 ]==FD_SNAPSHOT_MSG_CTRL_ERROR );
+  FD_TEST( test_file_off==sizeof(fd_accdb_disk_meta_t)+1UL );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
   FD_TEST( cl->ctx[ 0 ].state==FD_SNAPSHOT_STATE_IDLE );
-  FD_TEST( cl->shmem->writer.err==ENOSPC );
+  FD_TEST( !cl->ctx[ 0 ].writer.buf_used );
+  FD_TEST( test_file_off==sizeof(fd_accdb_disk_meta_t)+1UL );
 
   test_counters_reset();
   test_io_reset();
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
   FD_TEST( cl->ctx[ 0 ].state==FD_SNAPSHOT_STATE_PROCESSING );
-  FD_TEST( !cl->shmem->writer.buf_used );
-  FD_TEST( !cl->shmem->writer.err );
+  FD_TEST( !cl->ctx[ 0 ].writer.buf_used );
+  FD_TEST( !test_file_off );
+
+  test_cluster_delete( cl );
+}
+
+static void
+test_incremental_storage_error_reverts_range( void ) {
+  test_cluster_t * cl = test_cluster_new( 1UL, 1UL );
+  test_counters_reset();
+  test_io_reset();
+  test_stream_init( 1UL );
+
+  ulong checkpoint = 1000UL;
+  test_file_off = checkpoint;
+  cl->ctx[ 0 ].lead.recovery.accdb_metadata.whead_val = checkpoint;
+  cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  ulong appendvec_owner[ TEST_AV_MAX ];
+  cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, appendvec_owner );
+
+  uchar pubkey[ 32UL ] = {1};
+  uchar owner [ 32UL ] = {2};
+  uchar data[ 1UL ] = {3};
+  uchar const * pubkeys[ 1 ] = { pubkey };
+  uchar const * owners [ 1 ] = { owner };
+  uchar const * datas  [ 1 ] = { data };
+  ulong lamports [ 1 ] = { 1UL };
+  ulong data_lens[ 1 ] = { 1UL };
+  int executables[ 1 ] = { 0 };
+  FD_TEST( !writer_append_batch( &cl->ctx[ 0 ], 1UL, pubkeys, owners, datas, 42UL,
+                                 lamports, data_lens, executables ) );
+  test_pwrite_push( -1L, ENOSPC );
+
+  cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
+  FD_TEST( cl->ctx[ 0 ].state==FD_SNAPSHOT_STATE_ERROR );
+  FD_TEST( test_file_off==checkpoint+sizeof(fd_accdb_disk_meta_t)+1UL );
+  cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
+
+  test_counters_reset();
+  test_io_reset();
+  test_stream_init( 1UL );
+  cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_INCR );
+  FD_TEST( test_accdb_purge_cnt==1UL );
+  FD_TEST( test_accdb_revert_whead_cnt==1UL );
+  FD_TEST( test_file_off==checkpoint );
 
   test_cluster_delete( cl );
 }
@@ -2616,66 +2686,128 @@ test_writer_short_write_and_eintr( void ) {
   uchar data[ 5UL ] = { 1, 2, 3, 4, 5 };
   fd_snapin_tile_t ctx[1];
   sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
-  uchar * buf = fd_snapin_shmem_write_buf( ctx->shmem );
 
   test_io_reset();
   test_pwrite_push( -1L, EINTR );
   test_pwrite_push(  2L, 0     );
   test_pwrite_push(  3L, 0     );
 
-  fd_memcpy( buf, data, sizeof(data) );
-  ctx->shmem->writer.buf_off  = 10UL;
-  ctx->shmem->writer.buf_used = sizeof(data);
-  FD_TEST( !writer_flush( ctx ) );
+  FD_TEST( !writer_pwrite( ctx, data, sizeof(data), 10UL ) );
   FD_TEST( test_pwrite_call_cnt==3UL );
   FD_TEST( test_pwrite_sz [0]==5UL && test_pwrite_off[0]==10UL && test_pwrite_data[0][0]==1U );
   FD_TEST( test_pwrite_sz [1]==5UL && test_pwrite_off[1]==10UL && test_pwrite_data[1][0]==1U );
   FD_TEST( test_pwrite_sz [2]==3UL && test_pwrite_off[2]==12UL && test_pwrite_data[2][0]==3U );
   FD_TEST( ctx->metrics.disk_bytes_written==sizeof(data) );
-  FD_TEST( ctx->shmem->writer.buf_off==15UL );
-  FD_TEST( !ctx->shmem->writer.buf_used );
-
-  test_io_reset();
-  writer_reset( ctx );
-  ctx->metrics.disk_bytes_written = 0UL;
-  ctx->shmem->writer.buf_used = FD_SNAPIN_SHMEM_WRITE_BUF_SZ-1UL;
-  uchar pubkey[ 32UL ] = {1};
-  uchar owner [ 32UL ] = {2};
-  uchar byte = 3U;
-  uchar const * pubkeys [ 1 ] = { pubkey };
-  uchar const * owners  [ 1 ] = { owner  };
-  uchar const * datas   [ 1 ] = { &byte  };
-  ulong data_lens[ 1 ] = { 1UL };
-  ctx->account_view.pubkeys   = pubkeys;
-  ctx->account_view.owners    = owners;
-  ctx->account_view.datas     = datas;
-  ctx->account_view.data_lens = data_lens;
-  FD_TEST( !worker_store_record( ctx, 0UL, FD_SNAPIN_SHMEM_WRITE_BUF_SZ-1UL ) );
-  FD_TEST( test_pwrite_call_cnt==1UL );
-  FD_TEST( ctx->metrics.disk_bytes_written==FD_SNAPIN_SHMEM_WRITE_BUF_SZ-1UL );
-  FD_TEST( ctx->shmem->writer.buf_off==FD_SNAPIN_SHMEM_WRITE_BUF_SZ-1UL );
-  FD_TEST( ctx->shmem->writer.buf_used==sizeof(fd_accdb_disk_meta_t)+1UL );
 }
 
 static void
-test_writer_errors( void ) {
+test_writer_flush( void ) {
+  uchar pubkey[ 32UL ] = {1};
+  uchar owner [ 32UL ] = {2};
+  uchar data  [ 3UL ] = {3, 4, 5};
+  uchar const * pubkeys[ 1 ] = { pubkey };
+  uchar const * owners [ 1 ] = { owner  };
+  uchar const * datas  [ 1 ] = { data   };
+  ulong lamports  [ 1 ] = { 7UL };
+  ulong data_lens [ 1 ] = { sizeof(data) };
+  int executables [ 1 ] = { 1 };
+
+  fd_snapin_tile_t ctx[1];
+  sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
+  test_io_reset();
+
+  FD_TEST( !writer_append_batch( ctx, 1UL, pubkeys, owners, datas, 42UL, lamports, data_lens, executables ) );
+  FD_TEST( ctx->writer.record_cnt==1UL );
+  FD_TEST( !ctx->metrics.accounts_loaded );
+  FD_TEST( ctx->metrics.total_accounts_processed==1UL );
+  FD_TEST( ctx->metrics.total_account_batches_processed==1UL );
+  FD_TEST( !writer_flush( ctx ) );
+
+  ulong entry_sz = sizeof(fd_accdb_disk_meta_t)+sizeof(data);
+  FD_TEST( test_pwrite_call_cnt==1UL );
+  FD_TEST( test_pwrite_off[ 0 ]==0UL && test_pwrite_sz[ 0 ]==entry_sz );
+  FD_TEST( test_file_off==entry_sz );
+  FD_TEST( !ctx->writer.buf_used && !ctx->writer.record_cnt );
+  FD_TEST( ctx->metrics.accounts_loaded==1UL );
+  FD_TEST( ctx->metrics.disk_bytes_written==entry_sz );
+}
+
+static void
+test_writer_full_buffer_flush( void ) {
+  fd_snapin_tile_t ctx[1];
+  sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
+  test_io_reset();
+
+  ulong data_len = FD_SNAPIN_WRITE_BUF_SZ/2UL-sizeof(fd_accdb_disk_meta_t)-1UL;
+  uchar * data = aligned_alloc( 64UL, fd_ulong_align_up( data_len, 64UL ) );
+  FD_TEST( data );
+  fd_memset( data, 7, data_len );
+
+  uchar pubkey[ 32UL ] = {1};
+  uchar owner [ 32UL ] = {2};
+  uchar const * pubkeys[ 1 ] = { pubkey };
+  uchar const * owners [ 1 ] = { owner };
+  uchar const * datas  [ 1 ] = { data };
+  ulong lamports [ 1 ] = { 3UL };
+  ulong data_lens[ 1 ] = { data_len };
+  int executables[ 1 ] = { 0 };
+
+  FD_TEST( !writer_append_batch( ctx, 1UL, pubkeys, owners, datas, 42UL,
+                                 lamports, data_lens, executables ) );
+  pubkey[ 0 ] = 4U;
+  FD_TEST( !writer_append_batch( ctx, 1UL, pubkeys, owners, datas, 42UL,
+                                 lamports, data_lens, executables ) );
+  FD_TEST( ctx->writer.buf_used==FD_SNAPIN_WRITE_BUF_SZ-2UL );
+
+  pubkey[ 0 ] = 5U;
+  data_lens[ 0 ] = 1UL;
+  FD_TEST( !writer_append_batch( ctx, 1UL, pubkeys, owners, datas, 42UL,
+                                 lamports, data_lens, executables ) );
+  FD_TEST( test_pwrite_call_cnt==1UL );
+  FD_TEST( test_pwrite_sz[ 0 ]==FD_SNAPIN_WRITE_BUF_SZ-2UL );
+  FD_TEST( ctx->writer.buf_used==sizeof(fd_accdb_disk_meta_t)+1UL );
+
+  FD_TEST( !writer_flush( ctx ) );
+  FD_TEST( test_pwrite_call_cnt==2UL );
+  FD_TEST( test_pwrite_off[ 1 ]==FD_SNAPIN_WRITE_BUF_SZ-2UL );
+  FD_TEST( test_file_off==FD_SNAPIN_WRITE_BUF_SZ+sizeof(fd_accdb_disk_meta_t)-1UL );
+  free( data );
+}
+
+static void
+test_writer_error( void ) {
   uchar data[ 4UL ] = {1, 2, 3, 4};
   fd_snapin_tile_t ctx[1];
   sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
-  uchar * buf = fd_snapin_shmem_write_buf( ctx->shmem );
 
   test_io_reset();
-  fd_memcpy( buf, data, sizeof(data) );
-  ctx->shmem->writer.buf_used = sizeof(data);
   test_pwrite_push(  2L, 0   );
   test_pwrite_push( -1L, EIO );
-  FD_TEST( writer_flush( ctx )==-1 );
+  FD_TEST( writer_pwrite( ctx, data, sizeof(data), 0UL )==-1 );
   FD_TEST( test_pwrite_call_cnt==2UL );
   FD_TEST( test_pwrite_sz[0]==4UL && test_pwrite_off[0]==0UL && test_pwrite_data[0][0]==1U );
   FD_TEST( test_pwrite_sz[1]==2UL && test_pwrite_off[1]==2UL && test_pwrite_data[1][0]==3U );
   FD_TEST( ctx->metrics.disk_bytes_written==2UL );
-  FD_TEST( ctx->shmem->writer.buf_off==2UL && ctx->shmem->writer.buf_used==2UL );
-  FD_TEST( ctx->shmem->writer.err==EIO );
+}
+
+static void
+test_batch_duplicate_rejected_before_write( void ) {
+  fd_snapin_tile_t ctx[1];
+  sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
+  test_io_reset();
+
+  uchar entries[ 2 ][ 136UL ] = {{0}};
+  fd_ssparse_advance_result_t result = {
+    .account_batch = {
+      .batch = { entries[ 0 ], entries[ 1 ] },
+      .batch_cnt = 2UL,
+      .slot = 42UL,
+    },
+  };
+
+  FD_TEST( worker_process_account_batch( ctx, &result )==-1 );
+  FD_TEST( !ctx->writer.buf_used );
+  FD_TEST( !test_pwrite_call_cnt );
 }
 
 static void
@@ -2683,6 +2815,7 @@ test_max_account_staging( void ) {
   fd_snapin_tile_t ctx[1];
   sync_ctx_init( ctx, 1UL, FD_SNAPSHOT_STATE_IDLE );
   test_counters_reset();
+  test_io_reset();
 
   uchar pubkey[ 32UL ] = {4};
   uchar owner [ 32UL ] = {5};
@@ -2716,91 +2849,56 @@ test_max_account_staging( void ) {
   }
 
   FD_TEST( !ctx->staged.active );
-  FD_TEST( ctx->metrics.accounts_loaded==1UL );
-  FD_TEST( ctx->shmem->writer.buf_used==sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX );
-  uchar * record = fd_snapin_shmem_write_buf( ctx->shmem );
+  FD_TEST( ctx->writer.buf_used==sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX );
   fd_accdb_disk_meta_t meta;
-  fd_memcpy( meta.b, record, sizeof(meta) );
+  fd_memcpy( meta.b, ctx->writer.buf, sizeof(meta) );
   FD_TEST( meta.size==FD_RUNTIME_ACC_SZ_MAX );
   ulong actual_sum = 0UL;
   ulong actual_mix = 0UL;
   for( ulong i=0UL; i<FD_RUNTIME_ACC_SZ_MAX; i++ ) {
-    actual_sum += (ulong)record[ sizeof(meta)+i ];
-    actual_mix += (i+1UL)*(ulong)record[ sizeof(meta)+i ];
+    actual_sum += (ulong)ctx->writer.buf[ sizeof(meta)+i ];
+    actual_mix += (i+1UL)*(ulong)ctx->writer.buf[ sizeof(meta)+i ];
   }
   FD_TEST( actual_sum==expected_sum );
   FD_TEST( actual_mix==expected_mix );
-}
 
-typedef struct {
-  fd_snapin_tile_t * ctx;
-  uchar pubkey[ 32UL ];
-  uchar owner [ 32UL ];
-  uchar data  [ 32UL ];
-  uchar const * pubkeys  [ 1 ];
-  uchar const * owners   [ 1 ];
-  uchar const * datas    [ 1 ];
-  ulong         data_lens[ 1 ];
-} test_writer_thread_ctx_t;
-
-static void *
-test_writer_thread_main( void * ctx_ ) {
-  test_writer_thread_ctx_t * thread = (test_writer_thread_ctx_t *)ctx_;
-  fd_snapin_tile_t * ctx = thread->ctx;
-  ctx->account_view.pubkeys   = thread->pubkeys;
-  ctx->account_view.owners    = thread->owners;
-  ctx->account_view.datas     = thread->datas;
-  ctx->account_view.data_lens = thread->data_lens;
-
-  for( ulong i=0UL; i<1024UL; i++ ) {
-    writer_lock_acquire( &ctx->shmem->writer.lock );
-    ulong file_off = ctx->shmem->writer.buf_off+ctx->shmem->writer.buf_used;
-    FD_TEST( !worker_store_record( ctx, 0UL, file_off ) );
-    writer_lock_release( &ctx->shmem->writer.lock );
-  }
-  return NULL;
+  FD_TEST( !ctx->metrics.accounts_loaded );
+  FD_TEST( !writer_flush( ctx ) );
+  FD_TEST( ctx->metrics.accounts_loaded==1UL );
+  FD_TEST( test_pwrite_call_cnt==1UL );
+  FD_TEST( test_pwrite_sz[ 0 ]==sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX );
 }
 
 static void
-test_shared_writer_concurrency( void ) {
-  ulong const thread_cnt = 4UL;
-  test_cluster_t * cl = test_cluster_new( thread_cnt, 1UL );
-  test_writer_thread_ctx_t thread_ctx[ 4 ];
-  pthread_t threads[ 4 ];
+test_private_writer_ranges( void ) {
+  test_cluster_t * cl = test_cluster_new( 2UL, 1UL );
+  test_io_reset();
 
-  for( ulong i=0UL; i<thread_cnt; i++ ) {
-    fd_memset( &thread_ctx[ i ], 0, sizeof(thread_ctx[ i ]) );
-    thread_ctx[ i ].ctx          = &cl->ctx[ i ];
-    thread_ctx[ i ].pubkey[ 0 ]  = (uchar)(i+1UL);
-    thread_ctx[ i ].owner [ 0 ]  = (uchar)(i+2UL);
-    thread_ctx[ i ].data  [ 0 ]  = (uchar)(i+3UL);
-    thread_ctx[ i ].pubkeys[ 0 ] = thread_ctx[ i ].pubkey;
-    thread_ctx[ i ].owners [ 0 ] = thread_ctx[ i ].owner;
-    thread_ctx[ i ].datas  [ 0 ] = thread_ctx[ i ].data;
-    thread_ctx[ i ].data_lens[ 0 ] = 32UL;
-    FD_TEST( !pthread_create( &threads[ i ], NULL, test_writer_thread_main, &thread_ctx[ i ] ) );
+  uchar pubkey[ 2 ][ 32UL ] = {{1}, {2}};
+  uchar owner [ 2 ][ 32UL ] = {{3}, {4}};
+  uchar data  [ 2 ][ 4UL  ] = {{5}, {6}};
+  ulong lamports[ 1 ] = { 7UL };
+  ulong data_lens[ 1 ] = { 4UL };
+  int executables[ 1 ] = { 0 };
+
+  for( ulong i=0UL; i<2UL; i++ ) {
+    uchar const * pubkeys[ 1 ] = { pubkey[ i ] };
+    uchar const * owners [ 1 ] = { owner [ i ] };
+    uchar const * datas  [ 1 ] = { data  [ i ] };
+    FD_TEST( !writer_append_batch( &cl->ctx[ i ], 1UL, pubkeys, owners, datas, 42UL,
+                                   lamports, data_lens, executables ) );
   }
-  for( ulong i=0UL; i<thread_cnt; i++ ) FD_TEST( !pthread_join( threads[ i ], NULL ) );
 
-  FD_TEST( !cl->shmem->writer.lock );
-  FD_TEST( !cl->shmem->writer.err );
-  FD_TEST( cl->shmem->writer.buf_used==thread_cnt*1024UL*(sizeof(fd_accdb_disk_meta_t)+32UL) );
+  FD_TEST( cl->ctx[ 0 ].writer.buf!=cl->ctx[ 1 ].writer.buf );
+  FD_TEST( cl->ctx[ 0 ].writer.buf[ 0 ]==1U );
+  FD_TEST( cl->ctx[ 1 ].writer.buf[ 0 ]==2U );
+  FD_TEST( !writer_flush( &cl->ctx[ 1 ] ) );
+  FD_TEST( !writer_flush( &cl->ctx[ 0 ] ) );
 
-  ulong record_cnt[ 4 ] = {0};
-  uchar const * buf = fd_snapin_shmem_write_buf( cl->shmem );
-  ulong record_sz = sizeof(fd_accdb_disk_meta_t)+32UL;
-  for( ulong off=0UL; off<cl->shmem->writer.buf_used; off+=record_sz ) {
-    fd_accdb_disk_meta_t meta;
-    fd_memcpy( meta.b, buf+off, sizeof(meta) );
-    FD_TEST( meta.pubkey[ 0 ]>=1U && meta.pubkey[ 0 ]<=4U );
-    ulong thread_idx = (ulong)meta.pubkey[ 0 ]-1UL;
-    FD_TEST( meta.size==32U );
-    FD_TEST( fd_memeq( meta.pubkey, thread_ctx[ thread_idx ].pubkey, 32UL ) );
-    FD_TEST( fd_memeq( meta.owner,  thread_ctx[ thread_idx ].owner,  32UL ) );
-    FD_TEST( fd_memeq( buf+off+sizeof(meta), thread_ctx[ thread_idx ].data, 32UL ) );
-    record_cnt[ thread_idx ]++;
-  }
-  for( ulong i=0UL; i<thread_cnt; i++ ) FD_TEST( record_cnt[ i ]==1024UL );
+  ulong entry_sz = sizeof(fd_accdb_disk_meta_t)+4UL;
+  FD_TEST( test_pwrite_call_cnt==2UL );
+  FD_TEST( test_pwrite_off[ 0 ]==0UL && test_pwrite_off[ 1 ]==entry_sz );
+  FD_TEST( test_file_off==2UL*entry_sz );
   test_cluster_delete( cl );
 }
 
@@ -2810,9 +2908,12 @@ main( int     argc,
   fd_boot( &argc, &argv );
 
   test_writer_short_write_and_eintr();
-  test_writer_errors();
+  test_writer_flush();
+  test_writer_full_buffer_flush();
+  test_writer_error();
+  test_batch_duplicate_rejected_before_write();
   test_max_account_staging();
-  test_shared_writer_concurrency();
+  test_private_writer_ranges();
   test_scratch_layout_fits();
 
   /* The end-to-end populate test holds a full-size txncache (~1.3 GiB)
@@ -2869,6 +2970,7 @@ main( int     argc,
   test_retry_resets();
   test_fini_truncated_malform();
   test_fini_storage_error_retries();
+  test_incremental_storage_error_reverts_range();
   test_accumulator_fold();
   test_gauge_sum_continuity();
   test_full_lifecycle_9_tiles();

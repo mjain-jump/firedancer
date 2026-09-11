@@ -30,7 +30,11 @@
 
 #define NAME "snapin"
 
-FD_STATIC_ASSERT( sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX<=FD_SNAPIN_SHMEM_WRITE_BUF_SZ, write_buf );
+#define FD_SNAPIN_WRITE_BUF_SZ     (16UL<<20)
+#define FD_SNAPIN_WRITE_RECORD_MAX (FD_SNAPIN_WRITE_BUF_SZ/sizeof(fd_accdb_disk_meta_t))
+
+FD_STATIC_ASSERT( FD_SNAPSHOT_DATA_MTU<FD_SNAPIN_WRITE_BUF_SZ, write_buf );
+FD_STATIC_ASSERT( sizeof(fd_accdb_disk_meta_t)+FD_RUNTIME_ACC_SZ_MAX<=FD_SNAPIN_WRITE_BUF_SZ, max_account );
 
 /* The snapin tiles are state machines that parse and load a full
    and optionally an incremental snapshot.  They are responsible
@@ -132,6 +136,38 @@ struct fd_snapin_out_link {
   ulong       mtu;
 };
 typedef struct fd_snapin_out_link fd_snapin_out_link_t;
+
+struct fd_snapin_write_record {
+  ulong  lamports;
+  uint   slot;
+  ushort batch_cnt;
+  ushort executable;
+};
+
+typedef struct fd_snapin_write_record fd_snapin_write_record_t;
+
+FD_STATIC_ASSERT( sizeof(fd_snapin_write_record_t)==16UL, write_record );
+
+struct fd_snapin_account_batch {
+  ulong cnt;
+  ulong slot;
+  uchar const * pubkeys    [ FD_SSPARSE_ACC_BATCH_MAX ];
+  uchar const * owners     [ FD_SSPARSE_ACC_BATCH_MAX ];
+  uchar const * datas      [ FD_SSPARSE_ACC_BATCH_MAX ];
+  ulong         lamports   [ FD_SSPARSE_ACC_BATCH_MAX ];
+  ulong         data_lens  [ FD_SSPARSE_ACC_BATCH_MAX ];
+  int           executables[ FD_SSPARSE_ACC_BATCH_MAX ];
+  ulong         file_offsets[ FD_SSPARSE_ACC_BATCH_MAX ];
+};
+
+typedef struct fd_snapin_account_batch fd_snapin_account_batch_t;
+
+struct fd_snapin_snoop_ctx {
+  struct fd_snapin_tile *           tile;
+  fd_snapin_account_batch_t const * batch;
+};
+
+typedef struct fd_snapin_snoop_ctx fd_snapin_snoop_ctx_t;
 
 /* Only tile 0 uses this state. */
 struct fd_snapin_lead {
@@ -286,16 +322,12 @@ struct fd_snapin_tile {
 
   fd_accdb_snapshot_worker_metrics_t worker_metrics[1];
 
-  /* Batch data used by store and snoop callbacks. */
   struct {
-    ulong                 slot;
-    uchar const * const * pubkeys;
-    uchar const * const * owners;
-    uchar const * const * datas;
-    ulong const *         lamports;
-    ulong const *         data_lens;
-    int   const *         executables;
-  } account_view;
+    uchar *                    buf;
+    fd_snapin_write_record_t * records;
+    ulong                      buf_used;
+    ulong                      record_cnt;
+  } writer;
 
   /* Buffer streamed account data before inserting. */
   struct {
@@ -333,9 +365,11 @@ scratch_align( void ) {
 static ulong
 scratch_footprint( fd_topo_tile_t const * tile ) {
   ulong l = FD_LAYOUT_INIT;
-  l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),     sizeof(fd_snapin_tile_t)                          );
-  l = FD_LAYOUT_APPEND( l, fd_accdb_align(),              fd_accdb_footprint( tile->snapin.max_live_slots ) );
-  l = FD_LAYOUT_APPEND( l, 64UL,                          FD_RUNTIME_ACC_SZ_MAX                             );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_tile_t),         sizeof(fd_snapin_tile_t)                                      );
+  l = FD_LAYOUT_APPEND( l, fd_accdb_align(),                  fd_accdb_footprint( tile->snapin.max_live_slots )             );
+  l = FD_LAYOUT_APPEND( l, 64UL,                              FD_RUNTIME_ACC_SZ_MAX                                         );
+  l = FD_LAYOUT_APPEND( l, 64UL,                              FD_SNAPIN_WRITE_BUF_SZ                                        );
+  l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_write_record_t), FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
   if( FD_LIKELY( !tile->kind_id ) ) {
     l = FD_LAYOUT_APPEND( l, fd_txncache_align(),               fd_txncache_footprint( tile->snapin.max_live_slots )         );
     l = FD_LAYOUT_APPEND( l, fd_ssmanifest_parser_align(),      fd_ssmanifest_parser_footprint()                             );
@@ -1089,92 +1123,23 @@ validate_capitalization( fd_snapin_tile_t * ctx ) {
 
 /* Write engine */
 
-static inline void
-writer_lock_acquire( int * lock ) {
-  while( FD_UNLIKELY( FD_ATOMIC_CAS( lock, 0, 1 ) ) ) FD_SPIN_PAUSE();
-  FD_COMPILER_MFENCE();
-}
-
-static inline void
-writer_lock_release( int * lock ) {
-  FD_COMPILER_MFENCE();
-  FD_VOLATILE( *lock ) = 0;
-}
-
 static int
-writer_flush_locked( fd_snapin_tile_t * ctx ) {
-  fd_snapin_shmem_t * shmem = ctx->shmem;
-  if( FD_UNLIKELY( shmem->writer.err ) ) return -1;
-  if( FD_UNLIKELY( !shmem->writer.buf_used ) ) return 0;
-
-  uchar * buf  = fd_snapin_shmem_write_buf( shmem );
-  ulong   sz   = shmem->writer.buf_used;
-  ulong   off  = shmem->writer.buf_off;
+writer_pwrite( fd_snapin_tile_t * ctx,
+               uchar const *      buf,
+               ulong              sz,
+               ulong              off ) {
   ulong   done = 0UL;
   while( done<sz ) {
     long res = pwrite( FD_ACCDB_FD_RW, buf+done, sz-done, (long)(off+done) );
     if( FD_UNLIKELY( res<=0L ) ) {
       int err = res<0L ? errno : EIO;
       if( res<0L && err==EINTR ) continue;
-      if( done ) {
-        memmove( buf, buf+done, sz-done );
-        shmem->writer.buf_off  += done;
-        shmem->writer.buf_used -= done;
-      }
-      shmem->writer.err = err;
       FD_LOG_WARNING(( "snapshot write failed at offset %lu (%d-%s)", off+done, err, fd_io_strerror( err ) ));
       return -1;
     }
     done += (ulong)res;
     ctx->metrics.disk_bytes_written += (ulong)res;
   }
-  shmem->writer.buf_off += sz;
-  shmem->writer.buf_used = 0UL;
-  return 0;
-}
-
-static int
-writer_flush( fd_snapin_tile_t * ctx ) {
-  writer_lock_acquire( &ctx->shmem->writer.lock );
-  int err = writer_flush_locked( ctx );
-  writer_lock_release( &ctx->shmem->writer.lock );
-  return err;
-}
-
-static void
-writer_reset( fd_snapin_tile_t * ctx ) {
-  writer_lock_acquire( &ctx->shmem->writer.lock );
-  ctx->shmem->writer.err      = 0;
-  ctx->shmem->writer.buf_off  = 0UL;
-  ctx->shmem->writer.buf_used = 0UL;
-  writer_lock_release( &ctx->shmem->writer.lock );
-}
-
-static int
-worker_store_record( void * cb_ctx,
-                     ulong  batch_idx,
-                     ulong  file_off ) {
-  fd_snapin_tile_t *  ctx   = (fd_snapin_tile_t *)cb_ctx;
-  fd_snapin_shmem_t * shmem = ctx->shmem;
-  ulong data_len = ctx->account_view.data_lens[ batch_idx ];
-  ulong entry_sz = sizeof(fd_accdb_disk_meta_t)+data_len;
-  FD_TEST( entry_sz<=FD_SNAPIN_SHMEM_WRITE_BUF_SZ );
-
-  if( FD_UNLIKELY( file_off!=shmem->writer.buf_off+shmem->writer.buf_used ||
-                   entry_sz>FD_SNAPIN_SHMEM_WRITE_BUF_SZ-shmem->writer.buf_used ) ) {
-    if( FD_UNLIKELY( writer_flush_locked( ctx ) ) ) return -1;
-    shmem->writer.buf_off = file_off;
-  }
-
-  uchar * dst = fd_snapin_shmem_write_buf( shmem ) + shmem->writer.buf_used;
-  fd_accdb_disk_meta_t meta;
-  fd_memcpy( meta.pubkey, ctx->account_view.pubkeys[ batch_idx ], 32UL );
-  meta.size       = (uint)data_len;
-  meta.generation = 0U;
-  fd_memcpy( meta.owner, ctx->account_view.owners[ batch_idx ], 32UL );
-  fd_memcpy( dst, meta.b, sizeof(fd_accdb_disk_meta_t) );
-  if( data_len ) fd_memcpy( dst+sizeof(fd_accdb_disk_meta_t), ctx->account_view.datas[ batch_idx ], data_len );
-  shmem->writer.buf_used += entry_sz;
   return 0;
 }
 
@@ -1196,21 +1161,23 @@ worker_snoop_candidate( uchar const * pubkey,
 static void
 worker_snoop_winner( void * cb_ctx,
                      ulong  batch_idx ) {
-  fd_snapin_tile_t * ctx = (fd_snapin_tile_t *)cb_ctx;
+  fd_snapin_snoop_ctx_t * snoop = (fd_snapin_snoop_ctx_t *)cb_ctx;
+  fd_snapin_tile_t * ctx = snoop->tile;
+  fd_snapin_account_batch_t const * batch = snoop->batch;
 
-  uchar const * pubkey   = ctx->account_view.pubkeys  [ batch_idx ];
-  uchar const * owner    = ctx->account_view.owners   [ batch_idx ];
-  uchar const * data     = ctx->account_view.datas    [ batch_idx ];
-  ulong         lamports = ctx->account_view.lamports [ batch_idx ];
-  ulong         data_len = ctx->account_view.data_lens[ batch_idx ];
+  uchar const * pubkey   = batch->pubkeys  [ batch_idx ];
+  uchar const * owner    = batch->owners   [ batch_idx ];
+  uchar const * data     = batch->datas    [ batch_idx ];
+  ulong         lamports = batch->lamports [ batch_idx ];
+  ulong         data_len = batch->data_lens[ batch_idx ];
 
   if( FD_UNLIKELY( !memcmp( pubkey, fd_sysvar_slot_history_id.uc, 32UL ) ) ) {
     if( FD_UNLIKELY( data_len>FD_SYSVAR_SLOT_HISTORY_BINCODE_SZ ) ) return;
     fd_snapin_shmem_t * shmem = ctx->shmem;
-    shmem->slot_history.slot       = ctx->account_view.slot;
+    shmem->slot_history.slot       = batch->slot;
     shmem->slot_history.lamports   = lamports;
     shmem->slot_history.data_len   = data_len;
-    shmem->slot_history.executable = ctx->account_view.executables[ batch_idx ];
+    shmem->slot_history.executable = batch->executables[ batch_idx ];
     fd_memcpy( shmem->slot_history.owner, owner, 32UL );
     fd_memcpy( shmem->slot_history.buf, data, data_len );
     shmem->slot_history.captured   = 1;
@@ -1258,6 +1225,8 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
   ctx->gate_pending  = 0;
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
   fd_memset( ctx->worker_metrics, 0, sizeof(ctx->worker_metrics) );
+  ctx->writer.buf_used   = 0UL;
+  ctx->writer.record_cnt = 0UL;
   ctx->staged.active = 0;
   fd_ssparse_init( ctx->ssparse );
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
@@ -1268,7 +1237,6 @@ worker_reset_attempt( fd_snapin_tile_t * ctx ) {
 
 static inline void
 worker_record_insert_metrics( fd_snapin_tile_t * ctx,
-                              ulong              cnt,
                               ulong              accounts_ignored,
                               ulong              accounts_replaced,
                               ulong              accounts_loaded,
@@ -1278,11 +1246,121 @@ worker_record_insert_metrics( fd_snapin_tile_t * ctx,
   ctx->metrics.accounts_ignored  += accounts_ignored;
   ctx->metrics.accounts_replaced += accounts_replaced;
   ctx->metrics.accounts_loaded   += accounts_loaded;
-  ctx->metrics.total_accounts_processed += cnt;
-  ctx->metrics.total_account_batches_processed++;
   ctx->worker.input_lamports    = fd_ulong_sat_add( ctx->worker.input_lamports,    input_lamports    );
   ctx->worker.replaced_lamports = fd_ulong_sat_add( ctx->worker.replaced_lamports, replaced_lamports );
   ctx->worker.ignored_lamports  = fd_ulong_sat_add( ctx->worker.ignored_lamports,  ignored_lamports  );
+}
+
+static int
+worker_commit_batch( fd_snapin_tile_t *              ctx,
+                     fd_snapin_account_batch_t const * batch ) {
+  int candidates[ FD_SSPARSE_ACC_BATCH_MAX ];
+  ulong input_lamports = 0UL;
+  for( ulong i=0UL; i<batch->cnt; i++ ) {
+    candidates[ i ] = worker_snoop_candidate( batch->pubkeys[ i ], batch->owners[ i ] );
+    input_lamports  = fd_ulong_sat_add( input_lamports, batch->lamports[ i ] );
+  }
+
+  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
+  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
+  fd_snapin_snoop_ctx_t snoop = { .tile=ctx, .batch=batch };
+  if( FD_UNLIKELY( fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, batch->cnt, batch->pubkeys, batch->slot, batch->lamports,
+                                                         batch->data_lens, batch->executables, candidates,
+                                                         ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
+                                                         batch->file_offsets, ctx->worker_metrics,
+                                                         &accounts_ignored, &accounts_replaced,
+                                                         &accounts_loaded, &replaced_lamports, &ignored_lamports,
+                                                         worker_snoop_winner, &snoop ) ) ) return -1;
+
+  worker_record_insert_metrics( ctx, accounts_ignored, accounts_replaced, accounts_loaded,
+                                input_lamports, replaced_lamports, ignored_lamports );
+  return 0;
+}
+
+static int
+writer_flush( fd_snapin_tile_t * ctx ) {
+  if( FD_UNLIKELY( !ctx->writer.buf_used ) ) return 0;
+
+  ulong base_off = fd_accdb_snapshot_reserve_write( ctx->accdb, ctx->writer.buf_used );
+  /* Attempt rollback reclaims this range if writing or committing fails. */
+  if( FD_UNLIKELY( writer_pwrite( ctx, ctx->writer.buf, ctx->writer.buf_used, base_off ) ) ) return -1;
+
+  ulong record_idx = 0UL;
+  ulong buf_off    = 0UL;
+  while( record_idx<ctx->writer.record_cnt ) {
+    fd_snapin_write_record_t const * record = &ctx->writer.records[ record_idx ];
+    ulong cnt = (ulong)record->batch_cnt;
+    FD_TEST( cnt && cnt<=FD_SSPARSE_ACC_BATCH_MAX && record_idx+cnt<=ctx->writer.record_cnt );
+
+    fd_snapin_account_batch_t batch = {
+      .cnt  = cnt,
+      .slot = (ulong)record->slot,
+    };
+
+    for( ulong i=0UL; i<cnt; i++ ) {
+      record = &ctx->writer.records[ record_idx+i ];
+      fd_accdb_disk_meta_t const * meta = (fd_accdb_disk_meta_t const *)(ctx->writer.buf+buf_off);
+      batch.pubkeys    [ i ] = meta->pubkey;
+      batch.owners     [ i ] = meta->owner;
+      batch.datas      [ i ] = meta->b+sizeof(fd_accdb_disk_meta_t);
+      batch.lamports   [ i ] = record->lamports;
+      batch.data_lens  [ i ] = (ulong)meta->size;
+      batch.executables[ i ] = (int)record->executable;
+      batch.file_offsets[ i ] = base_off+buf_off;
+      FD_TEST( (ulong)record->slot==batch.slot );
+      buf_off += sizeof(fd_accdb_disk_meta_t)+(ulong)meta->size;
+    }
+
+    if( FD_UNLIKELY( worker_commit_batch( ctx, &batch ) ) ) return -1;
+    record_idx += cnt;
+  }
+
+  FD_TEST( buf_off==ctx->writer.buf_used );
+  ctx->writer.buf_used   = 0UL;
+  ctx->writer.record_cnt = 0UL;
+  return 0;
+}
+
+static int
+writer_append_batch( fd_snapin_tile_t *   ctx,
+                     ulong                cnt,
+                     uchar const * const  pubkeys[],
+                     uchar const * const  owners[],
+                     uchar const * const  datas[],
+                     ulong                slot,
+                     ulong const          lamports[],
+                     ulong const          data_lens[],
+                     int const            executables[] ) {
+  if( FD_UNLIKELY( slot>UINT_MAX ) ) FD_LOG_ERR(( "snapshot slot %lu exceeds 2^32-1, accdb format must be widened", slot ));
+
+  ulong batch_sz = 0UL;
+  for( ulong i=0UL; i<cnt; i++ ) batch_sz += sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
+  FD_TEST( batch_sz<=FD_SNAPIN_WRITE_BUF_SZ );
+
+  if( FD_UNLIKELY( batch_sz>FD_SNAPIN_WRITE_BUF_SZ-ctx->writer.buf_used ||
+                   cnt>FD_SNAPIN_WRITE_RECORD_MAX-ctx->writer.record_cnt ) ) {
+    if( FD_UNLIKELY( writer_flush( ctx ) ) ) return -1;
+  }
+
+  for( ulong i=0UL; i<cnt; i++ ) {
+    fd_snapin_write_record_t * record = &ctx->writer.records[ ctx->writer.record_cnt++ ];
+    record->slot       = (uint)slot;
+    record->lamports   = lamports[ i ];
+    record->batch_cnt  = (ushort)(i ? 0UL : cnt);
+    record->executable = (ushort)executables[ i ];
+
+    fd_accdb_disk_meta_t meta;
+    fd_memcpy( meta.pubkey, pubkeys[ i ], 32UL );
+    meta.size       = (uint)data_lens[ i ];
+    meta.generation = 0U;
+    fd_memcpy( meta.owner, owners[ i ], 32UL );
+    fd_memcpy( ctx->writer.buf+ctx->writer.buf_used, meta.b, sizeof(meta) );
+    fd_memcpy( ctx->writer.buf+ctx->writer.buf_used+sizeof(meta), datas[ i ], data_lens[ i ] );
+    ctx->writer.buf_used += sizeof(meta)+data_lens[ i ];
+  }
+  ctx->metrics.total_accounts_processed += cnt;
+  ctx->metrics.total_account_batches_processed++;
+  return 0;
 }
 
 static int
@@ -1298,9 +1376,7 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
   ulong         lamports    [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   ulong         data_lens   [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
   int           executables [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
-  int           candidates  [ FD_SSPARSE_ACC_BATCH_MAX ] = {0};
 
-  ulong batch_lamports = 0UL;
   for( ulong i=0UL; i<cnt; i++ ) {
     uchar const * e = entries[ i ];
     pubkeys[ i ]     = e + 16UL;
@@ -1309,35 +1385,18 @@ worker_process_account_batch( fd_snapin_tile_t *            ctx,
     lamports[ i ]    = fd_ulong_load_8_fast( e+48UL );
     data_lens[ i ]   = fd_ulong_load_8_fast( e+8UL );
     executables[ i ] = e[ 96UL ];
-    candidates[ i ]  = worker_snoop_candidate( pubkeys[ i ], owners[ i ] );
-    batch_lamports   = fd_ulong_sat_add( batch_lamports, lamports[ i ] );
   }
 
-  ctx->account_view.slot        = batch_slot;
-  ctx->account_view.pubkeys     = pubkeys;
-  ctx->account_view.owners      = owners;
-  ctx->account_view.datas       = datas;
-  ctx->account_view.lamports    = lamports;
-  ctx->account_view.data_lens   = data_lens;
-  ctx->account_view.executables = executables;
-
-  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, cnt, pubkeys, batch_slot, lamports,
-                                                            data_lens, executables, candidates,
-                                                            ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
-                                                            &ctx->shmem->writer.lock, &ctx->shmem->writer.err, ctx->worker_metrics,
-                                                            &accounts_ignored, &accounts_replaced,
-                                                            &accounts_loaded, &replaced_lamports, &ignored_lamports,
-                                                            worker_store_record, ctx,
-                                                            worker_snoop_winner, ctx ) ) ) {
-    return -1;
+  for( ulong i=1UL; i<cnt; i++ ) {
+    for( ulong j=0UL; j<i; j++ ) {
+      if( FD_UNLIKELY( !memcmp( pubkeys[ j ], pubkeys[ i ], 32UL ) ) ) {
+        FD_LOG_WARNING(( "corrupt snapshot: duplicate pubkey within a single batch (entries %lu and %lu, slot %lu)", j, i, batch_slot ));
+        return -1;
+      }
+    }
   }
 
-  worker_record_insert_metrics( ctx, cnt, accounts_ignored, accounts_replaced, accounts_loaded,
-                                batch_lamports, replaced_lamports, ignored_lamports );
-
-  return 0;
+  return writer_append_batch( ctx, cnt, pubkeys, owners, datas, batch_slot, lamports, data_lens, executables );
 }
 
 static int
@@ -1355,33 +1414,7 @@ worker_insert_one( fd_snapin_tile_t * ctx,
   ulong         lamports_a  [ 1 ] = { lamports };
   ulong         data_lens   [ 1 ] = { data_len };
   int           executables [ 1 ] = { executable };
-  int           candidates  [ 1 ] = { worker_snoop_candidate( pubkey, owner ) };
-
-  ctx->account_view.slot        = slot;
-  ctx->account_view.pubkeys     = pubkeys;
-  ctx->account_view.owners      = owners;
-  ctx->account_view.datas       = datas;
-  ctx->account_view.lamports    = lamports_a;
-  ctx->account_view.data_lens   = data_lens;
-  ctx->account_view.executables = executables;
-
-  ulong accounts_ignored, accounts_replaced, accounts_loaded, replaced_lamports, ignored_lamports;
-  fd_accdb_fork_id_t fork_id = { .val = ctx->full ? USHORT_MAX : (ushort)ctx->incr_fork };
-  if( FD_UNLIKELY( 0!=fd_accdb_snapshot_write_batch_worker( ctx->accdb, fork_id, 1UL, pubkeys, slot, lamports_a,
-                                                            data_lens, executables, candidates,
-                                                            ctx->stripe_locks, FD_SNAPIN_SHMEM_STRIPE_MSK,
-                                                            &ctx->shmem->writer.lock, &ctx->shmem->writer.err, ctx->worker_metrics,
-                                                            &accounts_ignored, &accounts_replaced,
-                                                            &accounts_loaded, &replaced_lamports, &ignored_lamports,
-                                                            worker_store_record, ctx,
-                                                            worker_snoop_winner, ctx ) ) ) {
-    return -1;
-  }
-
-  worker_record_insert_metrics( ctx, 1UL, accounts_ignored, accounts_replaced, accounts_loaded,
-                                lamports, replaced_lamports, ignored_lamports );
-
-  return 0;
+  return writer_append_batch( ctx, 1UL, pubkeys, owners, datas, slot, lamports_a, data_lens, executables );
 }
 
 static int
@@ -1735,7 +1768,6 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
                     ulong              chunk ) {
   /* Roll back before publishing this attempt. */
   if( FD_UNLIKELY( ctx->lead.rollback.pending ) ) tile0_rollback_failed_attempt( ctx, ctx->full );
-  writer_reset( ctx );
 
   ctx->lead.manifest_capitalization = 0UL;
 
@@ -2236,6 +2268,8 @@ unprivileged_init( fd_topo_t const *      topo,
   fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t) );
   void * _accdb          = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->snapin.max_live_slots ) );
   void * _staged_data    = FD_SCRATCH_ALLOC_APPEND( l, 64UL,                      FD_RUNTIME_ACC_SZ_MAX );
+  void * _write_buf      = FD_SCRATCH_ALLOC_APPEND( l, 64UL,                      FD_SNAPIN_WRITE_BUF_SZ );
+  void * _write_records  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_write_record_t), FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
 
   ctx->tile_idx = tile->kind_id;
   if( FD_UNLIKELY( ctx->tile_idx>=FD_TOPO_MAX_TILE_IN_LINKS ) ) {
@@ -2248,6 +2282,10 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->generation          = 0UL;
   ctx->expected_frame      = 0UL;
   ctx->staged.data          = (uchar *)_staged_data;
+  ctx->writer.buf           = (uchar *)_write_buf;
+  ctx->writer.records       = (fd_snapin_write_record_t *)_write_records;
+  ctx->writer.buf_used      = 0UL;
+  ctx->writer.record_cnt    = 0UL;
   ctx->lead.txncache_max_groups_per_slot  = tile->snapin.max_txn_per_slot;
   ctx->lead.txncache_max_entries_per_slot = 2UL*tile->snapin.max_txn_per_slot;
   ctx->lead.txncache_entries_max          = FD_TXNCACHE_MAX_SLOT_DELTAS*ctx->lead.txncache_max_entries_per_slot;
@@ -2257,6 +2295,9 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
   fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
   FD_TEST( accdb_shmem );
+  if( FD_UNLIKELY( fd_accdb_shmem_partition_sz( accdb_shmem )<FD_SNAPIN_WRITE_BUF_SZ ) ) {
+    FD_LOG_ERR(( "accdb partition size must be at least %lu bytes", FD_SNAPIN_WRITE_BUF_SZ ));
+  }
   ctx->accdb = fd_accdb_join( fd_accdb_new( _accdb, accdb_shmem, FD_ACCDB_FD_RW, 0UL, NULL ) );
   FD_TEST( ctx->accdb );
 

@@ -9,7 +9,6 @@
 /* 4096 stripes kept lock contention below 0.4% with 8 workers. */
 #define FD_SNAPIN_SHMEM_STRIPE_CNT (1UL<<12)
 #define FD_SNAPIN_SHMEM_STRIPE_MSK (FD_SNAPIN_SHMEM_STRIPE_CNT-1UL)
-#define FD_SNAPIN_SHMEM_WRITE_BUF_SZ (64UL<<20)
 
 /* Workers add capitalization totals before ACKing FINI. */
 struct fd_snapin_shmem_totals {
@@ -33,13 +32,6 @@ struct fd_snapin_shmem {
 
   /* Isolate the hot claim counter on its own cache line. */
   ulong next_appendvec __attribute__((aligned(128)));
-
-  struct __attribute__((aligned(128))) {
-    int   lock;
-    int   err;
-    ulong buf_off;
-    ulong buf_used;
-  } writer;
 
   fd_snapin_shmem_totals_t totals;
 
@@ -72,7 +64,6 @@ fd_snapin_shmem_footprint( void ) {
   ulong l = FD_LAYOUT_INIT;
   l = FD_LAYOUT_APPEND( l, alignof(fd_snapin_shmem_t), sizeof(fd_snapin_shmem_t)              );
   l = FD_LAYOUT_APPEND( l, alignof(int),               FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int) );
-  l = FD_LAYOUT_APPEND( l, 64UL,                       FD_SNAPIN_SHMEM_WRITE_BUF_SZ           );
   return FD_LAYOUT_FINI( l, fd_snapin_shmem_align() );
 }
 
@@ -87,10 +78,6 @@ fd_snapin_shmem_new( void * mem,
   shmem->attempt.generation = 0UL;
   shmem->attempt.fork_id    = 0UL;
   shmem->next_appendvec     = 0UL;
-  shmem->writer.lock        = 0;
-  shmem->writer.err         = 0;
-  shmem->writer.buf_off     = 0UL;
-  shmem->writer.buf_used    = 0UL;
   fd_memset( &shmem->totals,        0, sizeof(fd_snapin_shmem_totals_t) );
   fd_memset( &shmem->slot_history,  0, sizeof(shmem->slot_history)      );
   fd_memset( &shmem->feature_snoop, 0, sizeof(fd_feature_snoop_t)       );
@@ -112,14 +99,6 @@ fd_snapin_shmem_stripes( fd_snapin_shmem_t * shmem ) {
   FD_SCRATCH_ALLOC_INIT( l, shmem );
   FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_shmem_t), sizeof(fd_snapin_shmem_t) );
   return (int *)FD_SCRATCH_ALLOC_APPEND( l, alignof(int), FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int) );
-}
-
-static inline uchar *
-fd_snapin_shmem_write_buf( fd_snapin_shmem_t * shmem ) {
-  FD_SCRATCH_ALLOC_INIT( l, shmem );
-  FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_shmem_t), sizeof(fd_snapin_shmem_t) );
-  FD_SCRATCH_ALLOC_APPEND( l, alignof(int), FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int) );
-  return (uchar *)FD_SCRATCH_ALLOC_APPEND( l, 64UL, FD_SNAPIN_SHMEM_WRITE_BUF_SZ );
 }
 
 #endif /* HEADER_fd_src_discof_restore_utils_fd_snapin_shmem_h */

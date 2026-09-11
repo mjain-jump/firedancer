@@ -1878,6 +1878,13 @@ allocate_next_write( fd_accdb_t * accdb,
   return file_offset;
 }
 
+ulong
+fd_accdb_snapshot_reserve_write( fd_accdb_t * accdb,
+                                 ulong        sz ) {
+  FD_TEST( sz && sz<=accdb->shmem->partition_sz );
+  return allocate_next_write( accdb, sz );
+}
+
 /* Try to reserve a whole snapshot account batch in one partition.  The
    normal snapshot batch has about 7 accounts, so this replaces one atomic
    fetch-and-add per account with one CAS per batch.  If the batch would
@@ -4426,20 +4433,17 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       int const                            snoop_candidates[],
                                       int *                                stripe_locks,
                                       ulong                                stripe_msk,
-                                      int *                                writer_lock,
-                                      int *                                writer_err,
+                                      ulong const                          file_offsets[],
                                       fd_accdb_snapshot_worker_metrics_t * metrics,
                                       ulong *                              accounts_ignored,
                                       ulong *                              accounts_replaced,
                                       ulong *                              accounts_loaded,
                                       ulong *                              out_replaced_lamports,
                                       ulong *                              out_ignored_lamports,
-                                      fd_accdb_snapshot_store_fn_t         store_fn,
-                                      void *                               store_ctx,
                                       fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                       void *                               snoop_ctx ) {
   FD_TEST( cnt && cnt<=8UL );
-  FD_TEST( stripe_locks && writer_lock && writer_err && store_fn );
+  FD_TEST( stripe_locks && file_offsets );
 
   int incremental = fork_id.val!=USHORT_MAX;
 
@@ -4485,9 +4489,7 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
     }
   }
 
-  /* Walk and commit under the account stripe.  Accepted records also
-     take writer_lock before allocating their shared disk offset.  No
-     path may take these locks in the opposite order. */
+  /* Walk and commit under the account stripe. */
 
   for( ulong i=0UL; i<cnt; i++ ) {
     ulong  entry_sz = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
@@ -4530,26 +4532,13 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
 
     if( FD_UNLIKELY( skip ) ) {
       spin_lock_release( stripe );
+      fd_accdb_shmem_bytes_freed( accdb->shmem, file_offsets[ i ], entry_sz );
       ignored_lamports  += lamports[ i ];
       ignored++;
       continue;
     }
 
-    spin_lock_acquire( writer_lock );
-    if( FD_UNLIKELY( FD_VOLATILE_CONST( *writer_err ) ) ) {
-      spin_lock_release( writer_lock );
-      spin_lock_release( stripe );
-      return -1;
-    }
-
-    ulong file_off = allocate_next_write( accdb, entry_sz );
-    if( FD_UNLIKELY( store_fn( store_ctx, i, file_off ) ) ) {
-      if( FD_LIKELY( !*writer_err ) ) FD_VOLATILE( *writer_err ) = EIO;
-      spin_lock_release( writer_lock );
-      spin_lock_release( stripe );
-      return -1;
-    }
-    spin_lock_release( writer_lock );
+    ulong file_off = file_offsets[ i ];
 
     if( FD_UNLIKELY( existing!=NULL ) ) {
       ulong old_sz = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( existing->executable_size );
