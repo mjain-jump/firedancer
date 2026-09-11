@@ -433,7 +433,7 @@ sync_ctx_init( fd_snapin_tile_t * ctx,
   ctx->writer.buf     = write_buf;
   ctx->writer.records = write_records;
   test_file_off = 0UL;
-  worker_reset_attempt( ctx );
+  reset_attempt_state( ctx );
   clear_control_barrier( ctx );
 
   ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
@@ -584,7 +584,7 @@ test_cluster_new( ulong tile_cnt,
     ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
     ctx->lead.boot_timestamp     = fd_log_wallclock();
 
-    worker_reset_attempt( ctx );
+    reset_attempt_state( ctx );
   }
 
   return cl;
@@ -1121,7 +1121,7 @@ test_error_fail_and_retry( void ) {
      after every FAIL ack has quiesced.  Run that lead-only setup here
      without publishing another control ack, which keeps this test's
      control-pipeline assertions focused on ERROR and FAIL. */
-  tile0_init_attempt( ctx, 0UL, 0UL );
+  tile0_begin_attempt( ctx, 0UL, 0UL );
   FD_TEST( test_accdb_reset_cnt==1UL );
   FD_TEST( test_pub_cnt==2UL );
   FD_TEST( test_pub_sig[1]==FD_SNAPSHOT_MSG_CTRL_FAIL );
@@ -1196,18 +1196,18 @@ test_init_gate_holds_data( void ) {
   /* Stale attempt slot: generation 0 while the tile will be on
      generation 1 (bumped at its first INIT frag).  The stale fork id is
      left plausible (USHORT_MAX, i.e. what a previous full attempt would
-     have published) so that only the generation gate can stop the tile
+     have published) so that only the attempt number can stop the tile
      -- the fork-id sanity check must not be what saves us. */
-  FD_TEST( cl->shmem->attempt.generation==0UL );
+  FD_TEST( cl->shmem->attempt.number==0UL );
   cl->shmem->attempt.fork_id = (ulong)USHORT_MAX;
 
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( ctx, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
 
   /* The INIT barrier completed and was acked, but the write path is
      armed, not open. */
-  FD_TEST( ctx->generation==1UL );
+  FD_TEST( ctx->attempt_number==1UL );
   FD_TEST( ctx->state==FD_SNAPSHOT_STATE_PROCESSING );
-  FD_TEST( ctx->gate_pending );
+  FD_TEST( ctx->waiting_for_tile0 );
   FD_TEST( ctx->incr_fork==ULONG_MAX );
   FD_TEST( !cl->shmem->next_appendvec );
   FD_TEST( test_pub_cnt==1UL && test_pub_sig[ 0 ]==FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
@@ -1217,7 +1217,7 @@ test_init_gate_holds_data( void ) {
   test_cur_tile = ctx->tile_idx;
   for( ulong i=0UL; i<8UL; i++ ) {
     FD_TEST( before_frag( ctx, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
-    FD_TEST( ctx->gate_pending );
+    FD_TEST( ctx->waiting_for_tile0 );
     FD_TEST( !cl->shmem->next_appendvec );
     FD_TEST( !ctx->appendvec_seq );
   }
@@ -1227,11 +1227,11 @@ test_init_gate_holds_data( void ) {
   /* Publish the attempt slot exactly as tile 0's INIT does. */
   FD_VOLATILE( cl->shmem->attempt.fork_id ) = (ulong)USHORT_MAX;
   FD_COMPILER_MFENCE();
-  FD_VOLATILE( cl->shmem->attempt.generation ) = 1UL;
+  FD_VOLATILE( cl->shmem->attempt.number ) = 1UL;
 
   /* The next data frag opens the gate and is admitted. */
   FD_TEST( tile_step( ctx )==0UL );
-  FD_TEST( !ctx->gate_pending );
+  FD_TEST( !ctx->waiting_for_tile0 );
   FD_TEST( ctx->incr_fork==(ulong)USHORT_MAX );
   FD_TEST( cl->shmem->next_appendvec==2UL );  /* the eager claim, then its replacement */
   FD_TEST( test_pub_cnt==1UL );             /* still just the INIT ack */
@@ -1260,19 +1260,19 @@ test_init_aborted_barrier_retries( void ) {
 
   /* Tile 1 completes its INIT barrier on both lanes. */
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( t1, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( t1->generation==1UL );
-  FD_TEST( t1->gate_pending );
+  FD_TEST( t1->attempt_number==1UL );
+  FD_TEST( t1->waiting_for_tile0 );
 
   /* Tile 0 consumes INIT on lane 0 only, then the ERROR that sits right
      behind it: its barrier is abandoned, so the INIT handler never runs
      and nothing is published. */
   tile_send_control( t0, 0UL, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( t0->generation==1UL );
+  FD_TEST( t0->attempt_number==1UL );
   FD_TEST( before_frag( t0, 0UL, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR )==0 );
   tile_send_control( t0, 0UL, FD_SNAPSHOT_MSG_CTRL_ERROR );
   FD_TEST( t0->state==FD_SNAPSHOT_STATE_ERROR );
   FD_TEST( !t0->lead.init_completed );
-  FD_TEST( !cl->shmem->attempt.generation );  /* slot never published */
+  FD_TEST( !cl->shmem->attempt.number );  /* attempt never published */
 
   /* Tile 1 holds its data behind the unpublished slot, but the ERROR at
      its lane head is still deliverable. */
@@ -1292,7 +1292,7 @@ test_init_aborted_barrier_retries( void ) {
   for( ulong i=pub0; i<test_pub_cnt; i++ ) FD_TEST( test_pub_sig[ i ]==FD_SNAPSHOT_MSG_CTRL_FAIL );
   for( ulong t=0UL; t<n; t++ ) {
     FD_TEST( cl->ctx[ t ].state==FD_SNAPSHOT_STATE_IDLE );
-    FD_TEST( !cl->ctx[ t ].gate_pending );
+    FD_TEST( !cl->ctx[ t ].waiting_for_tile0 );
   }
   /* Tile 0's INIT never ran, so there is nothing to roll back -- and in
      particular the root fork id must not have been wiped on the stale
@@ -1303,14 +1303,14 @@ test_init_aborted_barrier_retries( void ) {
   test_counters_reset();
   test_stream_init( T );
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( cl->shmem->attempt.generation==2UL );
-  for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].generation==2UL );
-  FD_TEST( !t0->gate_pending );  /* tile 0 publishes, so it never gates */
-  FD_TEST( t1->gate_pending );   /* ... and tile 1 opens on its first data frag */
+  FD_TEST( cl->shmem->attempt.number==2UL );
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].attempt_number==2UL );
+  FD_TEST( !t0->waiting_for_tile0 );
+  FD_TEST( t1->waiting_for_tile0 );
 
   ulong owner[ TEST_AV_MAX ];
   cluster_stream( cl, TEST_ORDER_ROUND_ROBIN, owner );
-  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].gate_pending );
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].waiting_for_tile0 );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FINI );
   FD_TEST( cl->shmem->next_appendvec==T+n );
@@ -1330,20 +1330,20 @@ test_init_gate_rejects_stale_generation( void ) {
 
   /* Attempt 1 loads normally on tile 1 (tile 0 publishes generation 1). */
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( cl->shmem->attempt.generation==1UL );
+  FD_TEST( cl->shmem->attempt.number==1UL );
   (void)tile_step( t1 );  /* the first data frag opens tile 1's gate */
-  FD_TEST( !t1->gate_pending );
+  FD_TEST( !t1->waiting_for_tile0 );
 
   cluster_barrier( cl, FD_SNAPSHOT_MSG_CTRL_FAIL );
 
   /* Attempt 2: only tile 1's barrier completes.  The slot still holds
      generation 1, which must NOT open the gate. */
   for( ulong lane=0UL; lane<cl->lane_cnt; lane++ ) tile_send_control( t1, lane, FD_SNAPSHOT_MSG_CTRL_INIT_FULL );
-  FD_TEST( t1->generation==2UL );
-  FD_TEST( cl->shmem->attempt.generation==1UL );
+  FD_TEST( t1->attempt_number==2UL );
+  FD_TEST( cl->shmem->attempt.number==1UL );
   test_cur_tile = 1UL;
   FD_TEST( before_frag( t1, 0UL, 0UL, FD_SNAPSHOT_MSG_DATA )==-1 );
-  FD_TEST( t1->gate_pending );
+  FD_TEST( t1->waiting_for_tile0 );
 
   test_cluster_delete( cl );
 }
@@ -1370,14 +1370,14 @@ test_init_publishes_after_reset( void ) {
   FD_TEST( !shmem->totals.input_lamports );
   FD_TEST( !shmem->slot_history.captured );
   FD_TEST( !shmem->feature_snoop.present[ 0 ] );
-  FD_TEST( shmem->attempt.generation==1UL );
+  FD_TEST( shmem->attempt.number==1UL );
   FD_TEST( shmem->attempt.fork_id==(ulong)USHORT_MAX );
   /* Re-zeroed, then tile 0's own eager claim (it publishes the slot, so
      its gate opens inside the INIT handler; the other tiles draw theirs
      when their first data frag arrives). */
   FD_TEST( shmem->next_appendvec==1UL );
   FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
-  FD_TEST( !cl->ctx[ 0 ].gate_pending );
+  FD_TEST( !cl->ctx[ 0 ].waiting_for_tile0 );
 
   FD_TEST( test_accdb_reset_cnt==1UL );
   FD_TEST( test_accdb_attach_cnt==1UL );
@@ -1410,11 +1410,11 @@ test_eager_claim_coverage( void ) {
          frag opens its gate. */
       FD_TEST( cl->shmem->next_appendvec==1UL );
       FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
-      for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].gate_pending );
+      for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].waiting_for_tile0 );
 
       ulong owner[ TEST_AV_MAX ];
       cluster_stream( cl, orders[ o_idx ], owner );
-      for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].gate_pending );
+      for( ulong t=0UL; t<n; t++ ) FD_TEST( !cl->ctx[ t ].waiting_for_tile0 );
 
       FD_TEST( test_appendvec_parse_cnt==T ); /* the parser was flipped exactly once per ordinal */
 
@@ -2279,8 +2279,8 @@ test_retry_resets( void ) {
 
   FD_TEST( cl->shmem->next_appendvec==1UL );   /* claim sequence restarted at 0 */
   FD_TEST( cl->ctx[ 0 ].claimed_appendvec==0UL );
-  for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].generation==2UL );
-  for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].gate_pending );
+  for( ulong t=0UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].attempt_number==2UL );
+  for( ulong t=1UL; t<n; t++ ) FD_TEST( cl->ctx[ t ].waiting_for_tile0 );
 
   /* The retry covers every ordinal exactly once (cluster_stream would
      trip on a double claim). */

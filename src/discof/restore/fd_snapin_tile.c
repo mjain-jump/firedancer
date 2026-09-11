@@ -260,14 +260,14 @@ typedef struct fd_snapin_lead fd_snapin_lead_t;
 
 struct fd_snapin_tile {
   int  state;
-  uint full         : 1;  /* loading a full snapshot? */
-  uint gate_pending : 1;  /* waiting for attempt slot */
+  uint full              : 1;  /* loading a full snapshot? */
+  uint waiting_for_tile0 : 1;
 
   fd_snapin_lead_t lead;
 
   ulong tile_idx;           /* tile kind ID */
   ulong lane_cnt;
-  ulong generation;         /* attempt number */
+  ulong attempt_number;
   ulong expected_frame;
   ulong pending_control;    /* control message expected from snapdc tiles */
   uchar control_seen[ FD_TOPO_MAX_TILE_IN_LINKS ];
@@ -1233,20 +1233,24 @@ worker_snoop_winner( void * cb_ctx,
       FD_STAKE_DELEGATIONS_WARMUP_COOLDOWN_RATE_ENUM_025 );
 }
 
+/* Resets local worker state */
+
 static void
-worker_reset_attempt( fd_snapin_tile_t * ctx ) {
-  ctx->expected_frame = 0UL;
-  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) ctx->in[ lane ].pos = 0UL;
-  ctx->appendvec_seq = 0UL;
-  ctx->incr_fork     = ULONG_MAX;
-  ctx->gate_pending  = 0;
+reset_attempt_state( fd_snapin_tile_t * ctx ) {
+  for( ulong lane=0UL; lane<ctx->lane_cnt; lane++ ) {
+    ctx->in[ lane ].pos = 0UL;
+  }
+  ctx->expected_frame     = 0UL;
+  ctx->appendvec_seq      = 0UL;
+  ctx->incr_fork          = ULONG_MAX;
+  ctx->waiting_for_tile0  = 0;
+  ctx->writer.buf_used    = 0UL;
+  ctx->writer.record_cnt  = 0UL;
+  ctx->staged.active      = 0;
+
   fd_memset( &ctx->worker, 0, sizeof(ctx->worker) );
-  ctx->writer.buf_used   = 0UL;
-  ctx->writer.record_cnt = 0UL;
-  ctx->staged.active = 0;
   fd_ssparse_init( ctx->ssparse );
   fd_ssparse_batch_enable( ctx->ssparse, 1 );
-  /* The gate takes the next appendvec claim. */
 }
 
 static int
@@ -1727,16 +1731,13 @@ tile0_rollback_failed_attempt( fd_snapin_tile_t * ctx,
       fd_accdb_snapshot_revert_whead( ctx->accdb, &ctx->lead.recovery.accdb_metadata );
     }
     *ctx->lead.feature_snoop = ctx->lead.recovery.feature_snoop;
-  } else {
-    /* A failed full load must retry as full. */
-    FD_TEST( retry_full );
   }
 }
 
 /* Only a completed INIT has valid state to roll back. */
 
 static void
-tile0_defer_rollback( fd_snapin_tile_t * ctx ) {
+tile0_schedule_rollback( fd_snapin_tile_t * ctx ) {
   if( FD_LIKELY( ctx->lead.init_completed ) ) {
     ctx->lead.rollback.pending = 1;
     ctx->lead.rollback.full    = ctx->full;
@@ -1750,9 +1751,9 @@ tile0_defer_rollback( fd_snapin_tile_t * ctx ) {
 /* Tile 0 prepares shared state, then publishes the attempt slot. */
 
 static void
-tile0_init_attempt( fd_snapin_tile_t * ctx,
-                    ulong              in_idx,
-                    ulong              chunk ) {
+tile0_begin_attempt( fd_snapin_tile_t * ctx,
+                     ulong              in_idx,
+                     ulong              chunk ) {
   /* Roll back before publishing this attempt. */
   if( FD_UNLIKELY( ctx->lead.rollback.pending ) ) tile0_rollback_failed_attempt( ctx, ctx->full );
 
@@ -1815,19 +1816,19 @@ tile0_init_attempt( fd_snapin_tile_t * ctx,
   /* Publish last. Other tiles wait for this. */
   FD_VOLATILE( shmem->attempt.fork_id ) = ctx->full ? (ulong)USHORT_MAX : (ulong)ctx->lead.accdb_incr_fork_id.val;
   FD_COMPILER_MFENCE();
-  FD_VOLATILE( shmem->attempt.generation ) = ctx->generation;
+  FD_VOLATILE( shmem->attempt.number ) = ctx->attempt_number;
 }
 
-/* Attempt slot gate */
+/* Attempt sync */
 
-/* Tile 0 publishes the slot after INIT work.
+/* Tile 0 publishes the attempt after INIT work.
    Other tiles hold DATA until then.
    Controls still pass, so ERROR and FAIL can cancel the attempt. */
 
 static void
-attempt_gate_open( fd_snapin_tile_t * ctx ) {
+sync_attempt( fd_snapin_tile_t * ctx ) {
   FD_COMPILER_MFENCE();
-  FD_TEST( FD_VOLATILE_CONST( ctx->shmem->attempt.generation )==ctx->generation );
+  FD_TEST( FD_VOLATILE_CONST( ctx->shmem->attempt.number )==ctx->attempt_number );
   ctx->incr_fork = FD_VOLATILE_CONST( ctx->shmem->attempt.fork_id );
   if( FD_UNLIKELY( ctx->full ? ctx->incr_fork!=(ulong)USHORT_MAX : ctx->incr_fork>=(ulong)USHORT_MAX ) ) {
     FD_LOG_ERR(( "invalid attempt fork %lu (full=%d); this is a bug", ctx->incr_fork, (int)ctx->full ));
@@ -1835,16 +1836,14 @@ attempt_gate_open( fd_snapin_tile_t * ctx ) {
 
   /* Claim before the first data fragment. */
   ctx->claimed_appendvec = FD_ATOMIC_FETCH_AND_ADD( &ctx->shmem->next_appendvec, 1UL );
-  ctx->gate_pending      = 0;
+  ctx->waiting_for_tile0 = 0;
 }
 
-/* Returns 1 when writes may start. */
-
 static inline int
-attempt_gate_ready( fd_snapin_tile_t * ctx ) {
-  if( FD_LIKELY( !ctx->gate_pending ) ) return 1;
-  if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shmem->attempt.generation )!=ctx->generation ) ) return 0;
-  attempt_gate_open( ctx );
+try_sync_attempt( fd_snapin_tile_t * ctx ) {
+  if( FD_LIKELY( !ctx->waiting_for_tile0 ) ) return 1;
+  if( FD_UNLIKELY( FD_VOLATILE_CONST( ctx->shmem->attempt.number )!=ctx->attempt_number ) ) return 0;
+  sync_attempt( ctx );
   return 1;
 }
 
@@ -1869,17 +1868,14 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_INIT_FULL:
     case FD_SNAPSHOT_MSG_CTRL_INIT_INCR: {
       FD_TEST( ctx->state==FD_SNAPSHOT_STATE_IDLE );
-      /* Generation was bumped at the first INIT fragment. */
       ctx->state = FD_SNAPSHOT_STATE_PROCESSING;
       ctx->full = sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL;
 
-      worker_reset_attempt( ctx );
+      reset_attempt_state( ctx );
       fd_memset( &ctx->lead.flags, 0, sizeof(ctx->lead.flags) );
-      if( ctx->full ) ctx->metrics.full_bytes_read = 0UL;
+
       ctx->metrics.incremental_bytes_read = 0UL;
 
-      /* Full loads start at zero.
-         Incremental loads start from saved full counts. */
       if( ctx->full ) {
         ctx->metrics.accounts_loaded        = 0UL;
         ctx->metrics.accounts_replaced      = 0UL;
@@ -1887,17 +1883,21 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
         ctx->metrics.full_accounts_loaded   = 0UL;
         ctx->metrics.full_accounts_replaced = 0UL;
         ctx->metrics.full_accounts_ignored  = 0UL;
+        ctx->metrics.full_bytes_read        = 0UL;
       } else {
         ctx->metrics.accounts_loaded   = ctx->metrics.full_accounts_loaded;
         ctx->metrics.accounts_replaced = ctx->metrics.full_accounts_replaced;
         ctx->metrics.accounts_ignored  = ctx->metrics.full_accounts_ignored;
       }
 
-      if( FD_UNLIKELY( is_lead( ctx ) ) ) tile0_init_attempt( ctx, in_idx, chunk );
+      /* Tile 0 prepares shared state. */
+      if( FD_UNLIKELY( is_lead( ctx ) ) ) {
+        tile0_begin_attempt( ctx, in_idx, chunk );
+      }
 
       /* Tile 0 opens now. Other tiles open in before_frag. */
-      ctx->gate_pending = 1;
-      if( FD_UNLIKELY( is_lead( ctx ) ) ) attempt_gate_open( ctx );
+      ctx->waiting_for_tile0 = 1;
+      if( FD_UNLIKELY( is_lead( ctx ) ) ) sync_attempt( ctx );
       break;
     }
 
@@ -2038,11 +2038,17 @@ handle_control_frag( fd_snapin_tile_t *  ctx,
     case FD_SNAPSHOT_MSG_CTRL_FAIL: {
       FD_TEST( ctx->state!=FD_SNAPSHOT_STATE_SHUTDOWN );
       fd_accdb_flush_metrics( ctx->accdb );
-      FD_COMPILER_MFENCE(); /* publish before ack */
-      worker_reset_attempt( ctx );
 
-      /* Tile 0 rolls back at the next INIT, after all FAIL acks. */
-      if( FD_UNLIKELY( is_lead( ctx ) ) ) tile0_defer_rollback( ctx );
+      FD_COMPILER_MFENCE();
+
+      /* Reset the worker state for this full/incr loading attempt */
+      reset_attempt_state( ctx );
+
+      /* Defer rollback until the next INIT, which is triggered after
+         all workers have sent their FAIL acks. */
+      if( FD_UNLIKELY( is_lead( ctx ) ) ) {
+        tile0_schedule_rollback( ctx );
+      }
 
       ctx->state = FD_SNAPSHOT_STATE_IDLE;
       break;
@@ -2103,8 +2109,8 @@ before_frag( fd_snapin_tile_t * ctx,
     /* Only accept DATA frags from the expected lane */
     if( FD_UNLIKELY( in_idx!=ctx->expected_frame%ctx->lane_cnt ) ) return -1;
 
-    /* Wait for tile 0. Controls still pass. */
-    if( FD_UNLIKELY( !attempt_gate_ready( ctx ) ) ) return -1;
+    /* Wait for tile 0 to be ready */
+    if( FD_UNLIKELY( !try_sync_attempt( ctx ) ) ) return -1;
   }
 
   return 0;
@@ -2155,7 +2161,7 @@ handle_control_barrier( fd_snapin_tile_t *  ctx,
 
     /* Bump on the first INIT fragment, even if ERROR stops the barrier. */
     if( FD_UNLIKELY( sig==FD_SNAPSHOT_MSG_CTRL_INIT_FULL || sig==FD_SNAPSHOT_MSG_CTRL_INIT_INCR ) ) {
-      ctx->generation++;
+      ctx->attempt_number++;
     }
   }
 
@@ -2249,6 +2255,7 @@ unprivileged_init( fd_topo_t const *      topo,
                    fd_topo_tile_t const * tile ) {
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
 
+  /* Per-tile scratch. */
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_snapin_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_tile_t), sizeof(fd_snapin_tile_t) );
   void * _accdb          = FD_SCRATCH_ALLOC_APPEND( l, fd_accdb_align(),          fd_accdb_footprint( tile->snapin.max_live_slots ) );
@@ -2256,27 +2263,27 @@ unprivileged_init( fd_topo_t const *      topo,
   void * _write_buf      = FD_SCRATCH_ALLOC_APPEND( l, 64UL,                      FD_SNAPIN_WRITE_BUF_SZ );
   void * _write_records  = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_snapin_write_record_t), FD_SNAPIN_WRITE_RECORD_MAX*sizeof(fd_snapin_write_record_t) );
 
+  /* Per-tile state. */
   ctx->tile_idx = tile->kind_id;
   if( FD_UNLIKELY( ctx->tile_idx>=FD_TOPO_MAX_TILE_IN_LINKS ) ) {
     FD_LOG_ERR(( "tile `" NAME "` has unsupported kind id %lu", tile->kind_id ));
   }
+  
   ctx->full                = 1;
-  ctx->lead.init_completed = 0;
   ctx->state               = FD_SNAPSHOT_STATE_IDLE;
   ctx->lane_cnt            = tile->in_cnt;
-  ctx->generation          = 0UL;
+  ctx->attempt_number      = 0UL;
   ctx->expected_frame      = 0UL;
   ctx->staged.data          = (uchar *)_staged_data;
   ctx->writer.buf           = (uchar *)_write_buf;
   ctx->writer.records       = (fd_snapin_write_record_t *)_write_records;
   ctx->writer.buf_used      = 0UL;
   ctx->writer.record_cnt    = 0UL;
-  ctx->lead.txncache_max_groups_per_slot  = tile->snapin.max_txn_per_slot;
-  ctx->lead.txncache_max_entries_per_slot = 2UL*tile->snapin.max_txn_per_slot;
-  ctx->lead.txncache_entries_max          = FD_TXNCACHE_MAX_SLOT_DELTAS*ctx->lead.txncache_max_entries_per_slot;
   clear_control_barrier( ctx );
   fd_memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
+  fd_memset( &ctx->lead.flags, 0, sizeof(ctx->lead.flags) );
 
+  /* Shared objects. */
   void * _accdb_shmem = fd_topo_obj_laddr( topo, tile->snapin.accdb_obj_id );
   fd_accdb_shmem_t * accdb_shmem = fd_accdb_shmem_join( _accdb_shmem );
   FD_TEST( accdb_shmem );
@@ -2299,7 +2306,19 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->stake_delegations = fd_banks_stake_delegations_root_query( ctx->banks );
   FD_TEST( ctx->stake_delegations );
 
+  ctx->ct_out = out1( topo, tile, "snapin_ct", ctx->tile_idx );
+  if( FD_UNLIKELY( ctx->ct_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME ":%lu` missing required out link `snapin_ct`", ctx->tile_idx ));
+
+  ctx->lead.manifest_out = (fd_snapin_out_link_t){ .idx=ULONG_MAX };
+  ctx->lead.gui_out      = (fd_snapin_out_link_t){ .idx=ULONG_MAX };
+
+  /* Tile 0 state. */
   if( FD_UNLIKELY( is_lead( ctx ) ) ) {
+    ctx->lead.init_completed = 0;
+    ctx->lead.txncache_max_groups_per_slot  = tile->snapin.max_txn_per_slot;
+    ctx->lead.txncache_max_entries_per_slot = 2UL*tile->snapin.max_txn_per_slot;
+    ctx->lead.txncache_entries_max          = FD_TXNCACHE_MAX_SLOT_DELTAS*ctx->lead.txncache_max_entries_per_slot;
+
     void * _txncache        = FD_SCRATCH_ALLOC_APPEND( l, fd_txncache_align(),               fd_txncache_footprint( tile->snapin.max_live_slots )         );
     void * _manifest_parser = FD_SCRATCH_ALLOC_APPEND( l, fd_ssmanifest_parser_align(),      fd_ssmanifest_parser_footprint()                             );
     void * _sd_parser       = FD_SCRATCH_ALLOC_APPEND( l, fd_slot_delta_parser_align(),      fd_slot_delta_parser_footprint()                             );
@@ -2324,20 +2343,31 @@ unprivileged_init( fd_topo_t const *      topo,
 
     ctx->lead.slot_delta_parser = fd_slot_delta_parser_join( fd_slot_delta_parser_new( _sd_parser ) );
     FD_TEST( ctx->lead.slot_delta_parser );
-  }
 
-  ctx->lead.alpenglow = tile->snapin.alpenglow;
+    ctx->lead.alpenglow = tile->snapin.alpenglow;
 
-  ctx->ct_out            = out1( topo, tile, "snapin_ct",    ctx->tile_idx );
-  ctx->lead.manifest_out = out1( topo, tile, "snapin_manif", 0UL           );
-  ctx->lead.gui_out      = out1( topo, tile, "snapin_gui",   0UL           );
+    ctx->lead.manifest_out = out1( topo, tile, "snapin_manif", 0UL );
+    ctx->lead.gui_out      = out1( topo, tile, "snapin_gui",   0UL );
+    if( FD_UNLIKELY( ctx->lead.manifest_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_manif`" ));
 
-  if( FD_UNLIKELY( ctx->ct_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME ":%lu` missing required out link `snapin_ct`", ctx->tile_idx ));
-  if( FD_UNLIKELY( is_lead( ctx ) && ctx->lead.manifest_out.idx==ULONG_MAX ) ) FD_LOG_ERR(( "tile `" NAME "` missing required out link `snapin_manif`" ));
-
-  if( FD_UNLIKELY( is_lead( ctx ) ) ) {
     fd_ssmanifest_parser_init( ctx->lead.manifest_parser, fd_chunk_to_laddr( ctx->lead.manifest_out.mem, ctx->lead.manifest_out.chunk ) );
     fd_slot_delta_parser_init( ctx->lead.slot_delta_parser );
+
+    ctx->lead.gui_config_acct_sz  = 0UL;
+    ctx->lead.gui_config_acct_off = 0UL;
+    ctx->lead.advertised_slot = 0UL;
+    ctx->lead.bank_slot       = 0UL;
+    ctx->lead.epoch           = 0UL;
+    ctx->lead.full_genesis_creation_time_seconds = 0UL;
+    ctx->lead.manifest_capitalization            = 0UL;
+    ctx->lead.capitalization                     = 0UL;
+    ctx->lead.dup_capitalization                 = 0UL;
+    ctx->lead.recovery.capitalization            = 0UL;
+    fd_memset( &ctx->lead.account_counts, 0, sizeof(ctx->lead.account_counts) );
+    ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
+    fd_memset( &ctx->lead.recovery.accdb_metadata, 0, sizeof(ctx->lead.recovery.accdb_metadata) );
+    ctx->lead.boot_timestamp = fd_log_wallclock();
   }
 
   for( ulong i=0UL; i<ctx->lane_cnt; i++ ) {
@@ -2352,28 +2382,7 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->in[ i ].pos    = 0UL;
   }
 
-  worker_reset_attempt( ctx );
-
-  ctx->lead.gui_config_acct_sz  = 0UL;
-  ctx->lead.gui_config_acct_off = 0UL;
-
-  ctx->lead.advertised_slot = 0UL;
-  ctx->lead.bank_slot       = 0UL;
-  ctx->lead.epoch           = 0UL;
-
-  ctx->lead.full_genesis_creation_time_seconds = 0UL;
-  ctx->lead.manifest_capitalization            = 0UL;
-  ctx->lead.capitalization                     = 0UL;
-  ctx->lead.dup_capitalization                 = 0UL;
-  ctx->lead.recovery.capitalization            = 0UL;
-  fd_memset( &ctx->lead.account_counts, 0, sizeof(ctx->lead.account_counts) );
-
-  ctx->lead.accdb_root_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-  ctx->lead.accdb_incr_fork_id = (fd_accdb_fork_id_t){ .val = USHORT_MAX };
-  fd_memset( &ctx->lead.recovery.accdb_metadata, 0, sizeof(ctx->lead.recovery.accdb_metadata) );
-
-  fd_memset( &ctx->lead.flags, 0, sizeof(ctx->lead.flags) );
-  ctx->lead.boot_timestamp = fd_log_wallclock();
+  reset_attempt_state( ctx );
 }
 
 /* There are 3 output links that affect the calculation of STEM_BURST:
@@ -2386,7 +2395,6 @@ unprivileged_init( fd_topo_t const *      topo,
    an unreliable link, working as a dcache place holder. */
 #define STEM_BURST 1UL
 
-/* Refresh flow-control credits before producer lanes stall. */
 #define STEM_LAZY  (128L*250L)
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_snapin_tile_t

@@ -29,13 +29,16 @@ struct fd_snapin_shmem_totals {
 typedef struct fd_snapin_shmem_totals fd_snapin_shmem_totals_t;
 
 /* Tile 0 publishes the attempt after setup.  Workers hold data until
-   the generation matches, then claim appendvecs from next_appendvec. */
+   the attempt number matches, then claim appendvecs from next_appendvec. */
 struct fd_snapin_shmem {
   ulong magic;
   ulong worker_cnt;
 
+  /* Tile 0 publishes the attempt number and fork ID after setup.  Each
+     INIT increments the number, including retries and the transition
+     from full to incremental. */
   struct __attribute__((aligned(64))) {
-    ulong generation;
+    ulong number;
     ulong fork_id;
   } attempt;
 
@@ -84,9 +87,9 @@ fd_snapin_shmem_new( void * mem,
   int *               stripes = FD_SCRATCH_ALLOC_APPEND( l, alignof(int),               FD_SNAPIN_SHMEM_STRIPE_CNT*sizeof(int) );
   shmem->worker_cnt = worker_cnt;
   /* Workspace memory may survive a crash, so clear stale shared state. */
-  shmem->attempt.generation = 0UL;
-  shmem->attempt.fork_id    = 0UL;
-  shmem->next_appendvec     = 0UL;
+  shmem->attempt.number  = 0UL;
+  shmem->attempt.fork_id = 0UL;
+  shmem->next_appendvec  = 0UL;
   fd_memset( &shmem->totals,        0, sizeof(fd_snapin_shmem_totals_t) );
   fd_memset( &shmem->slot_history,  0, sizeof(shmem->slot_history)      );
   fd_memset( &shmem->feature_snoop, 0, sizeof(fd_feature_snoop_t)       );
