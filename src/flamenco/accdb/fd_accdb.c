@@ -470,6 +470,7 @@ fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb ) {
 
 void
 fd_accdb_snapshot_writer_end( fd_accdb_t * accdb ) {
+  fd_accdb_flush_metrics( accdb );
   if( FD_LIKELY( !accdb->snapshot_pool_cache.active ) ) return;
   ulong next = accdb->snapshot_pool_cache.next;
   ulong end  = accdb->snapshot_pool_cache.end;
@@ -565,132 +566,6 @@ fd_accdb_snapshot_load_end( fd_accdb_t * accdb ) {
     fd_accdb_shmem_try_enqueue_compaction( accdb->shmem, p );
   }
 
-  spin_lock_release( &accdb->shmem->partition_lock );
-}
-
-/* snapshot_worker_rotate makes room for sz bytes at a snapshot writer's
-   private write head, rotating to a fresh partition if the current one
-   cannot fit sz (accounts never straddle a partition boundary).  This is
-   the only part of the private-head allocator that takes a shared lock,
-   and callers hoist it out of their own critical sections so that a
-   partition fallocate never runs under one.  change_partition handles
-   pool acquisition, Cold tagging while snapshot_loading is set,
-   fallocate, and the partition_max CAS. */
-
-static void
-snapshot_worker_rotate( fd_accdb_t *                accdb,
-                        ulong                       sz,
-                        fd_accdb_snapshot_whead_t * whead ) {
-  FD_TEST( sz<=accdb->shmem->partition_sz );
-  accdb_offset_t offset = { .val = whead->val };
-  if( FD_LIKELY( whead->has_partition &&
-                 packed_partition_offset( &offset )+sz<=accdb->shmem->partition_sz ) ) return;
-
-  accdb_offset_t next;
-  spin_lock_acquire( &accdb->shmem->partition_lock );
-  change_partition( accdb, &offset, &next, &whead->has_partition, 0 );
-  spin_lock_release( &accdb->shmem->partition_lock );
-  whead->val = next.val;
-
-  if( FD_UNLIKELY( whead->attempt_partitions ) ) {
-    if( FD_UNLIKELY( whead->attempt_partition_cnt>=whead->attempt_partition_max ) ) {
-      FD_LOG_ERR(( "snapshot writer attempt-partition tracker overflow (%lu)", whead->attempt_partition_max ));
-    }
-    whead->attempt_partitions[ whead->attempt_partition_cnt++ ] = (uint)packed_partition_idx( &next );
-  }
-}
-
-/* Reserve sz bytes at a snapshot writer's private write head, modeled
-   on allocate_next_compaction_write: the head itself is joiner-private
-   (no atomics).  Returns the flat file offset of the reservation. */
-
-static ulong
-snapshot_worker_alloc( fd_accdb_t *                accdb,
-                       ulong                       sz,
-                       fd_accdb_snapshot_whead_t * whead ) {
-  snapshot_worker_rotate( accdb, sz, whead );
-
-  accdb_offset_t offset = { .val = whead->val };
-  whead->val = offset.val+sz;
-
-  /* Batch write metrics in the joiner-local write_stats (flushed by
-     fd_accdb_flush_metrics, which is atomic-safe). */
-  ulong partition_idx = packed_partition_idx( &offset );
-  if( FD_LIKELY( accdb->write_stats.num_ops ) &&
-      FD_UNLIKELY( accdb->write_stats.partition_idx!=partition_idx ) ) {
-    fd_accdb_flush_metrics( accdb );
-  }
-  accdb->write_stats.partition_idx  = partition_idx;
-  accdb->write_stats.bytes         += sz;
-  accdb->write_stats.num_ops++;
-
-  return packed_partition_file_offset( &offset, accdb->shmem->partition_sz );
-}
-
-void
-fd_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
-                                fd_accdb_snapshot_whead_t * whead ) {
-  fd_accdb_flush_metrics( accdb );
-  if( FD_UNLIKELY( !whead->has_partition ) ) return;
-
-  accdb_offset_t offset = { .val = whead->val };
-  ulong partition_idx = packed_partition_idx( &offset );
-  ulong write_offset  = packed_partition_offset( &offset );
-  ulong tail_sz       = accdb->shmem->partition_sz-write_offset;
-
-  /* Mirrors the closing half of change_partition: materialize the dense
-     record log's end for background_compact's walk and book the dead
-     tail slack.  Compaction enqueue is deliberately skipped —
-     fd_accdb_snapshot_load_end's sweep re-checks every partition. */
-  spin_lock_acquire( &accdb->shmem->partition_lock );
-  fd_accdb_partition_t * partition = partition_pool_ele( accdb->partition_pool, partition_idx );
-  partition->write_offset = write_offset;
-  FD_ATOMIC_FETCH_AND_ADD( &partition->bytes_freed, tail_sz );
-  FD_VOLATILE( partition->filled_ticks ) = (long)fd_tickcount();
-  FD_ATOMIC_FETCH_AND_ADD( &accdb->shmem->shmetrics->disk_current_bytes, tail_sz );
-  spin_lock_release( &accdb->shmem->partition_lock );
-
-  whead->val           = 0UL;
-  whead->has_partition = 0;
-}
-
-void
-fd_accdb_snapshot_worker_release_partitions( fd_accdb_t * accdb,
-                                             uint const * partition_idxs,
-                                             ulong        cnt ) {
-  if( FD_UNLIKELY( !cnt ) ) return;
-
-  /* Belt and braces: a still-running background purge walks index
-     entries that reference these partitions (per-partition bytes_freed
-     bookkeeping).  Callers already order the release after the purge;
-     make it locally safe too. */
-  wait_cmd( accdb );
-
-  spin_lock_acquire( &accdb->shmem->partition_lock );
-  for( ulong i=0UL; i<cnt; i++ ) {
-    fd_accdb_partition_t * part = partition_pool_ele( accdb->partition_pool, partition_idxs[ i ] );
-
-    /* Compaction enqueue is suppressed while snapshot_loading is set,
-       so queued should never be observed here; mirror revert_whead's
-       defensive unlink anyway. */
-    if( FD_UNLIKELY( part->queued ) ) {
-      compaction_dlist_ele_remove( accdb->compaction_dlist[ part->layer ], part, accdb->partition_pool );
-    }
-
-    /* Undo the partition's disk_current_bytes contribution: bytes
-       booked at allocation time (flushed into bytes_written) plus the
-       dead tail slack booked when the partition was closed (rotation
-       or worker_close; a failed attempt closes its final partition
-       before publishing its partition list, so every released
-       partition is closed and write_offset is authoritative). */
-    ulong current = part->bytes_written + ( accdb->shmem->partition_sz - part->write_offset );
-    FD_ATOMIC_FETCH_AND_SUB( &accdb->shmem->shmetrics->disk_current_bytes, current );
-
-    part->bytes_freed       = 0UL;
-    part->marked_compaction = 0UL;
-    part->queued            = 0;
-    partition_pool_ele_release( accdb->partition_pool, part );
-  }
   spin_lock_release( &accdb->shmem->partition_lock );
 }
 
@@ -4549,19 +4424,22 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       ulong const                          data_lens[],
                                       int const                            executables[],
                                       int const                            snoop_candidates[],
-                                      fd_accdb_snapshot_whead_t *          whead,
                                       int *                                stripe_locks,
                                       ulong                                stripe_msk,
+                                      int *                                writer_lock,
+                                      int *                                writer_err,
                                       fd_accdb_snapshot_worker_metrics_t * metrics,
-                                      ulong                                file_offsets[],
                                       ulong *                              accounts_ignored,
                                       ulong *                              accounts_replaced,
                                       ulong *                              accounts_loaded,
                                       ulong *                              out_replaced_lamports,
                                       ulong *                              out_ignored_lamports,
+                                      fd_accdb_snapshot_store_fn_t         store_fn,
+                                      void *                               store_ctx,
                                       fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                       void *                               snoop_ctx ) {
   FD_TEST( cnt && cnt<=8UL );
+  FD_TEST( stripe_locks && writer_lock && writer_err && store_fn );
 
   int incremental = fork_id.val!=USHORT_MAX;
 
@@ -4607,20 +4485,13 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
     }
   }
 
-  /* Phase 2: per account, decide-then-allocate with the walk + commit
-     under the chain's stripe lock.  Only one lock is ever held at a
-     time, so no deadlock.  Partition rotation is hoisted before the
-     lock; the allocation under the lock is then a private whead bump.
-     In incremental mode, a matching entry from another fork generation
-     is a cross-fork override: it is left in place (shadowed until
-     advance_root or purged on FAIL) and a new pool entry is prepended
-     ahead of it, with an undo record on the fork's txn list. */
+  /* Walk and commit under the account stripe.  Accepted records also
+     take writer_lock before allocating their shared disk offset.  No
+     path may take these locks in the opposite order. */
 
   for( ulong i=0UL; i<cnt; i++ ) {
     ulong  entry_sz = sizeof(fd_accdb_disk_meta_t)+data_lens[ i ];
     int *  stripe   = &stripe_locks[ hashes[ i ] & stripe_msk ];
-
-    snapshot_worker_rotate( accdb, entry_sz, whead );
 
     /* skip==1: existing version wins (or an untiebreakable equal-slot
        dup), incoming ignored without allocating.  freed_off/sz: dead
@@ -4660,114 +4531,89 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
 
     if( FD_UNLIKELY( skip ) ) {
       spin_lock_release( stripe );
-      file_offsets[ i ]  = ULONG_MAX; /* ignored dup burns no space */
       ignored_lamports  += lamports[ i ];
       ignored++;
       continue;
     }
 
+    spin_lock_acquire( writer_lock );
+    if( FD_UNLIKELY( FD_VOLATILE_CONST( *writer_err ) ) ) {
+      spin_lock_release( writer_lock );
+      spin_lock_release( stripe );
+      return -1;
+    }
+
+    ulong file_off = allocate_next_write( accdb, entry_sz );
+    if( FD_UNLIKELY( store_fn( store_ctx, i, file_off ) ) ) {
+      if( FD_LIKELY( !*writer_err ) ) FD_VOLATILE( *writer_err ) = EIO;
+      spin_lock_release( writer_lock );
+      spin_lock_release( stripe );
+      return -1;
+    }
+    spin_lock_release( writer_lock );
+
     if( FD_UNLIKELY( existing!=NULL ) ) {
-      /* In-place replace (same fork), still under the stripe lock so
-         concurrent same-chain walkers never observe a torn
-         (slot, lamports, size, offset) tuple. */
-      ulong old_sz  = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( existing->executable_size );
-      freed_off     = fd_accdb_acc_offset( existing );
-      freed_sz      = old_sz;
+      ulong old_sz = sizeof(fd_accdb_disk_meta_t) + FD_ACCDB_SIZE_DATA( existing->executable_size );
+      freed_off = fd_accdb_acc_offset( existing );
+      freed_sz  = old_sz;
       replaced_lamports += existing->lamports;
       replaced++;
 
-      ulong file_off = snapshot_worker_alloc( accdb, entry_sz, whead );
       existing->cache_idx       = (uint)slot;
       existing->lamports        = lamports[ i ];
       existing->executable_size = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
       existing->offset_fork     = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
+    } else {
+      fd_accdb_accmeta_t * accmeta;
+      if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
+      else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
+      if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
+      uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
 
-      /* Winner-gated snoop: entry i just won (replaced the incumbent),
-         so fire here, still under the stripe lock.  Same pubkey =>
-         same chain => same stripe, so this in-lock invocation is what
-         makes "settle the winner, then update" correct -- a
-         concurrent same-chain walker can only observe the fully
-         committed winner above, never a partial update racing
-         snoop_fn.  Lock order is stripe -> callee-internal locks
-         (e.g. the stake rwlock a snoop_fn may take), never the
-         reverse: snoop_fn must not try to acquire another stripe
-         lock. */
-      if( FD_UNLIKELY( snoop_fn!=NULL && snoop_candidates[ i ] ) ) snoop_fn( snoop_ctx, i );
+      fd_memcpy( accmeta->key.pubkey, pubkeys[ i ], 32UL );
+      accmeta->key.generation   = gen;
+      accmeta->cache_idx        = (uint)slot;
+      accmeta->lamports         = lamports[ i ];
+      accmeta->executable_size  = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
+      accmeta->offset_fork      = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
+      accmeta->map.next         = accdb->acc_map[ hashes[ i ] ];
+      FD_COMPILER_MFENCE();
+      accdb->acc_map[ hashes[ i ] ] = acc_idx;
 
-      spin_lock_release( stripe );
-
-      fd_accdb_shmem_bytes_freed( accdb->shmem, freed_off, freed_sz );
-      metrics->disk_used_removed += old_sz;
-      metrics->disk_used_added   += entry_sz;
-      file_offsets[ i ] = file_off;
-      continue;
-    }
-
-    /* New pool entry: a genuinely new key, or a cross-fork override
-       shadowing another fork's version (which stays in place and keeps
-       its disk bytes until promotion or purge).  Pool acquire is lock
-       free and safe under the stripe lock (it never takes a stripe lock
-       itself). */
-    fd_accdb_accmeta_t * accmeta;
-    if( FD_LIKELY( accdb->snapshot_pool_cache.active ) ) accmeta = fd_accdb_snapshot_pool_acquire( accdb );
-    else                                                 accmeta = acc_pool_acquire( accdb->acc_pool_join );
-    if( FD_UNLIKELY( !accmeta ) ) FD_LOG_ERR(( "accounts database ran out of space during snapshot loading" ));
-    uint acc_idx = (uint)acc_pool_idx( accdb->acc_pool_join, accmeta );
-
-    ulong file_off = snapshot_worker_alloc( accdb, entry_sz, whead );
-    fd_memcpy( accmeta->key.pubkey, pubkeys[ i ], 32UL );
-    accmeta->key.generation   = gen;
-    accmeta->cache_idx        = (uint)slot;
-    accmeta->lamports         = lamports[ i ];
-    accmeta->executable_size  = FD_ACCDB_SIZE_PACK( (uint)data_lens[ i ], executables[ i ] );
-    accmeta->offset_fork      = incremental ? fd_accdb_acc_pack_offset_fork( file_off, fork_id.val ) : file_off;
-    accmeta->map.next         = accdb->acc_map[ hashes[ i ] ];
-    FD_COMPILER_MFENCE();
-    accdb->acc_map[ hashes[ i ] ] = acc_idx;
-
-    /* Winner-gated snoop (see the in-place replace branch above for
-       the full rationale): entry i just won here too, whether it is a
-       genuinely new key or a cross-fork override shadowing another
-       fork's version, so fire while still under the stripe lock. */
-    if( FD_UNLIKELY( snoop_fn!=NULL && snoop_candidates[ i ] ) ) snoop_fn( snoop_ctx, i );
-
-    ulong cross_lamports = cross_existing ? cross_existing->lamports : 0UL;
-
-    if( FD_UNLIKELY( incremental ) ) {
-      /* Undo record so a FAIL can purge this fork's inserts.  The
-         per-fork txn list head is shared by every worker (different
-         stripes race on it), so serialize the prepend with the same
-         CAS retry loop the runtime release path uses; readers (purge /
-         advance_root on T2) only run after all workers quiesced. */
-      fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
-      if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
-      txn->acc_pool_idx = acc_idx;
-      uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
-      for(;;) {
-        uint old_head  = FD_VOLATILE_CONST( fork->shmem->txn_head );
-        txn->fork.next = old_head;
-        if( FD_LIKELY( FD_ATOMIC_CAS( &fork->shmem->txn_head, old_head, txn_idx )==old_head ) ) break;
-        FD_SPIN_PAUSE();
+      if( FD_UNLIKELY( incremental ) ) {
+        fd_accdb_txn_t * txn = txn_pool_acquire( accdb->txn_pool );
+        if( FD_UNLIKELY( !txn ) ) FD_LOG_ERR(( "txn pool exhausted during incremental snapshot loading" ));
+        txn->acc_pool_idx = acc_idx;
+        uint txn_idx      = (uint)txn_pool_idx( accdb->txn_pool, txn );
+        for(;;) {
+          uint old_head  = FD_VOLATILE_CONST( fork->shmem->txn_head );
+          txn->fork.next = old_head;
+          if( FD_LIKELY( FD_ATOMIC_CAS( &fork->shmem->txn_head, old_head, txn_idx )==old_head ) ) break;
+          FD_SPIN_PAUSE();
+        }
       }
     }
 
+    if( FD_UNLIKELY( snoop_fn!=NULL && snoop_candidates[ i ] ) ) snoop_fn( snoop_ctx, i );
+
+    ulong cross_lamports = cross_existing ? cross_existing->lamports : 0UL;
     spin_lock_release( stripe );
 
+    if( FD_UNLIKELY( existing!=NULL ) ) {
+      fd_accdb_shmem_bytes_freed( accdb->shmem, freed_off, freed_sz );
+      metrics->disk_used_removed += freed_sz;
+      metrics->disk_used_added   += entry_sz;
+      continue;
+    }
+
     if( FD_UNLIKELY( cross_existing!=NULL ) ) {
-      /* Cross-fork override: the shadowed version's bytes are NOT freed
-         (it survives an incremental FAIL); count it like write_one's
-         replaced (return 2) semantics. */
       replaced_lamports += cross_lamports;
       replaced++;
     } else {
       loaded++;
     }
-    metrics->disk_used_added += entry_sz;
-    /* accounts_total tracks acc_pool entries: increment for every new
-       allocation (both genuinely new accounts and cross-fork overrides
-       that insert a second pool entry). */
+    metrics->disk_used_added      += entry_sz;
     metrics->accounts_total_added++;
-    file_offsets[ i ] = file_off;
   }
 
   *accounts_ignored      = ignored;
@@ -4794,8 +4640,7 @@ fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         acc
    index and pread each one's on-disk record header, verifying that the
    stored pubkey and data size match the index.  chain_cnt is a power of
    two and pubkey->chain hashing is uniform, so a contiguous chain range
-   is a uniform sample of the account set (and, under chain-sharded
-   multi-writer loading, alternates across every writer's partitions). */
+   is a uniform sample of the account set. */
 
 void
 fd_accdb_snapshot_verify_readback( fd_accdb_t * accdb,

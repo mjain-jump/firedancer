@@ -262,9 +262,9 @@ fd_topo_obj_callbacks_t fd_obj_cb_backup = {
 };
 
 static ulong
-snapin_shmem_footprint_cb( fd_topo_t const *     topo,
-                           fd_topo_obj_t const * obj ) {
-  return fd_snapin_shmem_footprint( VAL("worker_cnt") );
+snapin_shmem_footprint_cb( fd_topo_t const *     topo FD_FN_UNUSED,
+                           fd_topo_obj_t const * obj FD_FN_UNUSED ) {
+  return fd_snapin_shmem_footprint();
 }
 
 static ulong

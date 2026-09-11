@@ -122,11 +122,8 @@ fd_accdb_join_readonly( void *             ljoin,
 void
 fd_accdb_snapshot_load_begin( fd_accdb_t * accdb );
 
-/* Each parallel snapshot index writer brackets its job stream with
-   writer_begin/writer_end.  This lets it amortize shared acc_pool
-   allocation over local blocks while returning any unused tail before
-   the coordinator ends or resets the load.  Single-writer callers may
-   also use this pair to opt into the same block allocator. */
+/* Bracket each worker's writes.  writer_end returns unused acc_pool
+   reservations and flushes partition metrics. */
 
 void
 fd_accdb_snapshot_writer_begin( fd_accdb_t * accdb );
@@ -550,20 +547,6 @@ fd_accdb_snapshot_write_one( fd_accdb_t *       accdb,
                              int                executable,
                              ulong *            out_replaced_lamports );
 
-/* Private disk cursor for one snapshot worker.  It tracks partitions
-   opened by the current attempt so they can be released after a failed
-   attempt is purged. */
-
-struct fd_accdb_snapshot_whead {
-  ulong  val; /* packed partition index and offset */
-  int    has_partition;
-  uint * attempt_partitions;
-  ulong  attempt_partition_cnt;
-  ulong  attempt_partition_max;
-};
-
-typedef struct fd_accdb_snapshot_whead fd_accdb_snapshot_whead_t;
-
 /* Per-worker metric changes, buffered off the hot insert path. */
 
 struct fd_accdb_snapshot_worker_metrics {
@@ -575,17 +558,22 @@ struct fd_accdb_snapshot_worker_metrics {
 
 typedef struct fd_accdb_snapshot_worker_metrics fd_accdb_snapshot_worker_metrics_t;
 
+/* Called with the account stripe and shared writer lock held. */
+
+typedef int (*fd_accdb_snapshot_store_fn_t)( void * cb_ctx, ulong batch_idx, ulong file_off );
+
 /* Called under the account stripe when a flagged entry wins. */
 
 typedef void (*fd_accdb_snapshot_snoop_fn_t)( void * cb_ctx, ulong batch_idx );
 
 /* Writes 1..8 accounts from one parallel worker.
-   - whead owns disk offsets; stripe_locks protects hash chains.
+   - stripe_locks protects hash chains.
+   - writer_lock protects disk offsets and store_fn.
    - USHORT_MAX fork_id selects a full snapshot.
-   - Ignored entries get ULONG_MAX and use no disk space.
    - Equal slots use last-lock-winner ordering.
+   - store_fn writes accepted records.
    - snoop_fn runs under the stripe lock for flagged winners.
-   Returns -1 if the batch repeats a pubkey. */
+   Returns -1 on a repeated pubkey or store error. */
 
 int
 fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb,
@@ -597,16 +585,18 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
                                       ulong const                          data_lens[],
                                       int const                            executables[],
                                       int const                            snoop_candidates[],
-                                      fd_accdb_snapshot_whead_t *          whead,
                                       int *                                stripe_locks,
                                       ulong                                stripe_msk,
+                                      int *                                writer_lock,
+                                      int *                                writer_err,
                                       fd_accdb_snapshot_worker_metrics_t * metrics,
-                                      ulong                                file_offsets[],
                                       ulong *                              accounts_ignored,
                                       ulong *                              accounts_replaced,
                                       ulong *                              accounts_loaded,
                                       ulong *                              out_replaced_lamports,
                                       ulong *                              out_ignored_lamports,
+                                      fd_accdb_snapshot_store_fn_t         store_fn,
+                                      void *                               store_ctx,
                                       fd_accdb_snapshot_snoop_fn_t         snoop_fn,
                                       void *                               snoop_ctx );
 
@@ -615,20 +605,6 @@ fd_accdb_snapshot_write_batch_worker( fd_accdb_t *                         accdb
 void
 fd_accdb_snapshot_flush_worker_metrics( fd_accdb_t *                         accdb,
                                         fd_accdb_snapshot_worker_metrics_t * m );
-
-/* Finalizes the worker's open partition and resets whead. */
-
-void
-fd_accdb_snapshot_worker_close( fd_accdb_t *                accdb,
-                                fd_accdb_snapshot_whead_t * whead );
-
-/* Releases failed-attempt partitions after writers stop and index
-   references are purged. */
-
-void
-fd_accdb_snapshot_worker_release_partitions( fd_accdb_t * accdb,
-                                             uint const * partition_idxs,
-                                             ulong        cnt );
 
 /* Samples live records and verifies their on-disk pubkey and size.
    Crashes on mismatch. */

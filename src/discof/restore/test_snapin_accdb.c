@@ -30,6 +30,7 @@ typedef struct {
   fd_accdb_shmem_t *       shmem;
   void *                   snapin_shmem_mem;
   fd_snapin_shmem_t *      snapin_shmem;
+  uchar *                  staged_mem;
   fd_snapin_tile_t *       worker;
   void *                   join_mem [ TEST_WORKER_MAX ];
   fd_accdb_fork_id_t       root;
@@ -128,7 +129,7 @@ test_env_init( test_env_t * env,
                           0, 42UL, worker_cnt, 0UL ) );
   FD_TEST( env->shmem );
 
-  ulong snapin_shmem_fp = fd_snapin_shmem_footprint( worker_cnt );
+  ulong snapin_shmem_fp = fd_snapin_shmem_footprint();
   env->snapin_shmem_mem = aligned_alloc( fd_snapin_shmem_align(),
                                          fd_ulong_align_up( snapin_shmem_fp, fd_snapin_shmem_align() ) );
   FD_TEST( env->snapin_shmem_mem );
@@ -139,6 +140,9 @@ test_env_init( test_env_t * env,
   env->worker = aligned_alloc( alignof(fd_snapin_tile_t), worker_fp );
   FD_TEST( env->worker );
   fd_memset( env->worker, 0, worker_fp );
+
+  env->staged_mem = aligned_alloc( 64UL, worker_cnt*FD_RUNTIME_ACC_SZ_MAX );
+  FD_TEST( env->staged_mem );
 
   for( ulong i=0UL; i<worker_cnt; i++ ) {
     ulong join_fp = fd_accdb_footprint( 16UL );
@@ -151,20 +155,14 @@ test_env_init( test_env_t * env,
     FD_TEST( ctx->accdb );
     ctx->full         = 1;
     ctx->tile_idx     = i;
-    ctx->tile_cnt     = worker_cnt;
     ctx->stripe_locks = fd_snapin_shmem_stripes( env->snapin_shmem );
     ctx->shmem        = env->snapin_shmem;
-    ctx->shmem_worker = fd_snapin_shmem_worker( env->snapin_shmem, i );
-    ctx->whead.attempt_partitions    = ctx->shmem_worker->fail_partitions;
-    ctx->whead.attempt_partition_max = FD_SNAPIN_SHMEM_PARTITION_MAX;
-
-    writer_init( &ctx->writer, FD_ACCDB_FD_RW );
+    ctx->staged.data  = env->staged_mem + i*FD_RUNTIME_ACC_SZ_MAX;
   }
 
   env->root = fd_accdb_attach_child( env->worker[ 0 ].accdb, (fd_accdb_fork_id_t){ .val = USHORT_MAX } );
   fd_accdb_snapshot_load_begin( env->worker[ 0 ].accdb );
   for( ulong i=0UL; i<worker_cnt; i++ ) {
-    writer_begin( &env->worker[ i ].writer );
     fd_accdb_snapshot_writer_begin( env->worker[ i ].accdb );
   }
 }
@@ -271,22 +269,14 @@ test_env_fini( test_env_t *          env,
   ulong bytes_written = 0UL;
   for( ulong i=0UL; i<env->worker_cnt; i++ ) {
     fd_snapin_tile_t * ctx = &env->worker[ i ];
-    FD_TEST( !writer_end( &ctx->writer ) );
-    bytes_written += ctx->writer.bytes_written;
-    fd_accdb_snapshot_worker_close( ctx->accdb, &ctx->whead );
+    FD_TEST( !writer_flush( ctx ) );
+    bytes_written += ctx->metrics.disk_bytes_written;
     fd_accdb_snapshot_writer_end( ctx->accdb );
     fd_accdb_snapshot_flush_worker_metrics( ctx->accdb, ctx->worker_metrics );
   }
 
   ulong expected_bytes = TEST_ACCOUNT_CNT*sizeof(fd_accdb_disk_meta_t)+accounts[ FD_SSPARSE_ACC_BATCH_MAX ].data_len;
   FD_TEST( bytes_written==expected_bytes );
-  if( env->worker_cnt==1UL ) {
-    FD_TEST( env->worker[ 0 ].writer.bytes_written==expected_bytes );
-  } else {
-    FD_TEST( env->worker[ 0 ].writer.bytes_written==FD_SSPARSE_ACC_BATCH_MAX*sizeof(fd_accdb_disk_meta_t) );
-    FD_TEST( env->worker[ 1 ].writer.bytes_written==sizeof(fd_accdb_disk_meta_t)+accounts[ FD_SSPARSE_ACC_BATCH_MAX ].data_len );
-    for( ulong i=2UL; i<env->worker_cnt; i++ ) FD_TEST( env->worker[ i ].writer.bytes_written==sizeof(fd_accdb_disk_meta_t) );
-  }
 
   fd_accdb_snapshot_load_end( env->worker[ 0 ].accdb );
   fd_accdb_snapshot_verify_readback( env->worker[ 0 ].accdb, ULONG_MAX );
@@ -295,6 +285,7 @@ test_env_fini( test_env_t *          env,
   for( ulong i=0UL; i<env->worker_cnt; i++ ) {
     free( env->join_mem[ i ] );
   }
+  free( env->staged_mem );
   free( env->worker );
   free( env->snapin_shmem_mem );
   free( env->shmem_mem );
