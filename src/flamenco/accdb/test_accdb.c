@@ -1654,6 +1654,43 @@ par_offset_cmp( void const * a, void const * b ) {
 }
 
 static void
+test_snapshot_equal_slot_rejected( void ) {
+  int fd;
+  ulong max_accounts = 64UL;
+  fd_accdb_t * accdb = test_setup_ex( &fd, max_accounts, 64UL, 1024UL, 64UL, 11UL<<20UL,
+                                      TEST_CACHE_FOOTPRINT, TEST_CACHE_MIN_RESERVED, 1UL );
+
+  fd_accdb_attach_child( accdb, SENTINEL );
+  fd_accdb_snapshot_load_begin( accdb );
+
+  uchar pubkey[ 32UL ] = {1};
+  uchar const * pubkeys[ 1 ] = { pubkey };
+  ulong lamports [ 1 ] = { 1UL };
+  ulong data_lens[ 1 ] = { 0UL };
+  int   execs    [ 1 ] = { 0 };
+  ulong ignored, replaced, loaded, replaced_lamports, ignored_lamports;
+  test_store_ctx_t store = { .fd=fd };
+
+  FD_TEST( !test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 100UL, lamports, data_lens, execs,
+                              &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports, &store ) );
+  FD_TEST( test_write_batch( accdb, SENTINEL, 1UL, pubkeys, 100UL, lamports, data_lens, execs,
+                             &ignored, &replaced, &loaded, &replaced_lamports, &ignored_lamports, &store )==-1 );
+
+  fd_accdb_accmeta_t * acc = par_find_unique( test_shmem_mem, max_accounts, pubkey );
+  FD_TEST( acc->lamports==1UL && acc->cache_idx==100U );
+
+  fd_accdb_snapshot_load_end( accdb );
+
+  acc_pool_t pool_join[ 1 ];
+  FD_TEST( acc_pool_join( pool_join, test_shmem_mem->acc_pool, par_layout( max_accounts ).acc_ele, max_accounts ) );
+  ulong free_cnt = 0UL;
+  while( acc_pool_acquire( pool_join ) ) free_cnt++;
+  FD_TEST( free_cnt==max_accounts-1UL );
+
+  test_teardown( accdb, fd );
+}
+
+static void
 test_snapshot_striped_writers( void ) {
   int fd;
   ulong psz = 11UL<<20UL;
@@ -2340,6 +2377,9 @@ main( int     argc,
 
   FD_LOG_NOTICE(( "test_snapshot_striped_writers ..." ));
   test_snapshot_striped_writers();
+
+  FD_LOG_NOTICE(( "test_snapshot_equal_slot_rejected ..." ));
+  test_snapshot_equal_slot_rejected();
 
   FD_LOG_NOTICE(( "test_snapshot_striped_writers_incremental ..." ));
   test_snapshot_striped_writers_incremental();

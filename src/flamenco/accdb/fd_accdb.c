@@ -4096,6 +4096,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
   ulong cross_replaced    = 0UL; /* cross-fork overrides (subset of replaced) */
   ulong replaced_lamports = 0UL;
   ulong ignored_lamports  = 0UL;
+  int   result            = 0;
 
   /* Snapshot slots are stored in the 32-bit cache_idx scratch field
      during loading.  Reject anything that would truncate. */
@@ -4154,7 +4155,10 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
         if( FD_LIKELY( (ulong)candidate->cache_idx>slots[ i ] ) ) {
           skip = 1;
         } else if( FD_UNLIKELY( (ulong)candidate->cache_idx==slots[ i ] ) ) {
-          FD_LOG_ERR(( "snapshot contains duplicate account at slot %lu", slots[ i ] ));
+          FD_LOG_WARNING(( "corrupt snapshot: duplicate account at slot %lu", slots[ i ] ));
+          spin_lock_release( stripe );
+          result = -1;
+          goto fini;
         } else if( FD_UNLIKELY( incremental ) && candidate->key.generation!=fork_gen ) {
           cross_existing = candidate;
         } else {
@@ -4225,6 +4229,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
     used_bytes_added += entry_sz;
   }
 
+fini:
   for( ulong i=acquired_used; i<cnt; i++ ) {
     acc_pool_release( accdb->acc_pool_join, acquired[ i ] );
   }
@@ -4239,7 +4244,7 @@ fd_accdb_snapshot_write_batch( fd_accdb_t *        accdb,
   *out_replaced_lamports = replaced_lamports;
   *out_ignored_lamports  = ignored_lamports;
 
-  return 0;
+  return result;
 }
 
 static void
