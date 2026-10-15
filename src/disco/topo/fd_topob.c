@@ -517,6 +517,7 @@ static char const * FLOATING[] = {
   "admin",  /* FIREDANCER ONLY */
   "snapsv", /* FIREDANCER ONLY */
   "snapmk", /* FIREDANCER ONLY */
+  "strmk",  /* FIREDANCER ONLY */
   "snapzp", /* FIREDANCER ONLY */
   "snaprd", /* FIREDANCER ONLY */
   NULL

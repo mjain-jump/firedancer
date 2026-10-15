@@ -130,6 +130,7 @@ run_firedancer_threaded( config_t * config,
   initialize_store_fds( config );
   if( FD_LIKELY( config->is_firedancer ) ) {
     initialize_snapshot_fds( config );
+    initialize_fast_boot_fds( config );
   }
 
   /* This is kind of a hack, but we have to join all the workspaces as
