@@ -115,6 +115,7 @@
 #define REPLAY_SIG_FINAL_CERT     (11)
 #define REPLAY_SIG_LEADER_FOOTER  (12)
 #define REPLAY_SIG_MISSING_FEC    (13)
+#define REPLAY_SIG_STREAM_STOP    (14)
 
 /* replay_out mcache seq[i] slots */
 #define REPLAY_SYNC_SEQ  (0UL) /* mcache->seq[0]: recently published seq no */
